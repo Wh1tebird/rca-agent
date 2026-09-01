@@ -1,0 +1,87 @@
+# RCA v4 Agent Environment
+
+`rca-agent` wraps RCA100 as a controlled, interactive investigation environment. An investigation
+policy receives a small event bootstrap payload and can acquire additional facts only through
+bounded, typed, read-only tools. Candidate interpretation and final evidence decisions belong to
+the internal Agent domain core.
+
+This repository currently implements the trusted runtime through the Fake/Scripted LangGraph
+integration stage:
+
+- repository and trust-boundary skeleton;
+- the minimal RCA Environment Contract;
+- a host-side RCA100 adapter that keeps dataset locations and case selectors private;
+- bounded Metric, Trace, and Topology tools;
+- explicit unavailable Log capability;
+- query cost and episode budget enforcement;
+- neutral observations with trust states.
+- a typed Episode Runner and four-state lifecycle;
+- append-only hash-chained Transcript persistence;
+- offline Recorded Replay validation;
+- typed answer freezing and a separate post-freeze Evaluator artifact;
+- a sanitized child process for Scripted/Fake Policy lifecycle tests.
+- an episode-scoped issued-Observation ledger;
+- a trust-aware bridge into the internal evidence-controlled domain core;
+- Catalog-owned candidate resolution and authoritative decisions.
+- a read-only, non-freezing Core assessment preview after each Policy action;
+- a provider-neutral LangChain structured-output boundary;
+- LangGraph orchestration that can act only through `EpisodeRunner`;
+- a no-API-key Scripted Policy integration test covering Tool -> Observation -> Core -> Freeze.
+
+Live model invocation, evaluator scoring, backend verification replay, deterministic diagnosis
+strategy, and blind accuracy experiments remain deferred.
+
+## Setup and verification
+
+```bash
+uv sync --extra dev
+uv run ruff check .
+uv run pytest -q
+```
+
+The package has no runtime dependency on the frozen sibling `rca-core` repository. The previously
+validated runtime domain is maintained under `src/rca_agent/core`: bounded RCA100 observation
+access, candidate and EvidenceCondition contracts, capability compilation, candidate proposal and
+discovery, evidence assessment, candidate-state aggregation, and safe decisions. Research modules
+remain outside Agent Runtime. RCA100 data is not copied into this repository. A host process
+supplies the existing `cases` directory when it constructs an environment; that path is never
+included in Agent-visible responses.
+
+## Trust states
+
+Every observation carries exactly one of:
+
+- `OBSERVED`: a bounded raw source value;
+- `DERIVED`: a deterministic, replayable transformation of observed values;
+- `IMPUTED`: an interpolated or filled value;
+- `MODEL_INFERRED`: a model estimate;
+- `MISSING`: expected source coverage is absent;
+- `UNKNOWN`: available values do not support the requested interpretation.
+
+Only trusted `OBSERVED` and replayable `DERIVED` values may later enter confirmation through the
+internal Agent domain core. Phase 1 never emits `IMPUTED` or `MODEL_INFERRED` observations.
+
+Policy proposals may name a trusted `candidate_id`, but cannot provide conditions, thresholds,
+strengths, sufficiency rules, or a final status. At answer freeze, the Core evaluates only issued
+observations explicitly referenced by submitted proposals.
+
+## LangChain and LangGraph boundary
+
+`LangChainPolicyAdapter` accepts exactly one closed `PolicyAction` as structured output. Its schema
+contains no final-decision, threshold, or evidence-weight field. `LangGraphInvestigation` supplies
+the model only sanitized bootstrap state, candidate options, prior action results, and the Core's
+read-only assessment preview.
+
+The graph never calls `RcaEnvironment` or the evidence controller directly. Tool execution,
+budget/max-round enforcement, observation issuance, proposal admission, transcript recording, and
+answer freeze all remain inside `EpisodeRunner`. A confirmed preview causes the graph to request
+stop; the Runner then recomputes and freezes the authoritative Core decision.
+
+## DeepSeek model binding
+
+The accuracy-first provider binding uses `deepseek-v4-pro` with thinking enabled and high reasoning
+effort. `create_deepseek_policy()` binds that model to the same closed structured Policy schema; it
+does not grant the model additional tools or decision authority. The provider package reads
+`DEEPSEEK_API_KEY` from the host process environment. Secrets must not be committed to this
+repository. DeepSeek uses JSON mode for the envelope because thinking mode rejects forced
+`tool_choice`; the returned object is still validated against the same Pydantic schema.

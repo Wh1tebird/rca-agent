@@ -1,0 +1,3 @@
+# Host-side configuration only. Never serialize this object into Agent context or replay output.
+cases_root = "/absolute/path/to/RCA100/cases"
+default_query_budget = 20
