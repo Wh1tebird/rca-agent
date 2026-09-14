@@ -88,8 +88,19 @@ class _CoreEvaluation:
 class CoreDecisionProvider:
     """Translate issued Agent facts into the internal evidence-controlled decision kernel."""
 
-    def __init__(self) -> None:
+    def __init__(self, excluded_catalog_candidate_ids: frozenset[str] = frozenset()) -> None:
         self._dynamic: dict[str, CompiledCandidate] = {}
+        self._excluded_catalog_candidate_ids = frozenset(excluded_catalog_candidate_ids)
+
+    @property
+    def excluded_catalog_candidate_ids(self) -> frozenset[str]:
+        return self._excluded_catalog_candidate_ids
+
+    def catalog(self, entity_ref: str) -> tuple[Candidate, ...]:
+        return tuple(
+            candidate for candidate in mechanism_catalog(entity_ref)
+            if candidate.candidate_id not in self._excluded_catalog_candidate_ids
+        )
 
     def register_dynamic(self, compiled: CompiledCandidate) -> None:
         key = compiled.candidate.candidate_id
@@ -102,7 +113,9 @@ class CoreDecisionProvider:
         return bool(self._dynamic)
 
     def verification_reports(self, proposals, observations) -> dict[str, DynamicVerification]:
-        evaluation = _evaluate(proposals, observations, self._dynamic)
+        evaluation = _evaluate(
+            proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+        )
         return evaluation.dynamic_verifications if evaluation else {}
 
     def preview(
@@ -116,7 +129,9 @@ class CoreDecisionProvider:
         overall = self.decide(proposals, observations, StopReason.POLICY_REQUEST)
         if not proposals:
             return CoreAssessmentPreview(overall_decision=overall)
-        evaluation = _evaluate(proposals, observations, self._dynamic)
+        evaluation = _evaluate(
+            proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+        )
         if evaluation is None:
             return CoreAssessmentPreview(overall_decision=overall)
         candidate_assessments = _candidate_previews(evaluation)
@@ -150,9 +165,13 @@ class CoreDecisionProvider:
                 reason="no policy hypothesis was submitted for domain-core assessment",
             )
 
-        evaluation = _evaluate(proposals, observations, self._dynamic)
+        evaluation = _evaluate(
+            proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+        )
         if evaluation is None:
-            _, _, unresolved = _resolve_candidates(proposals)
+            _, _, unresolved = _resolve_candidates(
+                proposals, excluded_catalog_candidate_ids=self._excluded_catalog_candidate_ids,
+            )
             return AuthoritativeDecision(
                 status=DecisionStatus.OUT_OF_SCOPE,
                 source=DecisionSource.CORE,
@@ -184,6 +203,7 @@ class CoreDecisionProvider:
 def _resolve_candidates(
     proposals: tuple[HypothesisProposal, ...],
     dynamic: dict[str, CompiledCandidate] | None = None,
+    excluded_catalog_candidate_ids: frozenset[str] = frozenset(),
 ) -> tuple[list[Candidate], dict[str, list[HypothesisProposal]], list[str]]:
     selected: dict[str, Candidate] = {}
     proposals_by_candidate: dict[str, list[HypothesisProposal]] = {}
@@ -199,7 +219,10 @@ def _resolve_candidates(
             selected[candidate.candidate_id] = candidate
             proposals_by_candidate.setdefault(candidate.candidate_id, []).append(proposal)
             continue
-        catalog = mechanism_catalog(proposal.causal_entity_ref)
+        catalog = tuple(
+            candidate for candidate in mechanism_catalog(proposal.causal_entity_ref)
+            if candidate.candidate_id not in excluded_catalog_candidate_ids
+        )
         by_key = {
             _candidate_key(value): candidate
             for candidate in catalog
@@ -221,9 +244,12 @@ def _evaluate(
     proposals: tuple[HypothesisProposal, ...],
     observations: tuple[IssuedObservation, ...],
     dynamic: dict[str, CompiledCandidate] | None = None,
+    excluded_catalog_candidate_ids: frozenset[str] = frozenset(),
 ) -> _CoreEvaluation | None:
     dynamic = dynamic or {}
-    candidates, proposal_groups, unresolved = _resolve_candidates(proposals, dynamic)
+    candidates, proposal_groups, unresolved = _resolve_candidates(
+        proposals, dynamic, excluded_catalog_candidate_ids,
+    )
     if not candidates:
         return None
     records_by_id = {item.observation.observation_id: item for item in observations}

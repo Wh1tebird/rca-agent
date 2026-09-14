@@ -48,6 +48,11 @@ def rca100_evidence_registry(
                     ),
                 )
                 specs.setdefault((spec.entity_ref, signal), spec)
+                descriptions = {
+                    "connection_duration_ms": "database connection phase is materially delayed",
+                    "sql_duration_share": "SQL execution dominates the operation duration",
+                    "sql_shape": "SQL has the known complex cross-join structure",
+                }
                 rules[signal] = RuleSpec(
                     rule_id=signal,
                     signal=signal,
@@ -55,8 +60,18 @@ def rca100_evidence_registry(
                     threshold=template.threshold,
                     source="configuration",
                     provenance="existing v3 trusted evidence template",
-                    description=signal.replace("_", " ") + " exhibits a mechanism-specific anomaly",
+                    description=descriptions[signal],
                 )
+                if signal == "sql_duration_share":
+                    rules["sql_duration_share_low"] = RuleSpec(
+                        rule_id="sql_duration_share_low",
+                        signal=signal,
+                        comparison="lte",
+                        threshold=0.2,
+                        source="configuration",
+                        provenance="RCA100 trace-stage differential contract",
+                        description="SQL execution is a small part of operation duration",
+                    )
         if (
             observation.signal in {"cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"}
             and observation.unit == "percent"

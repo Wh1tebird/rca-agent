@@ -187,3 +187,10 @@ are transcript-bound. The initial registry exposes only existing issued resource
 t025 and t030 are exposed development regressions. Their controlled Trace difference validates the
 environment interface, not Agent accuracy, blind generalization, production readiness, arbitrary
 mechanism discovery, or multi-root handling.
+
+The optional Unknown RCA Benchmark now supports a real Catalog holdout across Policy disclosure,
+Discovery context, Core resolution and Recorded Replay. Initial live `deepseek-chat` probes on t025
+and t030 proposed plausible Catalog-external mechanisms, including the correct slow-SQL mechanism
+for t030, but Core correctly stopped at `SUPPORTED_HYPOTHESIS` because the model did not bind its
+predictions to declared alternatives. See `analysis/unknown_rca_benchmark.md`; these two probes are
+diagnostic observations, not accuracy estimates.

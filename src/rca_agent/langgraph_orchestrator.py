@@ -62,7 +62,10 @@ class LangGraphInvestigation:
         if self._runner.status != EpisodeStatus.CREATED:
             raise ValueError("LangGraph investigation requires a newly created EpisodeRunner")
         self._bootstrap = self._runner.start()
-        self._candidate_options = _candidate_options(self._bootstrap.alert_entity.entity_ref)
+        self._candidate_options = _candidate_options(
+            self._bootstrap.alert_entity.entity_ref,
+            self._runner.excluded_catalog_candidate_ids,
+        )
         initial_preview = self._runner.preview_core_assessment()
         initial_frontier = _candidate_frontier(initial_preview, self._candidate_options)
         state = self._graph.invoke(
@@ -146,7 +149,10 @@ class LangGraphInvestigation:
         result = self._runner.discover_candidates()
         assert self._bootstrap is not None
         self._candidate_options = (
-            *_candidate_options(self._bootstrap.alert_entity.entity_ref),
+            *_candidate_options(
+                self._bootstrap.alert_entity.entity_ref,
+                self._runner.excluded_catalog_candidate_ids,
+            ),
             *(CandidateOption.model_validate(o) for o in self._runner.dynamic_candidate_options),
         )
         return {"discovery_requested": False,
@@ -240,7 +246,10 @@ class LangGraphInvestigation:
         return "policy"
 
 
-def _candidate_options(entity_ref: str) -> tuple[CandidateOption, ...]:
+def _candidate_options(
+    entity_ref: str,
+    excluded_candidate_ids: frozenset[str] = frozenset(),
+) -> tuple[CandidateOption, ...]:
     return tuple(
         CandidateOption(
             candidate_id=item.candidate_id,
@@ -254,6 +263,7 @@ def _candidate_options(entity_ref: str) -> tuple[CandidateOption, ...]:
             required_capabilities=tuple(item.required_capabilities),
         )
         for item in mechanism_catalog(entity_ref)
+        if item.candidate_id not in excluded_candidate_ids
     )
 
 

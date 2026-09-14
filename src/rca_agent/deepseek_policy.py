@@ -15,6 +15,7 @@ def create_deepseek_chat_model(
     model: str = DEFAULT_DEEPSEEK_MODEL,
     timeout_seconds: float = 120,
     max_retries: int = 2,
+    thinking_enabled: bool = True,
 ) -> ChatDeepSeek:
     """Create the accuracy-first DeepSeek model used by the RCA investigation policy.
 
@@ -23,14 +24,18 @@ def create_deepseek_chat_model(
     """
 
     credentials = {"api_key": api_key} if api_key is not None else {}
+    reasoning = (
+        {"reasoning_effort": "high", "extra_body": {"thinking": {"type": "enabled"}}}
+        if thinking_enabled
+        else {}
+    )
     return ChatDeepSeek(
         model=model,
         temperature=0,
         max_tokens=8192,
         timeout=timeout_seconds,
         max_retries=max_retries,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}},
+        **reasoning,
         **credentials,
     )
 
@@ -49,12 +54,20 @@ def create_deepseek_policy(
 
 
 def create_deepseek_discovery(
-    *, api_key: SecretStr | None = None, model: str = DEFAULT_DEEPSEEK_MODEL,
+    *,
+    api_key: SecretStr | None = None,
+    model: str = DEFAULT_DEEPSEEK_MODEL,
     timeout_seconds: float = 30,
+    thinking_enabled: bool = True,
 ) -> LangChainDiscoveryAdapter:
     """Construct (without calling) the separately budgeted open-discovery model."""
     return LangChainDiscoveryAdapter.from_chat_model(
-        create_deepseek_chat_model(api_key=api_key, model=model,
-                                  timeout_seconds=timeout_seconds, max_retries=0),
+        create_deepseek_chat_model(
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_retries=0,
+            thinking_enabled=thinking_enabled,
+        ),
         structured_method="json_mode",
     )

@@ -80,6 +80,9 @@ class RecordedReplay:
                 if event.event_type != EventType.EPISODE_CREATED:
                     raise ReplayValidationError("first event must create the episode")
                 status = EpisodeStatus.CREATED
+                provider = CoreDecisionProvider(
+                    frozenset(event.payload.get("excluded_catalog_candidate_ids", ()))
+                )
                 continue
             if event.event_type == EventType.ENVIRONMENT_RESET:
                 if status != EpisodeStatus.CREATED:

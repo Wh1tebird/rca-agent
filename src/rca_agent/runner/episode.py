@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from rca_agent.core.dynamic import DiscoveryPayload, EvidenceRegistry, observation_fact_digest
-from rca_agent.core.v3.catalog import mechanism_catalog
 from rca_agent.environment.contract import RcaEnvironment
 from rca_agent.models import (
     AnswerArtifact,
@@ -116,7 +115,13 @@ class EpisodeRunner:
         self.__answer: AnswerArtifact | None = None
         self.transcript.append(
             EventType.EPISODE_CREATED,
-            {"status": self.status, "max_rounds": max_rounds},
+            {
+                "status": self.status,
+                "max_rounds": max_rounds,
+                "excluded_catalog_candidate_ids": sorted(
+                    self.excluded_catalog_candidate_ids
+                ),
+            },
         )
 
     @property
@@ -134,6 +139,15 @@ class EpisodeRunner:
     @property
     def dynamic_candidate_options(self) -> tuple[dict[str, Any], ...]:
         return tuple(deepcopy(self.__dynamic_options))
+
+    @property
+    def excluded_catalog_candidate_ids(self) -> frozenset[str]:
+        provider = self.__decision_provider
+        return (
+            provider.excluded_catalog_candidate_ids
+            if isinstance(provider, CoreDecisionProvider)
+            else frozenset()
+        )
 
     def should_discover(self, *, stopping: bool = False) -> bool:
         if (self.status != EpisodeStatus.ACTIVE or self.__discovery is None
@@ -189,9 +203,12 @@ class EpisodeRunner:
             "observations": [r.observation.model_dump(mode="json")
                              for r in self.__observation_ledger.values()
                              if any(s.accepts(r.observation) for s in registry.signals)],
-            "existing_candidates": [{"candidate_id": c.candidate_id, "mechanism": c.fault_type}
-                                    for c in mechanism_catalog(
-                                        self.__bootstrap.alert_entity.entity_ref)],
+            "existing_candidates": [
+                {"candidate_id": c.candidate_id, "mechanism": c.fault_type}
+                for c in self.__decision_provider.catalog(
+                    self.__bootstrap.alert_entity.entity_ref
+                )
+            ],
         }
         self.transcript.append(EventType.DISCOVERY_STARTED, {"context_digest": sha256_digest(context)})
         mailbox: Queue = Queue(maxsize=1)
@@ -216,9 +233,13 @@ class EpisodeRunner:
             for draft in payload.hypotheses:
                 try:
                     original = proposals.get(draft.source_hypothesis_id)
-                    if original is None or draft.source_hypothesis_id in seen:
+                    discovery_key = (
+                        draft.source_hypothesis_id,
+                        draft.mechanism.strip().casefold(),
+                    )
+                    if original is None or discovery_key in seen:
                         raise ValueError("unknown or duplicate source hypothesis")
-                    seen.add(draft.source_hypothesis_id)
+                    seen.add(discovery_key)
                     compiled = registry.compile(
                         draft, original.causal_entity_ref,
                         discovery_query_refs=tuple(sorted({
@@ -232,7 +253,8 @@ class EpisodeRunner:
                     )
                     if not all(self._signal_executable(s) for s in compiled.signals):
                         raise ValueError("query recipe is not executable in this episode")
-                    existing = next((c for c in mechanism_catalog(original.causal_entity_ref)
+                    existing = next((c for c in self.__decision_provider.catalog(
+                                     original.causal_entity_ref)
                                      if draft.mechanism.casefold() in {
                                          c.candidate_id.casefold(), c.fault_type.casefold()
                                      } and c.family == draft.family), None)

@@ -21,22 +21,32 @@ class LangChainDiscoveryAdapter:
                 (
                     "system",
                     (
-                        "Propose bounded RCA mechanisms for the supplied hypotheses. "
+                        "Return one JSON object matching the supplied JSON schema. Propose bounded RCA "
+                        "mechanisms for the supplied hypotheses. "
                         "Keep each source_hypothesis_id. Reuse an existing mechanism when it explains the "
                         "facts; otherwise propose a new mechanism with a causal explanation, alternatives "
                         "and testable support/refutation predictions. Select only advertised rule_id values. "
                         "A refutation prediction describes a phenomenon that would refute the mechanism. "
                         "Never invent measurements, thresholds, weights, queries or a final decision. "
                         "Return an empty hypotheses list if the available rules cannot test a mechanism. "
-                    "Include at least one executable refutation test. For each listed alternative, "
-                    "provide a distinguishing prediction with its exact name in distinguishes. "
-                    "Choose evidence from different causal dimensions, and predict additional "
-                    "observations beyond those already supplied. All predictions are required tests. "
-                    "Completed generic verification can return the new mechanism as the root cause "
-                    "for this investigation without Catalog promotion."
+                        "A hypothesis is valid only when it has at least two support predictions from "
+                        "different causal dimensions and at least one contradict prediction. For every "
+                        "listed alternative, copy its complete exact string into the distinguishes array "
+                        "of at least one prediction whose outcome separates that alternative. Never leave "
+                        "all distinguishes arrays empty. If these requirements cannot be met, omit that "
+                        "hypothesis instead of returning an unverifiable draft. "
+                        "Choose evidence from different causal dimensions, and predict additional "
+                        "observations beyond those already supplied. All predictions are required tests. "
+                        "You may return up to four distinct mechanisms for one source hypothesis; copy "
+                        "the same source_hypothesis_id into each and order them by plausibility. "
+                        "Completed generic verification can return the new mechanism as the root cause "
+                        "for this investigation without Catalog promotion."
                     ),
                 ),
-                ("human", "{context_json}"),
+                (
+                    "human",
+                    "JSON schema:\n{schema_json}\n\nInvestigation context:\n{context_json}",
+                ),
             ]
         )
         return cls(
@@ -48,5 +58,8 @@ class LangChainDiscoveryAdapter:
         )
 
     def discover(self, context: dict[str, Any]) -> DiscoveryPayload:
-        raw = self._runnable.invoke({"context_json": json.dumps(context, sort_keys=True)})
+        raw = self._runnable.invoke({
+            "schema_json": json.dumps(DiscoveryPayload.model_json_schema(), sort_keys=True),
+            "context_json": json.dumps(context, sort_keys=True),
+        })
         return DiscoveryPayload.model_validate(raw)

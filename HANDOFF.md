@@ -115,12 +115,19 @@ Phase 3 may depend on:
 10. `CoreAssessmentPreview`, Candidate-scoped evidence updates, safe discriminating-signal views,
     and the Core-derived Candidate Frontier.
 
-The next objective is to provide `DEEPSEEK_API_KEY` to the host process and run one controlled live
-investigation through `create_deepseek_policy()`, then proceed to RCA100 blind investigations.
-Before accuracy claims, add model-facing prompt regressions and verify that candidate-option
-disclosure remains within the intended blind evaluation protocol. A non-LLM deterministic
-investigation-policy baseline is still useful as a comparison arm. No Core-interface blocker is
-currently known.
+`evaluation/unknown_benchmark.py` now runs a post-freeze Catalog-holdout probe with real discovery.
+Catalog exclusions are enforced in Policy options, Discovery context, Core resolution and Replay.
+Live `deepseek-chat` probes on t025 (`dbNetworkLatency`) and t030 (`slowSQL`) both produced compiled
+dynamic mechanisms and valid replay. The t030 model proposal semantically recovered slow SQL and its
+two supporting predicates matched, but neither run reached `DISCOVERED_VERIFIED`: the model left
+`Prediction.distinguishes` empty, so Core retained `SUPPORTED_HYPOTHESIS`. This is the desired safe
+failure. The full record and next benchmark design are in `analysis/unknown_rca_benchmark.md`.
+
+The next objective is a preregistered 20-30 case holdout manifest with post-freeze semantic scoring,
+failure-stage attribution and separate queryable/non-queryable strata. Do not weaken the generic
+verification standard to improve the headline recovery rate. Improve discovery contract adherence
+and expand host capability coverage, then measure Ground-Truth recall and wrong-verification rate.
+A non-LLM deterministic investigation-policy baseline remains useful as a comparison arm.
 
 Backend Verification Replay, signed transcript anchoring, concurrent transcript storage, evaluator
 scoring, and a general untrusted-code sandbox remain explicit follow-up work.

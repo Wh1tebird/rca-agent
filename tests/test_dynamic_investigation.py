@@ -795,3 +795,51 @@ def test_blank_or_duplicate_alternatives_are_not_valid_tests(alternatives):
     raw["alternatives"] = alternatives
     with pytest.raises(ValidationError):
         DynamicHypothesis.model_validate(raw)
+
+
+def test_catalog_holdout_is_enforced_in_policy_discovery_core_and_replay():
+    from rca_agent.langgraph_orchestrator import _candidate_options
+
+    excluded = frozenset({"dbNetworkLatency"})
+    provider = CoreDecisionProvider(excluded)
+    assert "dbNetworkLatency" not in {c.candidate_id for c in provider.catalog("ent-service")}
+    assert "dbNetworkLatency" not in {
+        c.candidate_id for c in _candidate_options("ent-service", excluded)
+    }
+    proposal = unknown_action().proposal.model_copy(update={
+        "candidate_id": "dbNetworkLatency", "mechanism": "dbNetworkLatency",
+    })
+    assert provider.decide((proposal,), (), StopReason.POLICY_REQUEST).status == DecisionStatus.OUT_OF_SCOPE
+
+    discoverer = Discoverer(draft(refute=True))
+    runner = EpisodeRunner(Environment(), decision_provider=provider, discovery=discoverer,
+                           evidence_registry=registry())
+    policy = LangChainPolicyAdapter(ScriptedPolicyRunnable((
+        query("active_ratio"), unknown_action(), RequestStopAction(summary="done"),
+    )))
+    LangGraphInvestigation(runner, policy).run()
+    assert "dbNetworkLatency" not in {
+        c["candidate_id"] for c in discoverer.context["existing_candidates"]
+    }
+    assert runner.transcript.events[0].payload["excluded_catalog_candidate_ids"] == [
+        "dbNetworkLatency"
+    ]
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_discovery_can_return_distinct_mechanisms_for_one_source_hypothesis():
+    second = draft(refute=True).model_copy(update={"mechanism": "another queue mechanism"})
+
+    class Multiple:
+        def discover(self, context):
+            return DiscoveryPayload(hypotheses=(draft(refute=True), second))
+
+    runner = EpisodeRunner(Environment(), discovery=Multiple(), evidence_registry=registry())
+    policy = LangChainPolicyAdapter(ScriptedPolicyRunnable((
+        query("active_ratio"), unknown_action(), RequestStopAction(summary="done"),
+    )))
+    report = LangGraphInvestigation(runner, policy).run()
+    assert len(runner.dynamic_candidate_options) == 2
+    assert len([p for p in report.answer.policy_proposals if p.hypothesis_id.startswith(
+        "h-discovered-")]) == 2
+    assert RecordedReplay.verify(runner.transcript.events).valid
