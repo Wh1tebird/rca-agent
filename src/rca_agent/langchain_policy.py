@@ -9,7 +9,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict
 
-from rca_agent.models import AuthoritativeDecision, PolicyAction, ResetResponse, parse_policy_action
+from rca_agent.models import (
+    CandidateFrontier,
+    CoreAssessmentPreview,
+    PolicyAction,
+    ResetResponse,
+    parse_policy_action,
+)
 
 
 class PolicyEnvelope(BaseModel):
@@ -38,7 +44,8 @@ class PolicyContext(BaseModel):
     bootstrap: ResetResponse
     candidate_options: tuple[CandidateOption, ...]
     history: tuple[dict[str, Any], ...] = ()
-    core_assessment: AuthoritativeDecision
+    core_assessment: CoreAssessmentPreview
+    candidate_frontier: CandidateFrontier = CandidateFrontier()
 
 
 class LangChainPolicyAdapter:
@@ -67,8 +74,8 @@ class LangChainPolicyAdapter:
                     "system",
                     (
                         "You are a non-authoritative RCA investigation policy. Return exactly one "
-                        "schema-valid action. You may call only advertised tools, submit a "
-                        "hypothesis using issued references, or request stop. Never output a final "
+                        "schema-valid action. You may call only advertised tools, register a "
+                        "hypothesis, attach issued observations to it, or request stop. Never output a final "
                         "decision, SQL, filesystem path, threshold, evidence strength, or evidence "
                         "weight. Return only JSON matching this schema: {policy_schema_json}"
                     ),

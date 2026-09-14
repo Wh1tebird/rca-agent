@@ -48,6 +48,9 @@ class RecordedReplay:
         pending_request: dict | None = None
         pending_response: ToolResponse | None = None
         tool_calls = 0
+        discovery_started = False
+        discovery_completed = False
+        dynamic_ids: set[str] = set()
         for expected_sequence, event in enumerate(events, start=1):
             if event.episode_id != episode_id:
                 raise ReplayValidationError("episode ID changed inside transcript")
@@ -69,6 +72,28 @@ class RecordedReplay:
                     raise ReplayValidationError("environment reset is out of order")
                 status = EpisodeStatus.ACTIVE
                 budget_remaining = int(event.payload["bootstrap"]["query_budget"]["remaining"])
+            elif event.event_type == EventType.DISCOVERY_STARTED:
+                if status != EpisodeStatus.ACTIVE or discovery_started:
+                    raise ReplayValidationError("discovery start is out of order")
+                discovery_started = True
+            elif event.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED:
+                from rca_agent.core.dynamic import CompiledCandidate
+
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("candidate registration is out of order")
+                compiled = CompiledCandidate.model_validate(event.payload["compiled"])
+                if compiled.candidate.candidate_id in dynamic_ids:
+                    raise ReplayValidationError("dynamic candidate registered twice")
+                dynamic_ids.add(compiled.candidate.candidate_id)
+            elif event.event_type == EventType.DISCOVERY_COMPLETED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("discovery completion is out of order")
+                if event.payload["registered"] != len(dynamic_ids):
+                    raise ReplayValidationError("discovery registration count mismatch")
+                discovery_completed = True
+            elif event.event_type == EventType.CATALOG_CANDIDATE_ALIGNED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("catalog alignment is out of order")
             elif event.event_type == EventType.TOOL_REQUEST:
                 if status != EpisodeStatus.ACTIVE or pending_request is not None:
                     raise ReplayValidationError("tool request is out of order")
@@ -134,10 +159,13 @@ class RecordedReplay:
                 EventType.TOOL_RESPONSE,
                 EventType.QUERY_COST,
                 EventType.HYPOTHESIS_SUBMITTED,
+                EventType.CANDIDATE_EVIDENCE_UPDATED,
             }:
                 raise ReplayValidationError("inference event appears after answer freeze")
         if pending_request is not None:
             raise ReplayValidationError("transcript ends with an incomplete tool call")
+        if discovery_started and not discovery_completed:
+            raise ReplayValidationError("transcript ends with incomplete discovery")
         if status is None:
             raise ReplayValidationError("transcript has no lifecycle state")
         return ReplayReport(

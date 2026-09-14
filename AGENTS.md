@@ -34,11 +34,19 @@ Read `PROJECT_CONTEXT.md` and `HANDOFF.md` completely before planning or changin
   to the internal Agent domain core, never to Policy output.
 - Policy may name a trusted Catalog `candidate_id`; only observations issued in the same episode and
   explicitly referenced by that proposal may enter the default Core decision provider.
+- Observations are immutable episode-global facts. Evidence admission is Candidate-scoped: an
+  Observation attached to one hypothesis must not enter another Candidate's assessment unless the
+  same issued reference is explicitly attached there too.
+- Per-candidate status and discriminating-signal views come only from `CoreAssessmentPreview`. They
+  may expose signal/capability gaps but never condition operators, thresholds, weights, strengths,
+  winner-margin values, or sufficiency rules.
 - LangChain/LangGraph are non-authoritative orchestration layers. They must send every action through
   `EpisodeRunner`; they must not call `RcaEnvironment`, the Observation ledger, evidence controller,
   evaluator, or answer-freeze internals directly.
 - `EpisodeRunner.preview_core_assessment()` is read-only routing information. A graph must request
   stop through the Runner and may not turn a preview into an answer artifact itself.
+- Candidate Frontier fields in Graph State must be derived from the latest Core preview. LangGraph
+  and Policy must not independently confirm, contradict, exclude, or reactivate a Candidate.
 
 ## Working practice
 

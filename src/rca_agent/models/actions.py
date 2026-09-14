@@ -18,6 +18,7 @@ from rca_agent.models.queries import (
 class ActionType(StrEnum):
     CALL_TOOL = "call_tool"
     SUBMIT_HYPOTHESIS = "submit_hypothesis"
+    UPDATE_CANDIDATE_EVIDENCE = "update_candidate_evidence"
     REQUEST_STOP = "request_stop"
 
 
@@ -93,6 +94,19 @@ class SubmitHypothesisAction(BaseModel):
     proposal: HypothesisProposal
 
 
+class UpdateCandidateEvidenceAction(BaseModel):
+    """Attach issued episode facts to one already-registered hypothesis."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action_type: Literal[ActionType.UPDATE_CANDIDATE_EVIDENCE] = (
+        ActionType.UPDATE_CANDIDATE_EVIDENCE
+    )
+    hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
+    observation_refs: tuple[str, ...] = Field(default=(), min_length=1, max_length=100)
+    missing_evidence: tuple[str, ...] = Field(default=(), max_length=100)
+
+
 class StopReason(StrEnum):
     POLICY_REQUEST = "policy_request"
     SCRIPT_COMPLETED = "script_completed"
@@ -113,7 +127,10 @@ class RequestStopAction(BaseModel):
 
 
 PolicyAction: TypeAlias = Annotated[
-    CallToolAction | SubmitHypothesisAction | RequestStopAction,
+    CallToolAction
+    | SubmitHypothesisAction
+    | UpdateCandidateEvidenceAction
+    | RequestStopAction,
     Field(discriminator="action_type"),
 ]
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,12 +22,20 @@ class DecisionStatus(StrEnum):
     SUPPORTED_HYPOTHESIS = "supported_hypothesis"
     CONFIRMED_ROOT_CAUSE = "confirmed_root_cause"
     OUT_OF_SCOPE = "out_of_scope"
-    QUERY_FAILED = "query_failed"
+    QUERY_FAILED = " query_failed"
 
 
 class DecisionSource(StrEnum):
     CORE = "rca_agent_core"
     PHASE2_LIFECYCLE_DEFAULT = "phase2_lifecycle_default"
+
+
+class CandidateEvidenceStatus(StrEnum):
+    UNASSESSED = "unassessed"
+    INCONCLUSIVE = "inconclusive"
+    SUPPORTED = "supported"
+    CONTRADICTED = "contradicted"
+    CONFIRMED = "confirmed"
 
 
 class AuthoritativeDecision(BaseModel):
@@ -44,6 +53,61 @@ class AuthoritativeDecision(BaseModel):
         ):
             raise ValueError("confirmed root cause requires domain-core authority and a winner")
         return self
+
+
+class CandidateAssessmentPreview(BaseModel):
+    """Threshold-free view of one Core-owned candidate assessment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_id: str
+    hypothesis_ids: tuple[str, ...]
+    evidence_status: CandidateEvidenceStatus
+    satisfied_signals: tuple[str, ...] = ()
+    missing_signals: tuple[str, ...] = ()
+    contradicting_signals: tuple[str, ...] = ()
+    unavailable_signals: tuple[str, ...] = ()
+    required_capabilities: tuple[str, ...] = ()
+
+
+class DiscriminatingSignalView(BaseModel):
+    """Safe query gap shared with Policy; no comparison rule or score is exposed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    signal: str
+    candidate_ids: tuple[str, ...]
+    compared_candidate_ids: tuple[str, ...]
+    required_capability: str
+    required_tool: str | None = None
+    issued_observation_refs: tuple[str, ...] = ()
+    available: bool
+    reason_code: Literal["separates_unresolved_candidates"] = (
+        "separates_unresolved_candidates"
+    )
+
+
+class CoreAssessmentPreview(BaseModel):
+    """Read-only multi-candidate projection used for orchestration routing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    overall_decision: AuthoritativeDecision
+    candidate_assessments: tuple[CandidateAssessmentPreview, ...] = ()
+    discriminating_signals: tuple[DiscriminatingSignalView, ...] = ()
+
+
+class CandidateFrontier(BaseModel):
+    """Graph projection derived exclusively from the latest Core preview."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    active_candidate_ids: tuple[str, ...] = ()
+    supported_candidate_ids: tuple[str, ...] = ()
+    contradicted_candidate_ids: tuple[str, ...] = ()
+    inconclusive_candidate_ids: tuple[str, ...] = ()
+    confirmed_candidate_ids: tuple[str, ...] = ()
+    unsubmitted_candidate_ids: tuple[str, ...] = ()
 
 
 class AnswerArtifact(BaseModel):

@@ -1,5 +1,20 @@
 # RCA Agent handoff
 
+## Latest increment — 2026-09-14
+
+Bounded dynamic discovery is integrated into LangGraph/Runner. Configure a separate discovery
+adapter and an EvidenceRegistry (or builder). Existing Catalog candidates remain available.
+The compiler checks signal types, units, threshold sources, reference data, independent groups
+and query recipes. Runner owns registration, verification, evidence binding and transcript events.
+Dynamic predicates default to support/inconclusive; confirmation requires a host-reviewed
+sufficiency contract and Core evidence checks.
+
+See `analysis/dynamic_discovery.md` for setup and limits. The initial RCA100 registry uses existing
+issued trace/resource signals; thread-pool tests use synthetic data. No live inference was performed.
+Next integration work is backend-specific inventories and a separately assessed live model run.
+Validation for this increment: Ruff passed; 117 tests passed (23 new dynamic-discovery tests).
+The older sections below describe the baseline before this increment.
+
 Updated: 2026-09-01
 
 ## Current status
@@ -9,7 +24,7 @@ boundary and LangGraph Fake/Scripted orchestration stage are also complete. The 
 factory now targets `deepseek-v4-pro`; a live investigation has not yet been run. Deterministic
 diagnosis strategy and accuracy experiments have not started. A one-call provider smoke test has
 validated credential loading and schema-constrained `REQUEST_STOP`; no RCA100 live investigation
-has run yet. Ruff and all 91 tests pass.
+has run yet. Ruff and all 94 tests pass.
 
 The package no longer depends on the frozen sibling `rca-core`. The RCA runtime domain is now
 owned under `src/rca_agent/core`, including the v3 candidate, condition, capability, proposal,
@@ -26,6 +41,14 @@ Policy, sends every action through the Runner, previews the resulting Core state
 result is inconclusive, and requests Runner-controlled freeze after confirmation. Invalid model
 output fails before any tool execution. Budget, max rounds, Transcript, Replay, and answer-freeze
 tests remain enforced without an API key.
+
+The preview is now genuinely multi-candidate. Observations remain episode-global facts, while
+`UPDATE_CANDIDATE_EVIDENCE` binds issued references to one hypothesis. Core evaluates each Candidate
+only within that scope and returns safe per-candidate status plus discriminating signal gaps. Graph
+rebuilds active/supported/contradicted/inconclusive/confirmed Candidate frontiers from the preview;
+it cannot author those states. A deterministic `slowSQL` versus `dbNetworkLatency` E2E confirms
+that evidence does not leak across candidates and that one differential Trace query can contradict
+slowSQL while Core confirms dbNetworkLatency.
 
 ## Implemented
 
@@ -84,6 +107,8 @@ Phase 3 may depend on:
 8. `EpisodeRunner.preview_core_assessment()` as the sole read-only graph-routing view of Core state.
 9. `LangChainPolicyAdapter`, `PolicyEnvelope`, and `LangGraphInvestigation` as non-authoritative
    orchestration interfaces.
+10. `CoreAssessmentPreview`, Candidate-scoped evidence updates, safe discriminating-signal views,
+    and the Core-derived Candidate Frontier.
 
 The next objective is to provide `DEEPSEEK_API_KEY` to the host process and run one controlled live
 investigation through `create_deepseek_policy()`, then proceed to RCA100 blind investigations.

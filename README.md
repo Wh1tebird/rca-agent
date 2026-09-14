@@ -1,5 +1,9 @@
 # RCA v4 Agent Environment
 
+Optional unknown-mechanism discovery is now integrated into the main LangGraph/Runner loop.
+It preserves the static Catalog and validates dynamic predicates against host-owned signal/rule
+contracts. See [dynamic discovery setup and limits](analysis/dynamic_discovery.md).
+
 `rca-agent` wraps RCA100 as a controlled, interactive investigation environment. An investigation
 policy receives a small event bootstrap payload and can acquire additional facts only through
 bounded, typed, read-only tools. Candidate interpretation and final evidence decisions belong to
@@ -27,6 +31,11 @@ integration stage:
 - a provider-neutral LangChain structured-output boundary;
 - LangGraph orchestration that can act only through `EpisodeRunner`;
 - a no-API-key Scripted Policy integration test covering Tool -> Observation -> Core -> Freeze.
+- candidate-scoped evidence binding without duplicating episode-global Observations;
+- threshold-free per-candidate Core previews and discriminating-signal views;
+- a Core-derived Graph candidate frontier for active, inconclusive, supported, contradicted, and
+  confirmed candidates;
+- a deterministic `slowSQL` versus `dbNetworkLatency` multi-candidate integration test.
 
 Live model invocation, evaluator scoring, backend verification replay, deterministic diagnosis
 strategy, and blind accuracy experiments remain deferred.
@@ -65,12 +74,23 @@ Policy proposals may name a trusted `candidate_id`, but cannot provide condition
 strengths, sufficiency rules, or a final status. At answer freeze, the Core evaluates only issued
 observations explicitly referenced by submitted proposals.
 
+Observations remain immutable episode-global facts. `UPDATE_CANDIDATE_EVIDENCE` explicitly attaches
+issued Observation references to one registered hypothesis. The Core assesses each Candidate only
+against its own attached references; a fact attached to Candidate A never enters Candidate B unless
+Policy explicitly attaches the same reference to B as well.
+
 ## LangChain and LangGraph boundary
 
 `LangChainPolicyAdapter` accepts exactly one closed `PolicyAction` as structured output. Its schema
 contains no final-decision, threshold, or evidence-weight field. `LangGraphInvestigation` supplies
 the model only sanitized bootstrap state, candidate options, prior action results, and the Core's
 read-only assessment preview.
+
+The preview exposes only safe per-candidate status, satisfied/missing/contradicting/unavailable
+signal names, required capabilities, and discriminating query gaps. It never exposes condition
+operators, thresholds, evidence strengths or weights, winner-margin values, or sufficiency rules.
+The Graph's Candidate Frontier is reconstructed from this preview after every action and has no
+independent decision authority.
 
 The graph never calls `RcaEnvironment` or the evidence controller directly. Tool execution,
 budget/max-round enforcement, observation issuance, proposal admission, transcript recording, and

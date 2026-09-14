@@ -107,9 +107,10 @@ tool request and response, cost, budget transition, proposal, stop, freeze, eval
 and explicit failure. Reverse transitions, duplicate freeze/evaluation, and tools after freeze are
 invalid.
 
-Policy Actions are the closed union `CALL_TOOL | SUBMIT_HYPOTHESIS | REQUEST_STOP`. A policy can
-propose a mechanism but cannot supply a decision status, threshold, evidence weight, SQL, path, or
-confirmation authority.
+Policy Actions are the closed union `CALL_TOOL | SUBMIT_HYPOTHESIS |
+UPDATE_CANDIDATE_EVIDENCE | REQUEST_STOP`. A policy can register a mechanism and explicitly attach
+episode-issued Observation references to it, but cannot supply a decision status, threshold,
+evidence weight, SQL, path, or confirmation authority.
 
 Transcript events form an append-only SHA-256 chain with normalized payloads and contiguous
 sequence numbers. Recorded Replay is backend-free and evaluator-free. It validates the chain,
@@ -127,6 +128,11 @@ the episode is active. It does not append transcript events, mutate proposal or 
 or freeze an answer. LangGraph uses the preview only for routing; finalization is still a
 `RequestStopAction` handled by the Runner, which recomputes the authoritative decision.
 
+Observations are episode-global immutable facts, while evidence admission is Candidate-scoped.
+Each Candidate is evaluated only against Observation references explicitly attached to its own
+hypothesis. `CoreAssessmentPreview` returns a safe per-candidate projection and discriminating
+signal view without condition rules, thresholds, weights, strengths, or margin values.
+
 ## 8. LangChain and LangGraph boundary
 
 `LangChainPolicyAdapter` owns prompt construction and strict `PolicyEnvelope` validation. Policy
@@ -141,6 +147,12 @@ provider reads `DEEPSEEK_API_KEY` from the host environment; runtime code never 
 Policy, with a confirmed preview routed to Runner-controlled freeze. It must not call the
 environment, Observation ledger, evidence controller, or evaluator directly. Budget, max rounds,
 Transcript, Replay, and answer freeze therefore retain their existing semantics.
+
+After every Core preview, the Graph rebuilds a Candidate Frontier containing active, supported,
+contradicted, inconclusive, confirmed, and unsubmitted Candidate IDs. This frontier is a projection,
+not a second authority: Graph and Policy cannot independently change Candidate status. A
+deterministic `slowSQL` versus `dbNetworkLatency` E2E proves differential Trace planning,
+Candidate-scoped evidence updates, safe confirmation, and replay integrity.
 
 ## 9. Roadmap and acceptance
 
@@ -159,6 +171,15 @@ Its deterministic policy may choose actions and propose hypotheses, but authorit
 must still be delegated to the internal Agent domain core.
 
 ## 10. Claim boundary
+
+The optional dynamic discovery increment is documented in `analysis/dynamic_discovery.md`.
+The main LangGraph/Runner chain accepts a separate discovery adapter and a host-owned typed signal
+and rule registry. Static Catalog candidates remain available. Core compiles selected predicates;
+Runner registers episode-local candidates, executes bounded queries and explicitly binds evidence.
+Generic anomalies cannot automatically confirm a causal mechanism: a host-reviewed sufficiency
+contract and Core evidence checks are required. Discovery is bounded by attempts, model waiting,
+candidate count, rounds and the existing query budget. Preview remains read-only and definitions
+are transcript-bound. The initial registry exposes only existing issued resource/trace capabilities.
 
 t025 and t030 are exposed development regressions. Their controlled Trace difference validates the
 environment interface, not Agent accuracy, blind generalization, production readiness, arbitrary

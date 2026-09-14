@@ -83,27 +83,34 @@ def test_partial_positive_evidence_is_supported_but_not_confirmed():
 
 
 def test_model_inferred_values_cannot_become_confirmation_evidence():
-    decision = CoreDecisionProvider().decide(
-        (_proposal("slowSQL"),),
-        (
-            _record(
-                "obs-0000000000000001",
-                "sql_duration_share",
-                0.8,
-                DataStatus.MODEL_INFERRED,
-            ),
-            _record(
-                "obs-0000000000000002",
-                "sql_shape",
-                "complex_cross_join",
-                DataStatus.MODEL_INFERRED,
-            ),
+    proposal = _proposal("slowSQL")
+    observations = (
+        _record(
+            "obs-0000000000000001",
+            "sql_duration_share",
+            0.8,
+            DataStatus.MODEL_INFERRED,
         ),
+        _record(
+            "obs-0000000000000002",
+            "sql_shape",
+            "complex_cross_join",
+            DataStatus.MODEL_INFERRED,
+        ),
+    )
+    decision = CoreDecisionProvider().decide(
+        (proposal,),
+        observations,
         StopReason.POLICY_REQUEST,
     )
+    preview = CoreDecisionProvider().preview((proposal,), observations)
 
     assert decision.status == DecisionStatus.INCONCLUSIVE
     assert decision.winning_hypothesis_id is None
+    assert preview.candidate_assessments[0].unavailable_signals == (
+        "sql_duration_share",
+        "sql_shape",
+    )
 
 
 def test_unknown_candidate_fails_closed_as_out_of_scope():
@@ -131,6 +138,45 @@ def test_single_condition_catalog_candidate_can_confirm():
 
     assert decision.status == DecisionStatus.CONFIRMED_ROOT_CAUSE
     assert decision.winning_hypothesis_id == "h-dbnetworklatency"
+
+
+def test_candidate_scoped_evidence_does_not_leak_between_proposals():
+    slow_sql = _proposal("slowSQL").model_copy(
+        update={"observation_refs": ("obs-0000000000000001",)}
+    )
+    db_network = _proposal("dbNetworkLatency").model_copy(
+        update={"observation_refs": ()}
+    )
+    connection_observation = _record(
+        "obs-0000000000000001",
+        "connection_duration_ms",
+        180.0,
+    )
+
+    decision = CoreDecisionProvider().decide(
+        (slow_sql, db_network),
+        (connection_observation,),
+        StopReason.POLICY_REQUEST,
+    )
+    preview = CoreDecisionProvider().preview(
+        (slow_sql, db_network),
+        (connection_observation,),
+    )
+
+    assert decision.status == DecisionStatus.INCONCLUSIVE
+    assert decision.winning_hypothesis_id is None
+    db_state = next(
+        item
+        for item in preview.candidate_assessments
+        if item.candidate_id == "dbNetworkLatency"
+    )
+    assert db_state.evidence_status.value == "unassessed"
+    connection_gap = next(
+        item
+        for item in preview.discriminating_signals
+        if item.signal == "connection_duration_ms"
+    )
+    assert connection_gap.issued_observation_refs == ("obs-0000000000000001",)
 
 
 def test_episode_runner_uses_issued_observation_ledger_for_core_decision():

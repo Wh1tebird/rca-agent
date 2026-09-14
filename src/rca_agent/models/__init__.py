@@ -7,6 +7,7 @@ from rca_agent.models.actions import (
     StopReason,
     SubmitHypothesisAction,
     ToolName,
+    UpdateCandidateEvidenceAction,
     parse_policy_action,
 )
 from rca_agent.models.common import (
@@ -23,8 +24,13 @@ from rca_agent.models.contract import CapabilityDescriptor, QueryBudgetView, Res
 from rca_agent.models.episode import (
     AnswerArtifact,
     AuthoritativeDecision,
+    CandidateAssessmentPreview,
+    CandidateEvidenceStatus,
+    CandidateFrontier,
+    CoreAssessmentPreview,
     DecisionSource,
     DecisionStatus,
+    DiscriminatingSignalView,
     EpisodeStatus,
 )
 from rca_agent.models.queries import (
@@ -41,11 +47,16 @@ __all__ = [
     "AnswerArtifact",
     "AuthoritativeDecision",
     "CallToolAction",
+    "CandidateAssessmentPreview",
+    "CandidateEvidenceStatus",
+    "CandidateFrontier",
     "CapabilityDescriptor",
     "CompareMetricWindowsRequest",
+    "CoreAssessmentPreview",
     "DataStatus",
     "DecisionSource",
     "DecisionStatus",
+    "DiscriminatingSignalView",
     "EntityRef",
     "EpisodeStatus",
     "GetMetricSeriesRequest",
@@ -67,5 +78,6 @@ __all__ = [
     "ToolName",
     "ToolResponse",
     "ToolStatus",
+    "UpdateCandidateEvidenceAction",
     "parse_policy_action",
 ]
