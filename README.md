@@ -4,6 +4,10 @@ Optional unknown-mechanism discovery is now integrated into the main LangGraph/R
 It preserves the static Catalog and validates dynamic predicates against host-owned signal/rule
 contracts. See [dynamic discovery setup and limits](analysis/dynamic_discovery.md).
 
+Dynamic mechanisms passing the common verification standard return `DISCOVERED_VERIFIED` as the
+root-cause result for this investigation. They need no per-mechanism human sufficiency definition;
+the result does not automatically promote them to Catalog or assert exhaustive causal proof.
+
 `rca-agent` wraps RCA100 as a controlled, interactive investigation environment. An investigation
 policy receives a small event bootstrap payload and can acquire additional facts only through
 bounded, typed, read-only tools. Candidate interpretation and final evidence decisions belong to

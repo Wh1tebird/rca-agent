@@ -4,7 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from rca_agent.core.dynamic import CompiledCandidate, assess_dynamic
+from rca_agent.core.dynamic import (
+    CompiledCandidate,
+    DynamicVerification,
+    assess_dynamic,
+    verify_dynamic,
+)
 from rca_agent.core.evidence_control import DecisionStatus as CoreDecisionStatus
 from rca_agent.core.evidence_control import EvidenceController, FamilyRoute, RouteStatus
 from rca_agent.core.v3.catalog import mechanism_catalog
@@ -77,6 +82,7 @@ class _CoreEvaluation:
     decision: Any
     unresolved: tuple[str, ...]
     unavailable: tuple[str, ...]
+    dynamic_verifications: dict[str, DynamicVerification]
 
 
 class CoreDecisionProvider:
@@ -94,6 +100,10 @@ class CoreDecisionProvider:
     @property
     def has_dynamic_candidates(self) -> bool:
         return bool(self._dynamic)
+
+    def verification_reports(self, proposals, observations) -> dict[str, DynamicVerification]:
+        evaluation = _evaluate(proposals, observations, self._dynamic)
+        return evaluation.dynamic_verifications if evaluation else {}
 
     def preview(
         self,
@@ -150,6 +160,8 @@ class CoreDecisionProvider:
             )
         decision = evaluation.decision
         status = _decision_status(decision.status, decision.candidate_states)
+        if decision.winner in evaluation.dynamic_verifications:
+            status = DecisionStatus.DISCOVERED_VERIFIED
         winning_hypothesis_id = (
             evaluation.proposals_by_candidate[decision.winner][0].hypothesis_id
             if decision.winner is not None
@@ -160,7 +172,12 @@ class CoreDecisionProvider:
             status=status,
             source=DecisionSource.CORE,
             winning_hypothesis_id=winning_hypothesis_id,
-            reason=_reason(decision.reason, notes),
+            reason=_reason(
+                "dynamic mechanism satisfies generic-root-cause-v1 and is returned as this "
+                "investigation's root cause; not promoted to Catalog; alternatives are bounded "
+                "by the recorded verification plan"
+                if status == DecisionStatus.DISCOVERED_VERIFIED else decision.reason, notes,
+            ),
         )
 
 
@@ -245,21 +262,20 @@ def _evaluate(
             item.assertion for item in assessments if item.assertion is not None
         )
     route = OpenRcaEngine._route(candidates, assertions)
+    verifications = {
+        key: verify_dynamic(value, assessments_by_candidate[key], records_by_candidate[key])
+        for key, value in dynamic.items() if key in assessments_by_candidate
+    }
     eligible = []
     for key in route.eligible_candidates:
         compiled = dynamic.get(key)
-        if compiled is not None:
-            assessments = assessments_by_candidate[key]
-            if (compiled.confirmation is None
-                    or any(a.observation is None for a in assessments)
-                    or any(a.matched and c.polarity == ConditionPolarity.CONTRADICT
-                           for a, c in zip(assessments, compiled.candidate.conditions, strict=True))):
-                continue
+        if compiled is not None and not verifications[key].passed:
+            continue
         eligible.append(key)
     if route.status == RouteStatus.ELIGIBLE:
         route = FamilyRoute(status=RouteStatus.ELIGIBLE, eligible_candidates=eligible) if eligible else (
             FamilyRoute(status=RouteStatus.UNKNOWN,
-                        reasons=["dynamic evidence lacks a complete confirmation contract"])
+                        reasons=["dynamic verification is incomplete or contradicted"])
         )
     decision = EvidenceController().decide(
         [item.candidate_id for item in candidates],
@@ -276,6 +292,7 @@ def _evaluate(
         decision=decision,
         unresolved=tuple(unresolved),
         unavailable=tuple(unavailable),
+        dynamic_verifications=verifications,
     )
 
 
@@ -309,12 +326,18 @@ def _candidate_previews(
                     satisfied.add(condition.signal)
                 else:
                     contradicting.add(condition.signal)
-            elif condition.polarity == ConditionPolarity.CONTRADICT and assessment.matched:
-                contradicting.add(condition.signal)
+            elif condition.polarity == ConditionPolarity.CONTRADICT:
+                if assessment.observation is None:
+                    target = unavailable if condition.signal in scoped_signals else missing
+                    target.add(condition.signal)
+                elif assessment.matched:
+                    contradicting.add(condition.signal)
         proposals = evaluation.proposals_by_candidate[candidate.candidate_id]
         state = state_by_candidate[candidate.candidate_id]
         if evaluation.decision.winner == candidate.candidate_id:
-            evidence_status = CandidateEvidenceStatus.CONFIRMED
+            evidence_status = (CandidateEvidenceStatus.DISCOVERED_VERIFIED
+                               if candidate.candidate_id in evaluation.dynamic_verifications
+                               else CandidateEvidenceStatus.CONFIRMED)
         elif contradicting or state.contradict_strength > 0:
             evidence_status = CandidateEvidenceStatus.CONTRADICTED
         elif state.support_strength > 0:
@@ -333,6 +356,8 @@ def _candidate_previews(
                 contradicting_signals=tuple(sorted(contradicting)),
                 unavailable_signals=tuple(sorted(unavailable)),
                 required_capabilities=tuple(sorted(candidate.required_capabilities)),
+                verification_pending=(candidate.candidate_id in evaluation.dynamic_verifications
+                                      and evidence_status != CandidateEvidenceStatus.DISCOVERED_VERIFIED),
             )
         )
     return tuple(sorted(result, key=lambda item: item.candidate_id))
@@ -348,7 +373,8 @@ def _discriminating_signals(
         item
         for item in previews
         if item.evidence_status
-        not in {CandidateEvidenceStatus.CONFIRMED, CandidateEvidenceStatus.CONTRADICTED}
+        not in {CandidateEvidenceStatus.CONFIRMED, CandidateEvidenceStatus.DISCOVERED_VERIFIED,
+                CandidateEvidenceStatus.CONTRADICTED}
     )
     if len(unresolved) < 2:
         return ()

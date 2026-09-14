@@ -6,7 +6,6 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
 from rca_agent.core.dynamic import (
-    ConfirmationContract,
     DiscoveryPayload,
     DynamicHypothesis,
     EvidenceRegistry,
@@ -14,6 +13,7 @@ from rca_agent.core.dynamic import (
     RuleSpec,
     SignalSpec,
     assess_dynamic,
+    verify_dynamic,
 )
 from rca_agent.core.v3.models import ConditionPolarity, MechanismFamily
 from rca_agent.langchain_discovery import LangChainDiscoveryAdapter
@@ -58,7 +58,7 @@ def query(signal):
     )
 
 
-def registry(confirm=False):
+def registry():
     return EvidenceRegistry(
         signals=tuple(
             SignalSpec(
@@ -75,7 +75,7 @@ def registry(confirm=False):
             for s, description in (
                 ("active_ratio", "busy workers divided by maximum workers"),
                 ("queue_ratio", "queued tasks divided by queue capacity"),
-                ("rejection_ratio", "rejected tasks divided by submitted tasks"),
+                ("downstream_wait_ratio", "fraction of worker time blocked on downstream"),
             )
         ),
         rules=tuple(
@@ -90,19 +90,9 @@ def registry(confirm=False):
             for s, threshold in (
                 ("active_ratio", 0.9),
                 ("queue_ratio", 0.8),
-                ("rejection_ratio", 0.01),
+                ("downstream_wait_ratio", 0.1),
             )
         ),
-        confirmations=(
-            ConfirmationContract(
-                mechanism="thread pool exhaustion",
-                required_support=frozenset({"active_ratio", "queue_ratio"}),
-                required_refutations=frozenset({"rejection_ratio"}),
-                provenance="test-only sufficiency contract, not a production recommendation",
-            ),
-        )
-        if confirm
-        else (),
     )
 
 
@@ -123,9 +113,10 @@ def draft(refute=False):
         + (
             (
                 Prediction(
-                    rule_id="rejection_ratio",
+                    rule_id="downstream_wait_ratio",
                     polarity=ConditionPolarity.CONTRADICT,
-                    rationale="Test fixture alternative explanation",
+                    rationale="Downstream blocking would explain worker occupancy instead",
+                    distinguishes=("downstream blocking",),
                 ),
             )
             if refute
@@ -137,7 +128,11 @@ def draft(refute=False):
 
 class Environment:
     def __init__(self, values=None, budget=20):
-        self.values = values or {"active_ratio": 0.95, "queue_ratio": 0.9, "rejection_ratio": 0}
+        self.values = values or {
+            "active_ratio": 0.95,
+            "queue_ratio": 0.9,
+            "downstream_wait_ratio": 0,
+        }
         self.remaining = budget
         self.calls = []
 
@@ -243,17 +238,19 @@ def test_unknown_candidate_full_runner_query_loop_and_replay():
     assert len(runner.dynamic_candidate_options) == 1
 
 
-def test_explicit_confirmation_contract_and_refutation_coverage():
-    runner, report, _, _ = run(Discoverer(draft(refute=True)), registry(confirm=True))
-    assert report.answer.authoritative_decision.status == DecisionStatus.CONFIRMED_ROOT_CAUSE
+def test_generic_verification_without_per_mechanism_configuration():
+    runner, report, _, _ = run(Discoverer(draft(refute=True)), registry())
+    assert report.answer.authoritative_decision.status == DecisionStatus.DISCOVERED_VERIFIED
+    assert report.final_frontier.discovered_verified_candidate_ids
+    assert not report.final_frontier.confirmed_candidate_ids
     assert report.final_preview.overall_decision == report.answer.authoritative_decision
     assert RecordedReplay.verify(runner.transcript.events).valid
     _, contradicted, _, _ = run(
         Discoverer(draft(refute=True)),
-        registry(confirm=True),
-        Environment({"active_ratio": 0.95, "queue_ratio": 0.9, "rejection_ratio": 0.2}),
+        registry(),
+        Environment({"active_ratio": 0.95, "queue_ratio": 0.9, "downstream_wait_ratio": 0.2}),
     )
-    assert contradicted.answer.authoritative_decision.status != DecisionStatus.CONFIRMED_ROOT_CAUSE
+    assert contradicted.answer.authoritative_decision.status != DecisionStatus.DISCOVERED_VERIFIED
     assert contradicted.final_frontier.contradicted_candidate_ids
 
 
@@ -598,3 +595,203 @@ def test_dynamic_evidence_cannot_be_attached_to_another_hypothesis():
     )
     with pytest.raises(ValueError):
         EpisodeRunner(Environment(), decision_provider=provider)
+
+
+@pytest.mark.parametrize("mechanism", ["unregistered worker saturation", "new mechanism 42"])
+def test_mechanism_name_does_not_gate_generic_verification(mechanism):
+    hypothesis = draft(refute=True).model_copy(update={"mechanism": mechanism})
+    runner, report, _, _ = run(Discoverer(hypothesis))
+    assert report.answer.authoritative_decision.status == DecisionStatus.DISCOVERED_VERIFIED
+    assert report.answer.policy_proposals[-1].mechanism == mechanism
+    assert "this investigation's root cause" in report.answer.authoritative_decision.reason
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def verification_event(runner):
+    event = next(
+        e for e in runner.transcript.events if e.event_type == EventType.DYNAMIC_VERIFICATION
+    )
+    return next(iter(event.payload["candidates"].values()))
+
+
+def test_missing_refutation_data_blocks_verified_root_cause():
+    runner, report, _, _ = run(
+        Discoverer(draft(refute=True)),
+        environment=Environment(
+            {
+                "active_ratio": 0.95,
+                "queue_ratio": 0.9,
+            }
+        ),
+    )
+    assert report.answer.authoritative_decision.status == DecisionStatus.SUPPORTED_HYPOTHESIS
+    assert "required_observations_unavailable" in verification_event(runner)["blockers"]
+    assert report.final_preview.candidate_assessments[0].verification_pending
+
+
+def test_unresolved_alternative_blocks_result_even_with_positive_support():
+    hypothesis = draft(refute=True).model_copy(
+        update={
+            "alternatives": ("downstream blocking", "scheduler pause"),
+        }
+    )
+    runner, report, _, _ = run(Discoverer(hypothesis))
+    assert report.answer.authoritative_decision.status == DecisionStatus.SUPPORTED_HYPOTHESIS
+    assert "alternative_explanations_unresolved" in verification_event(runner)["blockers"]
+
+
+def test_undeclared_alternative_is_rejected_by_compiler():
+    raw = draft(refute=True).model_dump()
+    raw["predictions"][-1]["distinguishes"] = ["made up alternative"]
+    with pytest.raises(ValueError, match="undeclared alternative"):
+        registry().compile(DynamicHypothesis.model_validate(raw), "ent-service")
+
+
+def test_requerying_discovery_facts_does_not_count_as_new_verification():
+    runner = EpisodeRunner(
+        Environment(), discovery=Discoverer(draft(refute=True)), evidence_registry=registry()
+    )
+    policy = LangChainPolicyAdapter(
+        ScriptedPolicyRunnable(
+            (
+                query("active_ratio"),
+                query("queue_ratio"),
+                query("downstream_wait_ratio"),
+                unknown_action(),
+                RequestStopAction(summary="all available data checked"),
+            )
+        )
+    )
+    report = LangGraphInvestigation(runner, policy).run()
+    assert report.answer.authoritative_decision.status == DecisionStatus.SUPPORTED_HYPOTHESIS
+    assert "no_new_support_verification" in verification_event(runner)["blockers"]
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_observation_id_reuse_is_not_new_verification():
+    env = Environment()
+    records = []
+    for signal in ("active_ratio", "queue_ratio", "downstream_wait_ratio"):
+        response = env.get_metric_series(query(signal).request)
+        records.append(IssuedObservation(response.observations[0], response.query_ref))
+    compiled = registry().compile(
+        draft(refute=True),
+        "ent-service",
+        discovery_observation_refs=tuple(r.observation.observation_id for r in records),
+    )
+    assessments = tuple(assess_dynamic(compiled, tuple(records)))
+    assert (
+        "no_new_support_verification"
+        in verify_dynamic(compiled, assessments, tuple(records)).blockers
+    )
+
+
+def test_verified_status_requires_core_and_winner():
+    from rca_agent.models import AuthoritativeDecision
+
+    for source, winner in (("rca_agent_core", None), ("phase2_lifecycle_default", "h-test")):
+        with pytest.raises(ValidationError):
+            AuthoritativeDecision(
+                status=DecisionStatus.DISCOVERED_VERIFIED,
+                source=source,
+                winning_hypothesis_id=winner,
+                reason="not authoritative",
+            )
+
+
+def test_replay_recomputes_generic_verification_instead_of_trusting_pass_flag():
+    from rca_agent.runner.replay import ReplayValidationError
+    from rca_agent.runner.transcript import Transcript
+
+    runner, _, _, _ = run()
+    rebuilt = Transcript(runner.episode_id)
+    for event in runner.transcript.events:
+        if event.event_type == EventType.ANSWER_FROZEN:
+            break
+        payload = event.payload
+        if event.event_type == EventType.DYNAMIC_VERIFICATION:
+            payload = {
+                "candidates": {
+                    k: {**v, "passed": True, "blockers": []}
+                    for k, v in payload["candidates"].items()
+                }
+            }
+        rebuilt.append(event.event_type, payload)
+    with pytest.raises(ReplayValidationError, match="differs from recorded evidence"):
+        RecordedReplay.verify(rebuilt.events)
+
+
+def test_rule_definitions_and_discovery_snapshot_are_recorded_before_queries():
+    runner, report, _, _ = run(Discoverer(draft(refute=True)))
+    registration = next(
+        e
+        for e in runner.transcript.events
+        if e.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED
+    )
+    compiled = registration.payload["compiled"]
+    assert compiled["discovery_query_refs"] == [
+        query_fingerprint("get_metric_series", query("active_ratio").request)
+    ]
+    assert len(compiled["predictions"]) == 3
+    assert compiled["alternatives"] == ["downstream blocking"]
+    assert "confirmation" not in compiled
+    assert report.final_preview.overall_decision == report.answer.authoritative_decision
+    proof = verification_event(runner)
+    assert proof["passed"] and proof["standard"] == "generic-root-cause-v1"
+    assert proof["distinguished_alternatives"] == ["downstream blocking"]
+
+
+def test_same_facts_with_new_ids_and_query_limits_do_not_verify():
+    from rca_agent.core.dynamic import observation_fact_digest
+
+    original_records = []
+    env = Environment()
+    for signal in ("active_ratio", "queue_ratio", "downstream_wait_ratio"):
+        response = env.get_metric_series(query(signal).request)
+        original_records.append(IssuedObservation(response.observations[0], response.query_ref))
+    raw = registry().model_dump()
+    for spec in raw["signals"]:
+        spec["query"]["request"]["max_points"] = 51
+    reg = EvidenceRegistry.model_validate(raw)
+    compiled = reg.compile(draft(refute=True), "ent-service",
+                           discovery_fact_digests=tuple(observation_fact_digest(r.observation)
+                                                       for r in original_records))
+    records = tuple(IssuedObservation(
+        original.observation.model_copy(update={"observation_id": f"obs-{i:016x}"}),
+        query_fingerprint(spec.query.tool_name, spec.query.request),
+    ) for i, (original, spec) in enumerate(zip(original_records, reg.signals, strict=True)))
+    report = verify_dynamic(compiled, tuple(assess_dynamic(compiled, records)), records)
+    assert not report.passed
+    assert "no_new_support_verification" in report.blockers
+
+
+def test_a_new_but_unsatisfied_sample_cannot_certify_old_maximum():
+    from rca_agent.core.dynamic import observation_fact_digest
+
+    raw = registry().model_dump()
+    for rule in raw["rules"]:
+        rule["aggregation"] = "max"
+    reg = EvidenceRegistry.model_validate(raw)
+    env = Environment()
+    old_records = []
+    for signal in ("active_ratio", "queue_ratio", "downstream_wait_ratio"):
+        response = env.get_metric_series(query(signal).request)
+        old_records.append(IssuedObservation(response.observations[0], response.query_ref))
+    compiled = reg.compile(draft(refute=True), "ent-service",
+                           discovery_fact_digests=tuple(observation_fact_digest(r.observation)
+                                                       for r in old_records))
+    new = IssuedObservation(old_records[0].observation.model_copy(update={
+        "observation_id": "obs-1111111111111111", "value": .1,
+    }), old_records[0].query_ref)
+    records = (*old_records, new)
+    report = verify_dynamic(compiled, tuple(assess_dynamic(compiled, records)), records)
+    assert not report.passed
+    assert "no_new_support_verification" in report.blockers
+
+
+@pytest.mark.parametrize("alternatives", [("",), ("downstream blocking", "Downstream blocking")])
+def test_blank_or_duplicate_alternatives_are_not_valid_tests(alternatives):
+    raw = draft().model_dump()
+    raw["alternatives"] = alternatives
+    with pytest.raises(ValidationError):
+        DynamicHypothesis.model_validate(raw)

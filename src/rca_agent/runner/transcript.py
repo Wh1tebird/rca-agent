@@ -29,6 +29,7 @@ class EventType(StrEnum):
     DISCOVERY_COMPLETED = "discovery_completed"
     DYNAMIC_CANDIDATE_REGISTERED = "dynamic_candidate_registered"
     CATALOG_CANDIDATE_ALIGNED = "catalog_candidate_aligned"
+    DYNAMIC_VERIFICATION = "dynamic_verification"
     STOP_REQUESTED = "stop_requested"
     ANSWER_FROZEN = "answer_frozen"
     EVALUATION_STARTED = "evaluation_started"

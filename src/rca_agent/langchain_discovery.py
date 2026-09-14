@@ -28,7 +28,12 @@ class LangChainDiscoveryAdapter:
                         "A refutation prediction describes a phenomenon that would refute the mechanism. "
                         "Never invent measurements, thresholds, weights, queries or a final decision. "
                         "Return an empty hypotheses list if the available rules cannot test a mechanism. "
-                        "Generic anomalies alone do not establish causality."
+                    "Include at least one executable refutation test. For each listed alternative, "
+                    "provide a distinguishing prediction with its exact name in distinguishes. "
+                    "Choose evidence from different causal dimensions, and predict additional "
+                    "observations beyond those already supplied. All predictions are required tests. "
+                    "Completed generic verification can return the new mechanism as the root cause "
+                    "for this investigation without Catalog promotion."
                     ),
                 ),
                 ("human", "{context_json}"),

@@ -21,6 +21,7 @@ class DecisionStatus(StrEnum):
     INCONCLUSIVE = "inconclusive"
     SUPPORTED_HYPOTHESIS = "supported_hypothesis"
     CONFIRMED_ROOT_CAUSE = "confirmed_root_cause"
+    DISCOVERED_VERIFIED = "discovered_verified"
     OUT_OF_SCOPE = "out_of_scope"
     QUERY_FAILED = " query_failed"
 
@@ -36,6 +37,7 @@ class CandidateEvidenceStatus(StrEnum):
     SUPPORTED = "supported"
     CONTRADICTED = "contradicted"
     CONFIRMED = "confirmed"
+    DISCOVERED_VERIFIED = "discovered_verified"
 
 
 class AuthoritativeDecision(BaseModel):
@@ -48,7 +50,7 @@ class AuthoritativeDecision(BaseModel):
 
     @model_validator(mode="after")
     def confirmation_requires_core_authority(self) -> AuthoritativeDecision:
-        if self.status == DecisionStatus.CONFIRMED_ROOT_CAUSE and (
+        if self.status in {DecisionStatus.CONFIRMED_ROOT_CAUSE, DecisionStatus.DISCOVERED_VERIFIED} and (
             self.source != DecisionSource.CORE or self.winning_hypothesis_id is None
         ):
             raise ValueError("confirmed root cause requires domain-core authority and a winner")
@@ -68,6 +70,7 @@ class CandidateAssessmentPreview(BaseModel):
     contradicting_signals: tuple[str, ...] = ()
     unavailable_signals: tuple[str, ...] = ()
     required_capabilities: tuple[str, ...] = ()
+    verification_pending: bool = False
 
 
 class DiscriminatingSignalView(BaseModel):
@@ -107,6 +110,7 @@ class CandidateFrontier(BaseModel):
     contradicted_candidate_ids: tuple[str, ...] = ()
     inconclusive_candidate_ids: tuple[str, ...] = ()
     confirmed_candidate_ids: tuple[str, ...] = ()
+    discovered_verified_candidate_ids: tuple[str, ...] = ()
     unsubmitted_candidate_ids: tuple[str, ...] = ()
 
 

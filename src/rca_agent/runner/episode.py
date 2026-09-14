@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from rca_agent.core.dynamic import DiscoveryPayload, EvidenceRegistry
+from rca_agent.core.dynamic import DiscoveryPayload, EvidenceRegistry, observation_fact_digest
 from rca_agent.core.v3.catalog import mechanism_catalog
 from rca_agent.environment.contract import RcaEnvironment
 from rca_agent.models import (
@@ -142,7 +142,9 @@ class EpisodeRunner:
                 or not isinstance(self.__decision_provider, CoreDecisionProvider)):
             return False
         preview = self.preview_core_assessment()
-        if preview.overall_decision.status == DecisionStatus.CONFIRMED_ROOT_CAUSE:
+        if preview.overall_decision.status in {
+            DecisionStatus.CONFIRMED_ROOT_CAUSE, DecisionStatus.DISCOVERED_VERIFIED,
+        }:
             return False
         resolved = {h for c in preview.candidate_assessments for h in c.hypothesis_ids}
         if any(p.hypothesis_id not in resolved for p in self.__proposals):
@@ -217,7 +219,17 @@ class EpisodeRunner:
                     if original is None or draft.source_hypothesis_id in seen:
                         raise ValueError("unknown or duplicate source hypothesis")
                     seen.add(draft.source_hypothesis_id)
-                    compiled = registry.compile(draft, original.causal_entity_ref)
+                    compiled = registry.compile(
+                        draft, original.causal_entity_ref,
+                        discovery_query_refs=tuple(sorted({
+                            r.query_ref for r in self.__observation_ledger.values()
+                        })),
+                        discovery_observation_refs=tuple(sorted(self.__observation_ledger)),
+                        discovery_fact_digests=tuple(sorted({
+                            observation_fact_digest(r.observation)
+                            for r in self.__observation_ledger.values()
+                        })),
+                    )
                     if not all(self._signal_executable(s) for s in compiled.signals):
                         raise ValueError("query recipe is not executable in this episode")
                     existing = next((c for c in mechanism_catalog(original.causal_entity_ref)
@@ -443,6 +455,14 @@ class EpisodeRunner:
             tuple(self.__observation_ledger[item] for item in used_observations),
             termination_reason,
         )
+        if isinstance(self.__decision_provider, CoreDecisionProvider):
+            reports = self.__decision_provider.verification_reports(
+                proposals, tuple(self.__observation_ledger[item] for item in used_observations),
+            )
+            if reports:
+                self.transcript.append(EventType.DYNAMIC_VERIFICATION, {
+                    "candidates": {key: report.model_dump(mode="json") for key, report in reports.items()},
+                })
         frozen_at = datetime.now(UTC)
         fields = {
             "episode_id": self.episode_id,

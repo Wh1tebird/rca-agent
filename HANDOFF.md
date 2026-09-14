@@ -6,13 +6,18 @@ Bounded dynamic discovery is integrated into LangGraph/Runner. Configure a separ
 adapter and an EvidenceRegistry (or builder). Existing Catalog candidates remain available.
 The compiler checks signal types, units, threshold sources, reference data, independent groups
 and query recipes. Runner owns registration, verification, evidence binding and transcript events.
-Dynamic predicates default to support/inconclusive; confirmation requires a host-reviewed
-sufficiency contract and Core evidence checks.
+Dynamic mechanisms can now return `DISCOVERED_VERIFIED` as this investigation's root-cause result.
+The prior per-mechanism ConfirmationContract was removed. All dynamic mechanisms use the same
+generic standard: independent support, executed refutation and declared-alternative checks, new
+verification evidence and Core arbitration. Incomplete/contradicted plans do not pass. This result
+does not promote the mechanism to Catalog or claim exhaustive exclusion of all possible alternatives.
+Transcript records the plan's discovery evidence snapshot and verification outcomes; replay
+recomputes the generic check and validates the dynamic root-cause result from issued evidence.
 
 See `analysis/dynamic_discovery.md` for setup and limits. The initial RCA100 registry uses existing
 issued trace/resource signals; thread-pool tests use synthetic data. No live inference was performed.
 Next integration work is backend-specific inventories and a separately assessed live model run.
-Validation for this increment: Ruff passed; 117 tests passed (23 new dynamic-discovery tests).
+Validation for the generic-verification revision: Ruff passed; 131 tests passed.
 The older sections below describe the baseline before this increment.
 
 Updated: 2026-09-01

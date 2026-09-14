@@ -230,7 +230,7 @@ class LangGraphInvestigation:
             return "verify_discovery"
         if (
             state["core_assessment"].overall_decision.status
-            == DecisionStatus.CONFIRMED_ROOT_CAUSE
+            in {DecisionStatus.CONFIRMED_ROOT_CAUSE, DecisionStatus.DISCOVERED_VERIFIED}
         ):
             return "finalize"
         if self._runner.should_discover():
@@ -302,6 +302,10 @@ def _candidate_frontier(
                 for item, status in statuses.items()
                 if status == CandidateEvidenceStatus.CONFIRMED
             )
+        ),
+        discovered_verified_candidate_ids=tuple(
+            sorted(item for item, status in statuses.items()
+                   if status == CandidateEvidenceStatus.DISCOVERED_VERIFIED)
         ),
         unsubmitted_candidate_ids=tuple(
             sorted(item.candidate_id for item in options if item.candidate_id not in statuses)

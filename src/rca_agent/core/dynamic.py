@@ -127,6 +127,7 @@ class Prediction(BaseModel):
     rule_id: str
     polarity: ConditionPolarity
     rationale: str = Field(min_length=1, max_length=500)
+    distinguishes: tuple[str, ...] = Field(default=(), max_length=8)
 
 
 class DynamicHypothesis(BaseModel):
@@ -138,20 +139,17 @@ class DynamicHypothesis(BaseModel):
     predictions: tuple[Prediction, ...] = Field(min_length=2, max_length=12)
     alternatives: tuple[str, ...] = Field(min_length=1, max_length=8)
 
+    @model_validator(mode="after")
+    def nonempty_unique_alternatives(self):
+        alternatives = [value.strip().casefold() for value in self.alternatives]
+        if any(not value for value in alternatives) or len(set(alternatives)) != len(alternatives):
+            raise ValueError("alternatives must be nonempty and distinct")
+        return self
+
 
 class DiscoveryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     hypotheses: tuple[DynamicHypothesis, ...] = Field(default=(), max_length=4)
-
-
-class ConfirmationContract(BaseModel):
-    """Optional host-owned sufficiency contract; generic anomalies alone cannot confirm."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    mechanism: str
-    required_support: frozenset[str]
-    required_refutations: frozenset[str] = frozenset()
-    provenance: str = Field(min_length=1)
 
 
 class CompiledCandidate(BaseModel):
@@ -160,7 +158,11 @@ class CompiledCandidate(BaseModel):
     source_hypothesis_id: str
     rules: tuple[RuleSpec, ...]
     signals: tuple[SignalSpec, ...]
-    confirmation: ConfirmationContract | None = None
+    predictions: tuple[Prediction, ...] = ()
+    alternatives: tuple[str, ...] = ()
+    discovery_query_refs: tuple[str, ...] = ()
+    discovery_observation_refs: tuple[str, ...] = ()
+    discovery_fact_digests: tuple[str, ...] = ()
     version: str
 
 
@@ -168,7 +170,6 @@ class EvidenceRegistry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     signals: tuple[SignalSpec, ...]
     rules: tuple[RuleSpec, ...]
-    confirmations: tuple[ConfirmationContract, ...] = ()
 
     @model_validator(mode="after")
     def validate_contracts(self):
@@ -214,7 +215,15 @@ class EvidenceRegistry(BaseModel):
                         raise ValueError("reference signal type or unit mismatch")
         return self
 
-    def compile(self, draft: DynamicHypothesis, entity_ref: str) -> CompiledCandidate:
+    def compile(
+        self,
+        draft: DynamicHypothesis,
+        entity_ref: str,
+        *,
+        discovery_query_refs: tuple[str, ...] = (),
+        discovery_observation_refs: tuple[str, ...] = (),
+        discovery_fact_digests: tuple[str, ...] = (),
+    ) -> CompiledCandidate:
         by_rule = {r.rule_id: r for r in self.rules}
         by_signal = {s.signal: s for s in self.signals if s.entity_ref == entity_ref}
         selected: list[RuleSpec] = []
@@ -223,6 +232,8 @@ class EvidenceRegistry(BaseModel):
         if len({p.rule_id for p in draft.predictions}) != len(draft.predictions):
             raise ValueError("duplicate predictions")
         for prediction in draft.predictions:
+            if not set(prediction.distinguishes) <= set(draft.alternatives):
+                raise ValueError("discriminating prediction references an undeclared alternative")
             rule = by_rule.get(prediction.rule_id)
             if rule is None:
                 raise ValueError("unknown rule")
@@ -243,6 +254,9 @@ class EvidenceRegistry(BaseModel):
             "entity": entity_ref,
             "rules": [r.model_dump(mode="json") for r in selected],
             "signals": [s.model_dump(mode="json") for s in specs.values()],
+            "discovery_query_refs": discovery_query_refs,
+            "discovery_observation_refs": discovery_observation_refs,
+            "discovery_fact_digests": discovery_fact_digests,
         }
         version = sha256_digest(payload)
         candidate_id = "dyn_" + version[:24]
@@ -261,21 +275,6 @@ class EvidenceRegistry(BaseModel):
             )
             for r, p in zip(selected, draft.predictions, strict=True)
         ]
-        support = {p.rule_id for p in draft.predictions if p.polarity == ConditionPolarity.SUPPORT}
-        refutations = {
-            p.rule_id for p in draft.predictions if p.polarity == ConditionPolarity.CONTRADICT
-        }
-        confirmation = next(
-            (
-                c
-                for c in self.confirmations
-                if c.mechanism == draft.mechanism
-                and len(c.required_support) >= 2
-                and c.required_support <= support
-                and c.required_refutations <= refutations
-            ),
-            None,
-        )
         candidate = Candidate(
             candidate_id=candidate_id,
             fault_type=draft.mechanism,
@@ -299,9 +298,104 @@ class EvidenceRegistry(BaseModel):
             source_hypothesis_id=draft.source_hypothesis_id,
             rules=tuple(selected),
             signals=tuple(specs.values()),
-            confirmation=confirmation,
+            predictions=draft.predictions,
+            alternatives=draft.alternatives,
+            discovery_query_refs=discovery_query_refs,
+            discovery_observation_refs=discovery_observation_refs,
+            discovery_fact_digests=discovery_fact_digests,
             version=version,
         )
+
+
+class DynamicVerification(BaseModel):
+    """One mechanism-independent standard, with auditable test outcomes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    standard: Literal["generic-root-cause-v1"] = "generic-root-cause-v1"
+    passed: bool
+    blockers: tuple[str, ...]
+    support_signals: tuple[str, ...]
+    refutation_signals: tuple[str, ...]
+    distinguished_alternatives: tuple[str, ...]
+    new_query_refs: tuple[str, ...]
+
+
+def observation_fact_digest(observation: Observation) -> str:
+    """Identify a fact independently of request formatting, result limits and issued IDs."""
+    return sha256_digest({
+        "entity_ref": observation.entity_ref, "signal": observation.signal,
+        "value": observation.value, "unit": observation.unit,
+        "observed_at": observation.observed_at.isoformat() if observation.observed_at else None,
+        "trace_ref": observation.details.get("trace_ref"),
+    })
+
+
+def verify_dynamic(
+    compiled: CompiledCandidate,
+    assessments: tuple[EvidenceAssessment, ...],
+    records,
+) -> DynamicVerification:
+    """Require executed support, refutation and alternative tests plus new verification evidence.
+
+    No mechanism name is consulted. The controller still arbitrates eligible candidates.
+    """
+    blockers = []
+    pairs = list(zip(compiled.candidate.conditions, assessments, strict=True))
+    support = [(c, a) for c, a in pairs if c.polarity == ConditionPolarity.SUPPORT]
+    refutations = [(c, a) for c, a in pairs if c.polarity == ConditionPolarity.CONTRADICT]
+    if len({c.independent_group for c, _ in support}) < 2:
+        blockers.append("insufficient_independent_support")
+    if any(a.observation is None for _, a in pairs):
+        blockers.append("required_observations_unavailable")
+    if any(not a.matched for _, a in support):
+        blockers.append("support_predictions_not_satisfied")
+    if not refutations:
+        blockers.append("refutation_test_absent")
+    if any(a.matched for _, a in refutations):
+        blockers.append("refutation_observed")
+    distinguished = set()
+    if len(compiled.predictions) == len(assessments):
+        for prediction, (_, assessment) in zip(compiled.predictions, pairs, strict=True):
+            satisfied = assessment.observation is not None and (
+                assessment.matched
+                if prediction.polarity == ConditionPolarity.SUPPORT
+                else not assessment.matched
+            )
+            if satisfied:
+                distinguished.update(prediction.distinguishes)
+    if not compiled.alternatives or not set(compiled.alternatives) <= distinguished:
+        blockers.append("alternative_explanations_unresolved")
+    # A repeated query or repackaged old Observation is not a new verification fact.
+    fresh_records = tuple(
+        r
+        for r in records
+        if r.query_ref not in compiled.discovery_query_refs
+        and r.observation.observation_id not in compiled.discovery_observation_refs
+        and observation_fact_digest(r.observation) not in compiled.discovery_fact_digests
+        and r.complete
+    )
+    new_queries = set()
+    for index, (condition, assessment) in enumerate(pairs):
+        if condition.polarity != ConditionPolarity.SUPPORT or not assessment.matched:
+            continue
+        reference_signal = compiled.rules[index].reference_signal
+        reference_rows = tuple(r for r in records if r not in fresh_records
+                               and r.observation.signal == reference_signal)
+        fresh_assessment = assess_dynamic(compiled, (*fresh_records, *reference_rows))[index]
+        if fresh_assessment.matched and fresh_assessment.observation is not None:
+            new_queries.add(fresh_assessment.observation.query_ref)
+    if not new_queries:
+        blockers.append("no_new_support_verification")
+    return DynamicVerification(
+        passed=not blockers,
+        blockers=tuple(blockers),
+        support_signals=tuple(sorted(c.signal for c, a in support if a.matched)),
+        refutation_signals=tuple(
+            sorted(c.signal for c, a in refutations if a.observation is not None and not a.matched)
+        ),
+        distinguished_alternatives=tuple(sorted(distinguished)),
+        new_query_refs=tuple(sorted(new_queries)),
+    )
 
 
 def assess_dynamic(compiled: CompiledCandidate, records) -> list[EvidenceAssessment]:

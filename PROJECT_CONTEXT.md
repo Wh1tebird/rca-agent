@@ -176,8 +176,11 @@ The optional dynamic discovery increment is documented in `analysis/dynamic_disc
 The main LangGraph/Runner chain accepts a separate discovery adapter and a host-owned typed signal
 and rule registry. Static Catalog candidates remain available. Core compiles selected predicates;
 Runner registers episode-local candidates, executes bounded queries and explicitly binds evidence.
-Generic anomalies cannot automatically confirm a causal mechanism: a host-reviewed sufficiency
-contract and Core evidence checks are required. Discovery is bounded by attempts, model waiting,
+Dynamic mechanisms passing the mechanism-independent `generic-root-cause-v1` standard and Core
+arbitration return `DISCOVERED_VERIFIED` as this investigation's root-cause result. No per-mechanism
+human sufficiency contract is required. The standard requires completed independent support,
+refutation and declared-alternative checks plus new verification evidence. This does not promote
+the mechanism to Catalog or exhaust every theoretical alternative. Discovery is bounded by attempts, model waiting,
 candidate count, rounds and the existing query budget. Preview remains read-only and definitions
 are transcript-bound. The initial registry exposes only existing issued resource/trace capabilities.
 
