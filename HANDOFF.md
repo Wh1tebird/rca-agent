@@ -129,5 +129,13 @@ verification standard to improve the headline recovery rate. Improve discovery c
 and expand host capability coverage, then measure Ground-Truth recall and wrong-verification rate.
 A non-LLM deterministic investigation-policy baseline remains useful as a comparison arm.
 
+The first preregistered expansion has now run all 7 available `dbNetworkLatency`/`slowSQL` cases with
+`deepseek-chat` and thinking disabled. Results: 7 valid replays, 6 discovery completions, 6 cases with
+compiled drafts, 4 GT-like proposals, 1 correct `DISCOVERED_VERIFIED`, 0 wrong verifications,
+3 `QUERY_FAILED`, and 1 `OUT_OF_SCOPE`. t030 is the verified success. DB-network recall remains 0/2;
+both misses were safer connection-pool guesses that Core declined to verify. Before expanding to
+20-30 cross-mechanism cases, add blind acquisition and at least two independent executable evidence
+groups for those mechanism families; otherwise the larger number mostly measures missing capability.
+
 Backend Verification Replay, signed transcript anchoring, concurrent transcript storage, evaluator
 scoring, and a general untrusted-code sandbox remain explicit follow-up work.

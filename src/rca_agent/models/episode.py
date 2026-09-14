@@ -23,7 +23,7 @@ class DecisionStatus(StrEnum):
     CONFIRMED_ROOT_CAUSE = "confirmed_root_cause"
     DISCOVERED_VERIFIED = "discovered_verified"
     OUT_OF_SCOPE = "out_of_scope"
-    QUERY_FAILED = " query_failed"
+    QUERY_FAILED = "query_failed"
 
 
 class DecisionSource(StrEnum):

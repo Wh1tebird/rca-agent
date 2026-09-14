@@ -194,3 +194,9 @@ and t030 proposed plausible Catalog-external mechanisms, including the correct s
 for t030, but Core correctly stopped at `SUPPORTED_HYPOTHESIS` because the model did not bind its
 predictions to declared alternatives. See `analysis/unknown_rca_benchmark.md`; these two probes are
 diagnostic observations, not accuracy estimates.
+
+A preregistered seven-case batch now covers all available `dbNetworkLatency` and `slowSQL` cases.
+All 7 completed with valid replay: 4 proposed a GT-like mechanism, 1 (t030/slowSQL) reached a correct
+`DISCOVERED_VERIFIED`, and 0 wrong mechanisms were verified. Three slow-SQL cases exposed trace-stage
+capability failures and one stayed out of scope. Treat these as diagnostic counts, not general RCA
+accuracy; the deterministic post-freeze lexical scorer still requires semantic review.
