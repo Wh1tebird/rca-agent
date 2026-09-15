@@ -2,10 +2,24 @@
 
 ## Latest increment — 2026-09-15
 
-The approved capability expansion stages 1-4 are complete. An evaluation-only generator writes
-`analysis/capability_matrix.{md,json}` and keeps missing transport, pool-capacity, JVM/GC and IO
-signals explicit. The runtime trace registry now exposes truthful Hikari/JDBC aliases, keys recipes
-by target entity, and reserves an unattempted issued trace for verification when available.
+The first capability increment delivered the 1-4 implementation slice, but not every acceptance
+condition in the full seven-step plan. The audit and entity graph are now implemented; database
+differentiation remains partial because transport, pool-capacity and server-side timing are absent;
+the fixed seven-case rerun is complete. The evaluation-only generator writes
+`analysis/capability_matrix.{md,json}`. The runtime trace registry exposes truthful Hikari/JDBC
+aliases, keys recipes by target entity, and reserves an unattempted issued trace for verification
+when available.
+
+The audit has since been upgraded from a static list to an executable inventory: it scans tool and
+entity contracts, query bounds, mapped Signal/Rule metadata, raw Case/sample coverage, unmapped
+metrics and Environment initialization failures. This revealed aggregate JVM and thread-pool data
+across all 103 raw metric sets. The Environment now maps active/max threads, queue depth, rejected
+tasks, runnable/total JVM threads, heap used/max and generic GC count/pause deltas for issued
+services. Core advertises bounded reusable rules without requiring those metrics to be pre-queried.
+Trace resolution issues both the downstream operation and its owning service, closing the entity
+bridge needed for Discovery. These capabilities remain PARTIAL: the aggregate data lacks queue-wait,
+old-gen/allocation/heap-after-GC and Full-GC-specific semantics, and thresholds still need holdout
+validation. The generic verification standard was not weakened.
 
 Acquisition can traverse issued operation/service relationships and request bounded slow traces for
 a discovered service. Trace breakdown preserves exact operation matches and otherwise resolves a
@@ -15,12 +29,10 @@ remain legal recipes for the resolved downstream target, while returned evidence
 that target.
 
 The fixed seven-case live batch was rerun with `deepseek-chat`: 7/7 completed, 7/7 replayed, 4/7
-compiled at least one draft, 3/7 proposed the GT mechanism, 1/7 reached a correct
-`DISCOVERED_VERIFIED` (t084/slowSQL), and 0 wrong mechanisms verified. Final `QUERY_FAILED` fell from
-3 to 0. Both DB-network cases proposed the held-out mechanism but remained
-`SUPPORTED_HYPOTHESIS`, correctly reflecting the lack of RTT and server-execution telemetry.
-Three drafts failed closed at compiler contracts and one case was inconclusive. Ruff and all 137
-tests pass.
+compiled at least one draft, 4/7 proposed the GT mechanism, 1/7 reached a correct
+`DISCOVERED_VERIFIED` (t021/slowSQL), and 0 wrong mechanisms verified. Final `QUERY_FAILED` fell from
+3 to 0. The proposed DB-network mechanism remained `SUPPORTED_HYPOTHESIS`, correctly reflecting the
+lack of RTT and server-execution telemetry. Ruff passes, as do all 143 tests.
 
 The older sections below describe the baseline before this increment.
 

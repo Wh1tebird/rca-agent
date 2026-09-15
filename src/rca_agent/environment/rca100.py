@@ -209,7 +209,9 @@ class Rca100Environment:
         def operation() -> tuple[ToolStatus, tuple[Observation, ...], str, bool]:
             selection = self.__traces[request.trace_ref]
             try:
-                values, resolved_entity, resolution = self.__adapter.trace_stage_breakdown(selection)
+                values, resolved_entity, resolved_service, resolution = (
+                    self.__adapter.trace_stage_breakdown(selection)
+                )
             except RuntimeError:
                 missing = self._observation(
                     query_ref,
@@ -228,6 +230,7 @@ class Rca100Environment:
                     False,
                 )
             self.__entities[resolved_entity.public_ref] = resolved_entity
+            self.__entities[resolved_service.public_ref] = resolved_service
             statuses = {
                 "operation_duration_ms": DataStatus.OBSERVED,
                 "connection_duration_ms": DataStatus.OBSERVED,
@@ -261,6 +264,9 @@ class Rca100Environment:
                     details={
                         "trace_ref": request.trace_ref,
                         "resolved_entity": self._public_entity(resolved_entity).model_dump(mode="json"),
+                        "resolved_service": self._public_entity(resolved_service).model_dump(
+                            mode="json"
+                        ),
                         "resolution": resolution,
                     },
                 )

@@ -39,6 +39,65 @@ TRACE_SIGNAL_CONTRACTS = {
     ),
 }
 
+NON_CAUSAL_SUPPORT_TRACE_RULES = frozenset({
+    "operation_duration_ms",
+    "sql_duration_ms",
+    "db_client_span_duration_ms",
+})
+
+METRIC_SIGNAL_CONTRACTS = {
+    "thread_pool_max": {
+        "unit": "count", "group": "thread_pool_capacity_reference",
+        "description": "observed aggregate maximum application thread count",
+    },
+    "thread_pool_active": {
+        "unit": "count", "group": "thread_pool_capacity",
+        "description": "aggregate active application threads approach observed pool capacity",
+        "comparison": "gte", "reference_signal": "thread_pool_max", "factor": 0.8,
+        "source": "capacity",
+    },
+    "thread_pool_queue_depth": {
+        "unit": "count", "group": "thread_pool_queueing",
+        "description": "aggregate application thread-pool queue depth is materially elevated",
+        "comparison": "gte", "threshold": 5, "source": "configuration",
+    },
+    "thread_pool_rejected_tasks": {
+        "unit": "count", "group": "thread_pool_failure",
+        "description": "the aggregate application thread-pool rejected-task signal is positive",
+        "comparison": "gte", "threshold": 1, "source": "configuration",
+    },
+    "jvm_runnable_threads": {
+        "unit": "count", "group": "jvm_scheduler_pressure",
+        "description": "aggregate runnable JVM thread count is elevated",
+        "comparison": "gte", "threshold": 1, "source": "configuration",
+    },
+    "jvm_thread_count": {
+        "unit": "count", "group": "jvm_thread_population",
+        "description": "aggregate JVM thread population is unusually high",
+        "comparison": "gte", "threshold": 100, "source": "configuration",
+    },
+    "jvm_heap_used_bytes": {
+        "unit": "bytes", "group": "jvm_heap_capacity",
+        "description": "aggregate JVM heap usage approaches the observed maximum heap",
+        "comparison": "gte", "reference_signal": "jvm_heap_max_bytes", "factor": 0.8,
+        "source": "capacity",
+    },
+    "jvm_heap_max_bytes": {
+        "unit": "bytes", "group": "jvm_heap_capacity_reference",
+        "description": "observed aggregate maximum JVM heap",
+    },
+    "jvm_gc_collection_delta": {
+        "unit": "count", "group": "jvm_gc_frequency",
+        "description": "aggregate JVM garbage-collection count delta is elevated",
+        "comparison": "gte", "threshold": 100, "source": "configuration",
+    },
+    "jvm_gc_pause_seconds_delta": {
+        "unit": "s", "group": "jvm_gc_pause",
+        "description": "aggregate JVM garbage-collection pause-time delta is elevated",
+        "comparison": "gte", "threshold": 5, "source": "configuration",
+    },
+}
+
 
 def rca100_evidence_registry(
     bootstrap: ResetResponse,
@@ -99,6 +158,7 @@ def rca100_evidence_registry(
                     source="configuration",
                     provenance="RCA100 instrumented trace-stage contract",
                     description=description,
+                    support_eligible=signal not in NON_CAUSAL_SUPPORT_TRACE_RULES,
                 )
             rules["sql_duration_share_low"] = RuleSpec(
                 rule_id="sql_duration_share_low",
@@ -108,36 +168,61 @@ def rca100_evidence_registry(
                 source="configuration",
                 provenance="RCA100 trace-stage differential contract",
                 description="SQL client span is a small part of operation duration",
+                support_eligible=False,
             )
+    issued_entity_types = {bootstrap.alert_entity.entity_ref: bootstrap.alert_entity.entity_type}
     for observation in observations:
-        if observation.data_status not in {DataStatus.OBSERVED, DataStatus.DERIVED}:
-            continue
-        if (
-            observation.signal in {"cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"}
-            and observation.unit == "percent"
-            and "get_metric_series" in tools
+        for value in (
+            observation.value if observation.signal == "related_entity" else None,
+            observation.details.get("neighbor"),
+            observation.details.get("resolved_entity"),
+            observation.details.get("resolved_service"),
         ):
-            signal = observation.signal
-            spec = SignalSpec(
-                signal=signal,
-                entity_ref=observation.entity_ref,
-                data_type="number",
-                unit="percent",
-                description="bounded node resource utilization",
-                independent_group=signal,
-                minimum=0,
-                maximum=100,
-                query=CallToolAction(
-                    tool_name="get_metric_series",
-                    request=GetMetricSeriesRequest(
-                        entity_ref=observation.entity_ref,
-                        signal=signal,
-                        window=bootstrap.observation_horizon,
-                        max_points=min(100, tools["get_metric_series"].max_results),
+            if isinstance(value, dict) and value.get("entity_ref") and value.get("entity_type"):
+                issued_entity_types[value["entity_ref"]] = value["entity_type"]
+        if observation.signal in METRIC_SIGNAL_CONTRACTS:
+            issued_entity_types[observation.entity_ref] = "apm.service"
+        if observation.signal in {"cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"}:
+            issued_entity_types[observation.entity_ref] = "k8s.node"
+    metric_specs: dict[tuple[str, str], SignalSpec] = {}
+    if "get_metric_series" in tools:
+        for entity_ref, entity_type in issued_entity_types.items():
+            if entity_type == "apm.service":
+                contracts = METRIC_SIGNAL_CONTRACTS
+            elif entity_type == "k8s.node":
+                contracts = {
+                    signal: {
+                        "unit": "percent", "group": signal,
+                        "description": "bounded node resource utilization",
+                    }
+                    for signal in ("cpu_usage_rate", "memory_usage_rate", "disk_usage_rate")
+                }
+            else:
+                continue
+            for signal, contract in contracts.items():
+                spec = SignalSpec(
+                    signal=signal,
+                    entity_ref=entity_ref,
+                    data_type="number",
+                    unit=contract["unit"],
+                    description=contract["description"],
+                    independent_group=contract["group"],
+                    minimum=0,
+                    maximum=100 if entity_type == "k8s.node" else None,
+                    query=CallToolAction(
+                        tool_name="get_metric_series",
+                        request=GetMetricSeriesRequest(
+                            entity_ref=entity_ref,
+                            signal=signal,
+                            window=bootstrap.observation_horizon,
+                            max_points=min(100, tools["get_metric_series"].max_results),
+                        ),
                     ),
-                ),
-            )
-            specs.setdefault((spec.entity_ref, signal), spec)
+                )
+                metric_specs[(entity_ref, signal)] = spec
+    specs.update(metric_specs)
+    for signal in ("cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"):
+        if any(spec.signal == signal for spec in metric_specs.values()):
             rules[signal] = RuleSpec(
                 rule_id=signal,
                 signal=signal,
@@ -148,4 +233,26 @@ def rca100_evidence_registry(
                 aggregation="max",
                 description="high utilization within the bounded window",
             )
+    for signal, contract in METRIC_SIGNAL_CONTRACTS.items():
+        if "comparison" not in contract:
+            continue
+        targets = [spec for spec in metric_specs.values() if spec.signal == signal]
+        reference_signal = contract.get("reference_signal")
+        if not targets or (
+            reference_signal is not None
+            and any((spec.entity_ref, reference_signal) not in metric_specs for spec in targets)
+        ):
+            continue
+        rules[signal] = RuleSpec(
+            rule_id=signal,
+            signal=signal,
+            comparison=contract["comparison"],
+            threshold=contract.get("threshold"),
+            reference_signal=reference_signal,
+            factor=contract.get("factor", 1),
+            source=contract["source"],
+            provenance="RCA100 aggregate JVM metric contract v1",
+            aggregation="max",
+            description=contract["description"],
+        )
     return EvidenceRegistry(signals=tuple(specs.values()), rules=tuple(rules.values()))

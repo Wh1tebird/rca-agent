@@ -227,6 +227,73 @@ def test_inspect_topology_returns_observed_edges_for_discovered_service(cases_ro
     )
 
 
+def test_service_exposes_neutral_jvm_and_thread_pool_metrics(cases_root: Path):
+    environment = _environment(cases_root, "t007", budget=50)
+    bootstrap = environment.reset()
+    related = environment.list_related_entities(
+        ListRelatedEntitiesRequest(entity_ref=bootstrap.alert_entity.entity_ref, max_results=5)
+    )
+    queue = [related.observations[0].value]
+    visited = set()
+    service_ref = None
+    while queue and service_ref is None:
+        entity = queue.pop(0)
+        if entity["entity_ref"] in visited or entity["entity_type"] != "apm.service":
+            continue
+        visited.add(entity["entity_ref"])
+        if entity["display_name"] == "inventory":
+            service_ref = entity["entity_ref"]
+            break
+        topology = environment.inspect_topology(
+            InspectTopologyRequest(entity_ref=entity["entity_ref"], max_results=50)
+        )
+        queue.extend(
+            item.details["neighbor"]
+            for item in topology.observations
+            if item.details["neighbor"]["entity_type"] == "apm.service"
+            and item.details["direction"] == "outgoing"
+        )
+    assert service_ref is not None
+
+    for signal, unit in (
+        ("thread_pool_active", "count"),
+        ("thread_pool_max", "count"),
+        ("thread_pool_queue_depth", "count"),
+        ("thread_pool_rejected_tasks", "count"),
+        ("jvm_runnable_threads", "count"),
+        ("jvm_heap_used_bytes", "bytes"),
+        ("jvm_gc_pause_seconds_delta", "s"),
+    ):
+        response = environment.get_metric_series(
+            GetMetricSeriesRequest(
+                entity_ref=service_ref,
+                signal=signal,
+                window=_incident_window(bootstrap),
+                max_points=10,
+            )
+        )
+        assert response.status == ToolStatus.SUCCESS
+        assert response.observations
+        assert all(item.unit == unit for item in response.observations)
+        assert all(item.entity_ref == service_ref for item in response.observations)
+
+
+def test_unqualified_apm_operation_uses_bounded_service_trace_fallback(cases_root: Path):
+    environment = _environment(cases_root, "t040")
+    bootstrap = environment.reset()
+    response = environment.get_service_trace_summary(
+        GetServiceTraceSummaryRequest(
+            entity_ref=bootstrap.alert_entity.entity_ref,
+            window=_incident_window(bootstrap),
+            min_duration_ms=100,
+            max_traces=2,
+        )
+    )
+
+    assert response.status in {ToolStatus.SUCCESS, ToolStatus.EMPTY}
+    assert response.status != ToolStatus.QUERY_FAILED
+
+
 @pytest.mark.parametrize(
     ("case_selector", "expected_connection", "expected_share", "expected_shape"),
     [
@@ -306,3 +373,6 @@ def test_t021_trace_breakdown_resolves_the_downstream_database_operation(
         item.details["resolution"] == "downstream_database_operation"
         for item in breakdown.observations
     )
+    resolved_service = facts["sql_duration_ms"].details["resolved_service"]
+    assert resolved_service["entity_type"] == "apm.service"
+    assert resolved_service["entity_ref"].startswith("ent-")

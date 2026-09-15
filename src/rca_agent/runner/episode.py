@@ -198,7 +198,8 @@ class EpisodeRunner:
                          "data_type": s.data_type, "unit": s.unit, "description": s.description,
                          "available": self._signal_executable(s)} for s in registry.signals],
             "rules": [{"rule_id": r.rule_id, "signal": r.signal,
-                       "phenomenon": r.description, "aggregation": r.aggregation}
+                       "phenomenon": r.description, "aggregation": r.aggregation,
+                       "support_eligible": r.support_eligible}
                       for r in registry.rules],
             "entity_graph": self._discovery_entity_graph(registry),
             "observations": [r.observation.model_dump(mode="json")
@@ -344,6 +345,11 @@ class EpisodeRunner:
                 nodes[resolved["entity_ref"]] = resolved
                 edges.add((observation.entity_ref, resolved["entity_ref"],
                            "trace_resolves_to", "outgoing"))
+            resolved_service = observation.details.get("resolved_service")
+            if isinstance(resolved_service, dict):
+                nodes[resolved_service["entity_ref"]] = resolved_service
+                source = resolved["entity_ref"] if isinstance(resolved, dict) else observation.entity_ref
+                edges.add((source, resolved_service["entity_ref"], "operation_of", "parent"))
             if isinstance(target, dict) and "entity_ref" in target:
                 nodes[target["entity_ref"]] = target
                 edges.add((observation.entity_ref, target["entity_ref"],

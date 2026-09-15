@@ -97,6 +97,7 @@ class RuleSpec(BaseModel):
     description: str = Field(
         default="Host-defined observable predicate", min_length=1, max_length=500
     )
+    support_eligible: bool = True
     reference_signal: str | None = None
     factor: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     aggregation: Literal["single", "max", "sustained"] = "single"
@@ -242,6 +243,8 @@ class EvidenceRegistry(BaseModel):
             rule = by_rule.get(prediction.rule_id)
             if rule is None:
                 raise ValueError("unknown rule")
+            if prediction.polarity == ConditionPolarity.SUPPORT and not rule.support_eligible:
+                raise ValueError("rule is not eligible as root-cause support")
             target_entity_ref = prediction.target_entity_ref or causal_entity_ref
             prediction_entities.append(target_entity_ref)
             for signal in (rule.signal, rule.reference_signal):

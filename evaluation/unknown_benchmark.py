@@ -37,6 +37,7 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
         self._summarized_entities: set[str] = set()
         self._expanded_entities: set[str] = set()
         self._acquisition_actions = 0
+        self._pending_expand: str | None = None
 
     def invoke(self, input: dict[str, Any], config: Any = None, **kwargs: Any) -> PolicyEnvelope:
         del config, kwargs
@@ -78,6 +79,22 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
             ))
         if not has_stage_context and self._acquisition_actions < 16:
             entities = _history_entities(context)
+            pending = next(
+                (entity for entity in entities
+                 if entity["entity_ref"] == self._pending_expand
+                 and entity["entity_ref"] not in self._expanded_entities),
+                None,
+            )
+            if pending is not None:
+                self._expanded_entities.add(pending["entity_ref"])
+                self._pending_expand = None
+                self._acquisition_actions += 1
+                return PolicyEnvelope(action=CallToolAction(
+                    tool_name=ToolName.LIST_RELATED_ENTITIES,
+                    request=ListRelatedEntitiesRequest(
+                        entity_ref=pending["entity_ref"], max_results=50,
+                    ),
+                ))
             service = next(
                 (entity for entity in entities
                  if entity["entity_type"] == "apm.service"
@@ -86,6 +103,7 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
             )
             if service is not None:
                 self._summarized_entities.add(service["entity_ref"])
+                self._pending_expand = service["entity_ref"]
                 self._acquisition_actions += 1
                 bootstrap = context["bootstrap"]
                 return PolicyEnvelope(action=CallToolAction(

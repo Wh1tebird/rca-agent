@@ -289,6 +289,17 @@ def test_model_cannot_author_threshold_or_groups():
         EvidenceRegistry.model_validate(raw).compile(draft(), "ent-service")
 
 
+def test_noncausal_symptom_rule_cannot_count_as_root_cause_support():
+    base = registry()
+    restricted = EvidenceRegistry(
+        signals=base.signals,
+        rules=(base.rules[0].model_copy(update={"support_eligible": False}), *base.rules[1:]),
+    )
+
+    with pytest.raises(ValueError, match="not eligible as root-cause support"):
+        restricted.compile(draft(), "ent-service")
+
+
 def test_nonfinite_wrong_unit_entity_and_query_are_not_evidence():
     compiled = registry().compile(draft(), "ent-service")
     env = Environment()
@@ -516,6 +527,93 @@ def test_factory_uses_issued_trace_and_reuses_existing_candidate():
         s.query.request.trace_ref for s in reg.signals
     } == {"trace-0000000000000002"}
     assert not rca100_evidence_registry(bootstrap, ()).signals
+
+
+def test_factory_registers_jvm_thread_rules_for_an_issued_service():
+    from rca_agent.core.runtime_registry import rca100_evidence_registry
+
+    bootstrap = Environment().reset()
+    observations = (
+        Observation(
+            observation_id="obs-0000000000000001",
+            modality=Modality.TOPOLOGY,
+            entity_ref="ent-service",
+            signal="related_entity",
+            value={
+                "entity_ref": "ent-inventory",
+                "display_name": "inventory",
+                "entity_type": "apm.service",
+            },
+            data_status=DataStatus.DERIVED,
+        ),
+    )
+    registry = rca100_evidence_registry(bootstrap, observations)
+
+    assert {spec.signal for spec in registry.signals} >= {
+        "thread_pool_active", "thread_pool_max", "thread_pool_queue_depth",
+        "thread_pool_rejected_tasks", "jvm_runnable_threads", "jvm_thread_count",
+        "jvm_heap_used_bytes", "jvm_heap_max_bytes", "jvm_gc_collection_delta",
+        "jvm_gc_pause_seconds_delta",
+    }
+    rules = {rule.rule_id: rule for rule in registry.rules}
+    assert rules["thread_pool_active"].reference_signal == "thread_pool_max"
+    assert rules["jvm_heap_used_bytes"].reference_signal == "jvm_heap_max_bytes"
+    rejected = next(
+        spec for spec in registry.signals if spec.signal == "thread_pool_rejected_tasks"
+    )
+    assert rejected.independent_group == "thread_pool_failure"
+    assert {spec.entity_ref for spec in registry.signals} == {"ent-inventory"}
+    assert "thread_pool_max" not in rules
+    assert "jvm_heap_max_bytes" not in rules
+
+
+def test_trace_symptoms_and_exclusion_rules_are_not_causal_support():
+    from rca_agent.core.runtime_registry import rca100_evidence_registry
+
+    bootstrap = Environment().reset().model_copy(update={
+        "capabilities": (
+            CapabilityDescriptor(
+                tool_name="get_trace_stage_breakdown",
+                modality=Modality.TRACE,
+                available=True,
+                query_cost=1,
+                max_window_seconds=300,
+                max_results=12,
+            ),
+        )
+    })
+    summary = Observation(
+        observation_id="obs-0000000000000001",
+        modality=Modality.TRACE,
+        entity_ref="ent-source",
+        signal="operation_trace_duration_ms",
+        value=300,
+        unit="ms",
+        data_status=DataStatus.OBSERVED,
+        details={"trace_ref": "trace-0000000000000001"},
+    )
+    stage = Observation(
+        observation_id="obs-0000000000000002",
+        modality=Modality.TRACE,
+        entity_ref="ent-target",
+        signal="sql_duration_share",
+        value=0.1,
+        unit="ratio",
+        data_status=DataStatus.DERIVED,
+        details={"trace_ref": "trace-0000000000000001"},
+    )
+    rules = {
+        rule.rule_id: rule for rule in rca100_evidence_registry(
+            bootstrap, (summary, stage)
+        ).rules
+    }
+
+    assert not rules["operation_duration_ms"].support_eligible
+    assert not rules["sql_duration_ms"].support_eligible
+    assert not rules["db_client_span_duration_ms"].support_eligible
+    assert not rules["sql_duration_share_low"].support_eligible
+    assert rules["sql_duration_share"].support_eligible
+    assert rules["sql_shape"].support_eligible
 
 
 def test_provider_factory_no_network(monkeypatch):

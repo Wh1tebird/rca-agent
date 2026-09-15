@@ -241,7 +241,6 @@ class Rca100ObservationAdapter:
 
     def find_slow_service_traces(self, query: SlowServiceTraceQuery) -> QueryResult:
         self._query_count += 1
-        self._require_trace_value("serviceName", query.service)
         rows = self._connection.execute(
             """
             SELECT traceId, spanId, parentSpanId, serviceName, spanName,

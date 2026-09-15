@@ -36,6 +36,28 @@ PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
         "error_count": ("apm.service.legacy", "error", "count"),
         "cpu_usage": ("apm.service.legacy", "cpu", None),
         "memory_usage": ("apm.service.legacy", "mem", None),
+        "thread_pool_active": (
+            "apm.metric.jvm", "arms_thread_pool_active_thread_count", "count"
+        ),
+        "thread_pool_max": (
+            "apm.metric.jvm", "arms_thread_pool_max_thread_count", "count"
+        ),
+        "thread_pool_queue_depth": (
+            "apm.metric.jvm", "arms_thread_pool_queue_size", "count"
+        ),
+        "thread_pool_rejected_tasks": (
+            "apm.metric.jvm", "arms_thread_pool_rejected_task_count", "count"
+        ),
+        "jvm_runnable_threads": (
+            "apm.metric.thread", "arms_grouped_thread_runnable_count", "count"
+        ),
+        "jvm_thread_count": ("apm.metric.jvm", "arms_jvm_threads_count", "count"),
+        "jvm_heap_used_bytes": ("apm.metric.jvm", "arms_jvm_mem_used_bytes", "bytes"),
+        "jvm_heap_max_bytes": ("apm.metric.jvm", "arms_jvm_mem_max_bytes", "bytes"),
+        "jvm_gc_collection_delta": ("apm.metric.jvm", "arms_jvm_gc_delta", "count"),
+        "jvm_gc_pause_seconds_delta": (
+            "apm.metric.jvm", "arms_jvm_gc_seconds_delta", "s"
+        ),
     },
     "k8s.node": {
         "cpu_usage_rate": ("k8s.node", "node_cpu_usage_rate", "percent"),
@@ -205,7 +227,7 @@ class PrivateRca100Adapter:
         if entity.entity_type == "apm.operation":
             service, separator, operation = entity.name.partition("::")
             if not separator:
-                raise ValueError("trace operation name is not service-qualified")
+                operation = None
         elif entity.entity_type == "apm.service":
             service, operation = entity.name, None
         else:
@@ -255,7 +277,7 @@ class PrivateRca100Adapter:
 
     def trace_stage_breakdown(
         self, selection: TraceSelection
-    ) -> tuple[dict[str, Any], EntityBinding, str]:
+    ) -> tuple[dict[str, Any], EntityBinding, EntityBinding, str]:
         with Rca100ObservationAdapter(self.__case) as adapter:
             result = adapter.get_trace(TraceByIdQuery(trace_id=selection.raw_trace_id, limit=200))
         extracted = extract_trace_stage_observation(
@@ -267,6 +289,7 @@ class PrivateRca100Adapter:
         entity = self._binding(
             f"{extracted.service}::{extracted.operation}", "apm.operation"
         )
+        service = self._binding(extracted.service, "apm.service")
         return {
             "operation_duration_ms": extracted.operation_duration_ms,
             "connection_duration_ms": extracted.connection_duration_ms,
@@ -275,7 +298,7 @@ class PrivateRca100Adapter:
             "db_client_span_duration_ms": extracted.sql_duration_ms,
             "sql_duration_share": extracted.sql_duration_share,
             "sql_shape": extracted.sql_shape.value,
-        }, entity, extracted.resolution
+        }, entity, service, extracted.resolution
 
     def _build_entity_registry(self) -> dict[tuple[str, str], EntityBinding]:
         topology = json.loads(self.__case.observations["topology"].read_text())

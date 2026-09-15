@@ -29,6 +29,20 @@ def mechanism_matches(root_cause: str, mechanism: str) -> bool:
                 r"\bsql\s+(execution|query)\b.{0,80}\b(slow|long|dominat|high|latenc)",
             )
         )
+    if root_cause == "threadExhaustion":
+        return "thread" in normalized and any(
+            word in normalized for word in ("exhaust", "saturat", "pool", "reject", "starv")
+        )
+    if root_cause == "memoryPressure":
+        return any(word in normalized for word in ("memory", "heap")) and any(
+            word in normalized for word in ("pressure", "leak", "exhaust", "saturat", "high")
+        )
+    if root_cause == "fullGC":
+        return (
+            "full gc" in normalized
+            or "full garbage collection" in normalized
+            or ("garbage collection" in normalized and "pause" in normalized)
+        )
     raise ValueError("unsupported Ground-Truth mechanism in holdout manifest")
 
 
