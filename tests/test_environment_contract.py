@@ -275,3 +275,34 @@ def test_t025_t030_expose_distinct_neutral_trace_stage_facts(
     assert facts["connection_duration_ms"].data_status == DataStatus.OBSERVED
     assert facts["sql_duration_share"].data_status == DataStatus.DERIVED
     assert facts["sql_shape"].data_status == DataStatus.DERIVED
+
+
+def test_t021_trace_breakdown_resolves_the_downstream_database_operation(
+    cases_root: Path,
+):
+    environment = _environment(cases_root, "t021")
+    bootstrap = environment.reset()
+    summary = environment.get_service_trace_summary(
+        GetServiceTraceSummaryRequest(
+            entity_ref=bootstrap.alert_entity.entity_ref,
+            window=_incident_window(bootstrap),
+            min_duration_ms=100,
+            max_traces=1,
+        )
+    )
+    breakdown = environment.get_trace_stage_breakdown(
+        GetTraceStageBreakdownRequest(
+            trace_ref=summary.observations[0].details["trace_ref"],
+            max_stages=12,
+        )
+    )
+
+    facts = {item.signal: item for item in breakdown.observations}
+    assert breakdown.status == ToolStatus.SUCCESS
+    assert facts["sql_duration_ms"].entity_ref != bootstrap.alert_entity.entity_ref
+    assert facts["connection_acquisition_ms"].value == facts["connection_duration_ms"].value
+    assert facts["db_client_span_duration_ms"].value == facts["sql_duration_ms"].value
+    assert all(
+        item.details["resolution"] == "downstream_database_operation"
+        for item in breakdown.observations
+    )

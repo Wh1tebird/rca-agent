@@ -163,8 +163,10 @@ class Rca100Environment:
         if rejection is not None:
             return rejection
         entity = self.__entities[request.entity_ref]
-        if entity.entity_type != "apm.operation":
-            return self._rejected(tool, query_ref, "trace summary requires an operation entity")
+        if entity.entity_type not in {"apm.operation", "apm.service"}:
+            return self._rejected(
+                tool, query_ref, "trace summary requires an operation or service entity"
+            )
 
         def operation() -> tuple[ToolStatus, tuple[Observation, ...], str, bool]:
             rows, selections = self.__adapter.trace_summary(
@@ -206,18 +208,41 @@ class Rca100Environment:
 
         def operation() -> tuple[ToolStatus, tuple[Observation, ...], str, bool]:
             selection = self.__traces[request.trace_ref]
-            values = self.__adapter.trace_stage_breakdown(selection)
+            try:
+                values, resolved_entity, resolution = self.__adapter.trace_stage_breakdown(selection)
+            except RuntimeError:
+                missing = self._observation(
+                    query_ref,
+                    0,
+                    Modality.TRACE,
+                    selection.source_entity_ref,
+                    "trace_stage_bundle",
+                    None,
+                    DataStatus.MISSING,
+                    details={"trace_ref": request.trace_ref},
+                )
+                return (
+                    ToolStatus.EMPTY,
+                    (missing,),
+                    "trace has no complete database stage bundle",
+                    False,
+                )
+            self.__entities[resolved_entity.public_ref] = resolved_entity
             statuses = {
                 "operation_duration_ms": DataStatus.OBSERVED,
                 "connection_duration_ms": DataStatus.OBSERVED,
+                "connection_acquisition_ms": DataStatus.DERIVED,
                 "sql_duration_ms": DataStatus.OBSERVED,
+                "db_client_span_duration_ms": DataStatus.DERIVED,
                 "sql_duration_share": DataStatus.DERIVED,
                 "sql_shape": DataStatus.DERIVED,
             }
             units = {
                 "operation_duration_ms": "ms",
                 "connection_duration_ms": "ms",
+                "connection_acquisition_ms": "ms",
                 "sql_duration_ms": "ms",
+                "db_client_span_duration_ms": "ms",
                 "sql_duration_share": "ratio",
                 "sql_shape": None,
             }
@@ -228,12 +253,16 @@ class Rca100Environment:
                     query_ref,
                     index,
                     Modality.TRACE,
-                    self.__adapter.alert_entity.public_ref,
+                    resolved_entity.public_ref,
                     signal,
                     value,
                     statuses[signal],
                     unit=units[signal],
-                    details={"trace_ref": request.trace_ref},
+                    details={
+                        "trace_ref": request.trace_ref,
+                        "resolved_entity": self._public_entity(resolved_entity).model_dump(mode="json"),
+                        "resolution": resolution,
+                    },
                 )
                 for index, (signal, value) in enumerate(items[: request.max_stages])
             )

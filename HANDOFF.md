@@ -1,6 +1,30 @@
 # RCA Agent handoff
 
-## Latest increment — 2026-09-14
+## Latest increment — 2026-09-15
+
+The approved capability expansion stages 1-4 are complete. An evaluation-only generator writes
+`analysis/capability_matrix.{md,json}` and keeps missing transport, pool-capacity, JVM/GC and IO
+signals explicit. The runtime trace registry now exposes truthful Hikari/JDBC aliases, keys recipes
+by target entity, and reserves an unattempted issued trace for verification when available.
+
+Acquisition can traverse issued operation/service relationships and request bounded slow traces for
+a discovered service. Trace breakdown preserves exact operation matches and otherwise resolves a
+complete Hikari/JDBC bundle to its downstream database-owning operation. Runner exposes this as an
+issued entity graph; Discovery may choose only advertised entity/rule pairs. Caller trace references
+remain legal recipes for the resolved downstream target, while returned evidence must still match
+that target.
+
+The fixed seven-case live batch was rerun with `deepseek-chat`: 7/7 completed, 7/7 replayed, 4/7
+compiled at least one draft, 3/7 proposed the GT mechanism, 1/7 reached a correct
+`DISCOVERED_VERIFIED` (t084/slowSQL), and 0 wrong mechanisms verified. Final `QUERY_FAILED` fell from
+3 to 0. Both DB-network cases proposed the held-out mechanism but remained
+`SUPPORTED_HYPOTHESIS`, correctly reflecting the lack of RTT and server-execution telemetry.
+Three drafts failed closed at compiler contracts and one case was inconclusive. Ruff and all 137
+tests pass.
+
+The older sections below describe the baseline before this increment.
+
+## Previous dynamic-discovery increment — 2026-09-14
 
 Bounded dynamic discovery is integrated into LangGraph/Runner. Configure a separate discovery
 adapter and an EvidenceRegistry (or builder). Existing Catalog candidates remain available.

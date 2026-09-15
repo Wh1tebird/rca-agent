@@ -1,6 +1,6 @@
 # RCA Agent project context
 
-Last consolidated: 2026-09-01 after internal domain-core extraction
+Last consolidated: 2026-09-15 after capability-aware unknown-RCA rerun
 
 ## 1. Purpose
 
@@ -196,7 +196,11 @@ predictions to declared alternatives. See `analysis/unknown_rca_benchmark.md`; t
 diagnostic observations, not accuracy estimates.
 
 A preregistered seven-case batch now covers all available `dbNetworkLatency` and `slowSQL` cases.
-All 7 completed with valid replay: 4 proposed a GT-like mechanism, 1 (t030/slowSQL) reached a correct
-`DISCOVERED_VERIFIED`, and 0 wrong mechanisms were verified. Three slow-SQL cases exposed trace-stage
-capability failures and one stayed out of scope. Treat these as diagnostic counts, not general RCA
-accuracy; the deterministic post-freeze lexical scorer still requires semantic review.
+The capability-aware rerun completed all 7 with valid replay: 3 proposed a GT-like mechanism, 1
+(t084/slowSQL) reached a correct `DISCOVERED_VERIFIED`, and 0 wrong mechanisms were verified. Bounded
+service/operation exploration and downstream DB-stage resolution removed all final `QUERY_FAILED`
+outcomes. Both DB-network cases proposed the held-out mechanism but safely remained supported because
+true RTT and database-server timing are unavailable. Treat these as diagnostic counts, not general
+RCA accuracy; the deterministic post-freeze lexical scorer still requires semantic review. The
+evaluation-only matrix in `analysis/capability_matrix.md` records full, partial and unsupported
+mechanism families without exposing Ground Truth to inference.

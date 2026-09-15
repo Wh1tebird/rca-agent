@@ -69,6 +69,7 @@ class EvidenceCondition(BaseModel):
     independent_group: str
     strength: float = Field(gt=0.0, le=10.0)
     reason: str
+    observed_entity: str | None = None
 
 
 class Candidate(BaseModel):

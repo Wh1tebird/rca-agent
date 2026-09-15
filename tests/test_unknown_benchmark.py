@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from evaluation.capability_audit import build_matrix, render_markdown
 from evaluation.unknown_benchmark_batch import mechanism_matches, score_case, summarize
 from rca_agent.models import DecisionStatus
 
@@ -36,3 +39,20 @@ def test_batch_score_separates_proposal_recall_from_wrong_verification():
     aggregate = summarize([proposed, wrong], [])
     assert aggregate["gt_mechanism_proposed"] == 1
     assert aggregate["wrong_verified"] == 1
+
+
+def test_capability_audit_keeps_missing_network_and_pool_signals_explicit(
+    cases_root: Path,
+):
+    matrix = build_matrix(cases_root.parent / "answer_key")
+    mechanisms = {item["mechanism"]: item for item in matrix["mechanisms"]}
+
+    assert mechanisms["slowSQL"]["queryability"] == "full"
+    assert mechanisms["dbNetworkLatency"]["queryability"] == "partial"
+    assert "db_network_rtt_ms" in mechanisms["dbNetworkLatency"]["missing"]
+    assert mechanisms["connectionPoolExhaustion"]["queryability"] == "partial"
+    assert "connection_pool_max" in mechanisms["connectionPoolExhaustion"]["missing"]
+    assert mechanisms["threadExhaustion"]["queryability"] == "unsupported"
+    rendered = render_markdown(matrix)
+    assert "not network RTT" in rendered
+    assert "not database-server" in rendered

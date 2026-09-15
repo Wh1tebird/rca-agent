@@ -13,6 +13,7 @@ from rca_agent.core.cases import BlindCase, FlatBlindCaseRepository
 from rca_agent.core.rca100_adapter import (
     AdapterQueryError,
     Rca100ObservationAdapter,
+    SlowServiceTraceQuery,
     SlowTraceQuery,
     TopologyQuery,
     TraceByIdQuery,
@@ -71,6 +72,7 @@ class TraceSelection:
     public_trace_ref: str
     service: str
     operation: str
+    source_entity_ref: str
 
 
 class PrivateRca100Adapter:
@@ -200,20 +202,32 @@ class PrivateRca100Adapter:
         min_duration_ms: float,
         limit: int,
     ) -> tuple[list[dict[str, Any]], list[TraceSelection]]:
-        service, separator, operation = entity.name.partition("::")
-        if entity.entity_type != "apm.operation" or not separator:
-            raise ValueError("trace summaries require an operation entity")
+        if entity.entity_type == "apm.operation":
+            service, separator, operation = entity.name.partition("::")
+            if not separator:
+                raise ValueError("trace operation name is not service-qualified")
+        elif entity.entity_type == "apm.service":
+            service, operation = entity.name, None
+        else:
+            raise ValueError("trace summaries require an operation or service entity")
         with Rca100ObservationAdapter(self.__case) as adapter:
-            result = adapter.find_slow_traces(
-                SlowTraceQuery(
+            if operation is None:
+                result = adapter.find_slow_service_traces(SlowServiceTraceQuery(
+                    service=service,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    min_duration_ms=min_duration_ms,
+                    limit=limit,
+                ))
+            else:
+                result = adapter.find_slow_traces(SlowTraceQuery(
                     service=service,
                     operation=operation,
                     start_ns=start_ns,
                     end_ns=end_ns,
                     min_duration_ms=min_duration_ms,
                     limit=limit,
-                )
-            )
+                ))
         rows: list[dict[str, Any]] = []
         selections: list[TraceSelection] = []
         for row in result.rows:
@@ -223,7 +237,8 @@ class PrivateRca100Adapter:
                     raw_trace_id=row["trace_id"],
                     public_trace_ref=trace_ref,
                     service=service,
-                    operation=operation,
+                    operation=row["span_name"],
+                    source_entity_ref=entity.public_ref,
                 )
             )
             rows.append(
@@ -238,7 +253,9 @@ class PrivateRca100Adapter:
             )
         return rows, selections
 
-    def trace_stage_breakdown(self, selection: TraceSelection) -> dict[str, Any]:
+    def trace_stage_breakdown(
+        self, selection: TraceSelection
+    ) -> tuple[dict[str, Any], EntityBinding, str]:
         with Rca100ObservationAdapter(self.__case) as adapter:
             result = adapter.get_trace(TraceByIdQuery(trace_id=selection.raw_trace_id, limit=200))
         extracted = extract_trace_stage_observation(
@@ -247,13 +264,18 @@ class PrivateRca100Adapter:
             selection.operation,
             ["private-query-ref"],
         )
+        entity = self._binding(
+            f"{extracted.service}::{extracted.operation}", "apm.operation"
+        )
         return {
             "operation_duration_ms": extracted.operation_duration_ms,
             "connection_duration_ms": extracted.connection_duration_ms,
+            "connection_acquisition_ms": extracted.connection_duration_ms,
             "sql_duration_ms": extracted.sql_duration_ms,
+            "db_client_span_duration_ms": extracted.sql_duration_ms,
             "sql_duration_share": extracted.sql_duration_share,
             "sql_shape": extracted.sql_shape.value,
-        }
+        }, entity, extracted.resolution
 
     def _build_entity_registry(self) -> dict[tuple[str, str], EntityBinding]:
         topology = json.loads(self.__case.observations["topology"].read_text())

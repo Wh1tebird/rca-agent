@@ -200,14 +200,13 @@ class EpisodeRunner:
             "rules": [{"rule_id": r.rule_id, "signal": r.signal,
                        "phenomenon": r.description, "aggregation": r.aggregation}
                       for r in registry.rules],
+            "entity_graph": self._discovery_entity_graph(registry),
             "observations": [r.observation.model_dump(mode="json")
                              for r in self.__observation_ledger.values()
                              if any(s.accepts(r.observation) for s in registry.signals)],
             "existing_candidates": [
                 {"candidate_id": c.candidate_id, "mechanism": c.fault_type}
-                for c in self.__decision_provider.catalog(
-                    self.__bootstrap.alert_entity.entity_ref
-                )
+                for c in self.__decision_provider.catalog(self.__bootstrap.alert_entity.entity_ref)
             ],
         }
         self.transcript.append(EventType.DISCOVERY_STARTED, {"context_digest": sha256_digest(context)})
@@ -240,6 +239,14 @@ class EpisodeRunner:
                     if original is None or discovery_key in seen:
                         raise ValueError("unknown or duplicate source hypothesis")
                     seen.add(discovery_key)
+                    referenced_entities = {
+                        draft.causal_entity_ref or original.causal_entity_ref,
+                        *(prediction.target_entity_ref
+                          for prediction in draft.predictions
+                          if prediction.target_entity_ref is not None),
+                    }
+                    if not referenced_entities <= self.__issued_entities:
+                        raise ValueError("dynamic hypothesis references an unissued entity")
                     compiled = registry.compile(
                         draft, original.causal_entity_ref,
                         discovery_query_refs=tuple(sorted({
@@ -254,7 +261,7 @@ class EpisodeRunner:
                     if not all(self._signal_executable(s) for s in compiled.signals):
                         raise ValueError("query recipe is not executable in this episode")
                     existing = next((c for c in self.__decision_provider.catalog(
-                                     original.causal_entity_ref)
+                                     compiled.candidate.causal_entity)
                                      if draft.mechanism.casefold() in {
                                          c.candidate_id.casefold(), c.fault_type.casefold()
                                      } and c.family == draft.family), None)
@@ -270,7 +277,8 @@ class EpisodeRunner:
                         })
                         self._submit_hypothesis(HypothesisProposal(
                             hypothesis_id=hypothesis_id, candidate_id=existing.candidate_id,
-                            mechanism=existing.fault_type, causal_entity_ref=original.causal_entity_ref,
+                            mechanism=existing.fault_type,
+                            causal_entity_ref=compiled.candidate.causal_entity,
                             rationale=draft.causal_explanation,
                         ))
                         queries = {query_fingerprint(s.query.tool_name, s.query.request): s.query
@@ -288,7 +296,8 @@ class EpisodeRunner:
                     })
                     self._submit_hypothesis(HypothesisProposal(
                         hypothesis_id=hypothesis_id, candidate_id=compiled.candidate.candidate_id,
-                        mechanism=draft.mechanism, causal_entity_ref=original.causal_entity_ref,
+                        mechanism=draft.mechanism,
+                        causal_entity_ref=compiled.candidate.causal_entity,
                         rationale=draft.causal_explanation,
                     ))
                     candidate = compiled.candidate
@@ -314,6 +323,51 @@ class EpisodeRunner:
         self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
         return result
 
+    def _discovery_entity_graph(self, registry: EvidenceRegistry) -> dict[str, Any]:
+        assert self.__bootstrap is not None
+        alert = self.__bootstrap.alert_entity
+        nodes: dict[str, dict[str, Any]] = {
+            alert.entity_ref: alert.model_dump(mode="json")
+        }
+        edges: set[tuple[str, str, str, str]] = set()
+        for record in self.__observation_ledger.values():
+            observation = record.observation
+            target = None
+            relation = observation.details.get("relation")
+            direction = observation.details.get("direction", "outgoing")
+            if observation.signal == "related_entity" and isinstance(observation.value, dict):
+                target = observation.value
+            elif observation.signal == "topology_edge":
+                target = observation.details.get("neighbor")
+            resolved = observation.details.get("resolved_entity")
+            if isinstance(resolved, dict):
+                nodes[resolved["entity_ref"]] = resolved
+                edges.add((observation.entity_ref, resolved["entity_ref"],
+                           "trace_resolves_to", "outgoing"))
+            if isinstance(target, dict) and "entity_ref" in target:
+                nodes[target["entity_ref"]] = target
+                edges.add((observation.entity_ref, target["entity_ref"],
+                           str(relation or observation.value), str(direction)))
+        rules_by_signal: dict[str, list[str]] = {}
+        for rule in registry.rules:
+            rules_by_signal.setdefault(rule.signal, []).append(rule.rule_id)
+        available_by_entity: dict[str, set[str]] = {}
+        for signal in registry.signals:
+            available_by_entity.setdefault(signal.entity_ref, set()).update(
+                rules_by_signal.get(signal.signal, ())
+            )
+        return {
+            "nodes": [
+                {**node, "available_rule_ids": sorted(available_by_entity.get(ref, set()))}
+                for ref, node in sorted(nodes.items())
+            ],
+            "edges": [
+                {"source_entity_ref": source, "target_entity_ref": target,
+                 "relation": relation, "direction": direction}
+                for source, target, relation, direction in sorted(edges)
+            ],
+        }
+
     def _signal_executable(self, spec) -> bool:
         assert self.__bootstrap is not None
         if not spec.available or spec.entity_ref not in self.__issued_entities:
@@ -328,8 +382,7 @@ class EpisodeRunner:
             return False
         trace = getattr(request, "trace_ref", None)
         if trace is not None and not any(
-            r.observation.entity_ref == spec.entity_ref
-            and r.observation.details.get("trace_ref") == trace
+            r.observation.details.get("trace_ref") == trace
             for r in self.__observation_ledger.values()
         ):
             return False

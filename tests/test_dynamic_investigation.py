@@ -477,7 +477,7 @@ def test_factory_uses_issued_trace_and_reuses_existing_candidate():
             )
         }
     )
-    observation = Observation(
+    summary = Observation(
         observation_id="obs-0000000000000001",
         modality=Modality.TRACE,
         entity_ref="ent-service",
@@ -487,12 +487,34 @@ def test_factory_uses_issued_trace_and_reuses_existing_candidate():
         data_status=DataStatus.OBSERVED,
         details={"trace_ref": "trace-0000000000000001"},
     )
-    reg = rca100_evidence_registry(bootstrap, (observation,))
+    verification_summary = summary.model_copy(update={
+        "observation_id": "obs-0000000000000002",
+        "details": {"trace_ref": "trace-0000000000000002"},
+    })
+    stage = Observation(
+        observation_id="obs-0000000000000003",
+        modality=Modality.TRACE,
+        entity_ref="ent-root-service",
+        signal="sql_duration_share",
+        value=0.9,
+        unit="ratio",
+        data_status=DataStatus.DERIVED,
+        details={"trace_ref": "trace-0000000000000001"},
+    )
+    reg = rca100_evidence_registry(bootstrap, (summary, verification_summary, stage))
     assert {s.signal for s in reg.signals} == {
+        "operation_duration_ms",
         "sql_shape",
+        "sql_duration_ms",
         "sql_duration_share",
         "connection_duration_ms",
+        "connection_acquisition_ms",
+        "db_client_span_duration_ms",
     }
+    assert {s.entity_ref for s in reg.signals} == {"ent-root-service"}
+    assert {
+        s.query.request.trace_ref for s in reg.signals
+    } == {"trace-0000000000000002"}
     assert not rca100_evidence_registry(bootstrap, ()).signals
 
 

@@ -125,6 +125,7 @@ class RuleSpec(BaseModel):
 class Prediction(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     rule_id: str
+    target_entity_ref: str | None = Field(default=None, pattern=r"^ent-[a-z0-9-]{3,40}$")
     polarity: ConditionPolarity
     rationale: str = Field(min_length=1, max_length=500)
     distinguishes: tuple[str, ...] = Field(default=(), max_length=8)
@@ -133,6 +134,7 @@ class Prediction(BaseModel):
 class DynamicHypothesis(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     source_hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
+    causal_entity_ref: str | None = Field(default=None, pattern=r"^ent-[a-z0-9-]{3,40}$")
     mechanism: str = Field(min_length=3, max_length=500)
     family: MechanismFamily
     causal_explanation: str = Field(min_length=10, max_length=2000)
@@ -225,11 +227,14 @@ class EvidenceRegistry(BaseModel):
         discovery_fact_digests: tuple[str, ...] = (),
     ) -> CompiledCandidate:
         by_rule = {r.rule_id: r for r in self.rules}
-        by_signal = {s.signal: s for s in self.signals if s.entity_ref == entity_ref}
+        causal_entity_ref = draft.causal_entity_ref or entity_ref
+        by_signal = {(s.entity_ref, s.signal): s for s in self.signals}
         selected: list[RuleSpec] = []
-        specs: dict[str, SignalSpec] = {}
+        specs: dict[tuple[str, str], SignalSpec] = {}
+        prediction_entities: list[str] = []
         groups: set[str] = set()
-        if len({p.rule_id for p in draft.predictions}) != len(draft.predictions):
+        if len({(p.target_entity_ref or causal_entity_ref, p.rule_id)
+                for p in draft.predictions}) != len(draft.predictions):
             raise ValueError("duplicate predictions")
         for prediction in draft.predictions:
             if not set(prediction.distinguishes) <= set(draft.alternatives):
@@ -237,21 +242,23 @@ class EvidenceRegistry(BaseModel):
             rule = by_rule.get(prediction.rule_id)
             if rule is None:
                 raise ValueError("unknown rule")
+            target_entity_ref = prediction.target_entity_ref or causal_entity_ref
+            prediction_entities.append(target_entity_ref)
             for signal in (rule.signal, rule.reference_signal):
                 if signal is None:
                     continue
-                spec = by_signal.get(signal)
+                spec = by_signal.get((target_entity_ref, signal))
                 if spec is None or not spec.available:
                     raise ValueError("signal unavailable for target entity")
-                specs[signal] = spec
+                specs[(target_entity_ref, signal)] = spec
             selected.append(rule)
             if prediction.polarity == ConditionPolarity.SUPPORT:
-                groups.add(by_signal[rule.signal].independent_group)
+                groups.add(by_signal[(target_entity_ref, rule.signal)].independent_group)
         if len(groups) < 2:
             raise ValueError("two host-defined independent support groups are required")
         payload = {
             "draft": draft.model_dump(mode="json"),
-            "entity": entity_ref,
+            "entity": causal_entity_ref,
             "rules": [r.model_dump(mode="json") for r in selected],
             "signals": [s.model_dump(mode="json") for s in specs.values()],
             "discovery_query_refs": discovery_query_refs,
@@ -262,24 +269,27 @@ class EvidenceRegistry(BaseModel):
         candidate_id = "dyn_" + version[:24]
         conditions = [
             EvidenceCondition(
-                condition_id=f"{candidate_id}-{r.rule_id}",
+                condition_id=f"{candidate_id}-{index}-{r.rule_id}",
                 candidate_id=candidate_id,
                 polarity=p.polarity,
                 signal=r.signal,
                 comparison=r.comparison,
                 threshold=r.threshold if r.threshold is not None else 0,
-                capability_id=by_signal[r.signal].query.tool_name.value,
-                independent_group=by_signal[r.signal].independent_group,
+                capability_id=by_signal[(target, r.signal)].query.tool_name.value,
+                independent_group=by_signal[(target, r.signal)].independent_group,
                 strength=2,
                 reason=p.rationale,
+                observed_entity=target,
             )
-            for r, p in zip(selected, draft.predictions, strict=True)
+            for index, (r, p, target) in enumerate(
+                zip(selected, draft.predictions, prediction_entities, strict=True)
+            )
         ]
         candidate = Candidate(
             candidate_id=candidate_id,
             fault_type=draft.mechanism,
             family=draft.family,
-            causal_entity=entity_ref,
+            causal_entity=causal_entity_ref,
             proposal_reason=draft.causal_explanation,
             positive_evidence_requirements=[
                 c.condition_id for c in conditions if c.polarity == ConditionPolarity.SUPPORT
@@ -402,10 +412,10 @@ def assess_dynamic(compiled: CompiledCandidate, records) -> list[EvidenceAssessm
     """Evaluate only explicitly attached, entity- and query-matched issued observations."""
     from rca_agent.tools.fingerprint import query_fingerprint
 
-    specs = {s.signal: s for s in compiled.signals}
+    specs = {(s.entity_ref, s.signal): s for s in compiled.signals}
 
-    def values(signal):
-        spec = specs[signal]
+    def values(entity_ref, signal):
+        spec = specs[(entity_ref, signal)]
         fingerprint = query_fingerprint(spec.query.tool_name, spec.query.request)
         return [
             r
@@ -417,9 +427,12 @@ def assess_dynamic(compiled: CompiledCandidate, records) -> list[EvidenceAssessm
 
     assessments = []
     for condition, rule in zip(compiled.candidate.conditions, compiled.rules, strict=True):
-        rows = values(rule.signal)
+        observed_entity = condition.observed_entity or compiled.candidate.causal_entity
+        rows = values(observed_entity, rule.signal)
         threshold = rule.threshold
-        references = values(rule.reference_signal) if rule.reference_signal else []
+        references = (
+            values(observed_entity, rule.reference_signal) if rule.reference_signal else []
+        )
         if rule.reference_signal:
             threshold = (
                 references[0].observation.value * rule.factor
@@ -456,7 +469,7 @@ def assess_dynamic(compiled: CompiledCandidate, records) -> list[EvidenceAssessm
                 signal=rule.signal,
                 value=value,
                 query_ref=rows[0].query_ref,
-                observed_entity=compiled.candidate.causal_entity,
+                observed_entity=observed_entity,
             )
             if matched:
                 assertion = EvidenceAssertion(

@@ -52,6 +52,23 @@ class SlowTraceQuery(BaseModel):
         return self
 
 
+class SlowServiceTraceQuery(BaseModel):
+    """Find bounded slow server spans for one issued service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    service: str = Field(min_length=1, max_length=200)
+    start_ns: int = Field(gt=0)
+    end_ns: int = Field(gt=0)
+    min_duration_ms: float = Field(default=100.0, ge=0.0, le=3_600_000.0)
+    limit: int = Field(default=10, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> SlowServiceTraceQuery:
+        _validate_range(self.start_ns, self.end_ns, 1_000_000_000)
+        return self
+
+
 class TraceByIdQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -212,6 +229,51 @@ class Rca100ObservationAdapter:
                 {
                     "service": query.service,
                     "operation": query.operation,
+                    "start_ns": query.start_ns,
+                    "end_ns": query.end_ns,
+                    "min_duration_ms": query.min_duration_ms,
+                    "limit": query.limit,
+                    "time_match": "overlap",
+                },
+            ),
+            data,
+        )
+
+    def find_slow_service_traces(self, query: SlowServiceTraceQuery) -> QueryResult:
+        self._query_count += 1
+        self._require_trace_value("serviceName", query.service)
+        rows = self._connection.execute(
+            """
+            SELECT traceId, spanId, parentSpanId, serviceName, spanName,
+                   try_cast(startTime AS UBIGINT) AS start_time_ns,
+                   try_cast(duration AS DOUBLE) / 1000000.0 AS duration_ms,
+                   statusCode, statusMessage
+            FROM read_parquet(?)
+            WHERE serviceName = ?
+              AND try_cast(startTime AS UBIGINT) < ?
+              AND try_cast(startTime AS UBIGINT) + try_cast(duration AS UBIGINT) > ?
+              AND try_cast(duration AS DOUBLE) / 1000000.0 >= ?
+              AND try_cast(json_extract_string(attributes, '$."call.kind"') AS VARCHAR)
+                  NOT IN ('sql', 'internal')
+            ORDER BY duration_ms DESC, traceId, spanId
+            LIMIT ?
+            """,
+            [
+                str(self._case.observations["traces"]), query.service,
+                query.end_ns, query.start_ns, query.min_duration_ms, query.limit,
+            ],
+        ).fetchall()
+        columns = (
+            "trace_id", "span_id", "parent_span_id", "service", "span_name",
+            "start_time_ns", "duration_ms", "status_code", "status_message",
+        )
+        data = tuple(dict(zip(columns, row, strict=True)) for row in rows)
+        return QueryResult(
+            self._query_count,
+            self._ref(
+                "slow_service_traces",
+                {
+                    "service": query.service,
                     "start_ns": query.start_ns,
                     "end_ns": query.end_ns,
                     "min_duration_ms": query.min_duration_ms,
