@@ -19,7 +19,7 @@ from rca_agent.core.rca100_adapter import (
     TraceByIdQuery,
     WindowComparisonQuery,
 )
-from rca_agent.core.trace_analysis import extract_trace_stage_observation
+from rca_agent.core.trace_analysis import extract_trace_stage_observation, rank_trace_participants
 
 PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
     "apm.operation": {
@@ -37,10 +37,10 @@ PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
         "cpu_usage": ("apm.service.legacy", "cpu", None),
         "memory_usage": ("apm.service.legacy", "mem", None),
         "thread_pool_active": (
-            "apm.metric.jvm", "arms_thread_pool_active_thread_count", "count"
+            "apm.metric.jvm", "arms_thread_pool_active_thread_count", None
         ),
         "thread_pool_max": (
-            "apm.metric.jvm", "arms_thread_pool_max_thread_count", "count"
+            "apm.metric.jvm", "arms_thread_pool_max_thread_count", None
         ),
         "thread_pool_queue_depth": (
             "apm.metric.jvm", "arms_thread_pool_queue_size", "count"
@@ -52,6 +52,9 @@ PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
             "apm.metric.thread", "arms_grouped_thread_runnable_count", "count"
         ),
         "jvm_thread_count": ("apm.metric.jvm", "arms_jvm_threads_count", "count"),
+        "jvm_thread_cpu_time_ns": (
+            "apm.metric.thread", "arms_grouped_thread_cpu_time", "ns"
+        ),
         "jvm_heap_used_bytes": ("apm.metric.jvm", "arms_jvm_mem_used_bytes", "bytes"),
         "jvm_heap_max_bytes": ("apm.metric.jvm", "arms_jvm_mem_max_bytes", "bytes"),
         "jvm_gc_collection_delta": ("apm.metric.jvm", "arms_jvm_gc_delta", "count"),
@@ -299,6 +302,21 @@ class PrivateRca100Adapter:
             "sql_duration_share": extracted.sql_duration_share,
             "sql_shape": extracted.sql_shape.value,
         }, entity, service, extracted.resolution
+
+    def trace_participants(self, selection: TraceSelection, limit: int) -> list[dict[str, Any]]:
+        """Return bounded, neutral service participants from an already selected trace."""
+
+        with Rca100ObservationAdapter(self.__case) as adapter:
+            result = adapter.get_trace(TraceByIdQuery(trace_id=selection.raw_trace_id, limit=200))
+        return [
+            {
+                "binding": self._binding(item.service, "apm.service"),
+                "critical_rank": index,
+                "max_depth": item.max_depth,
+                "max_duration_ms": item.max_duration_ms,
+            }
+            for index, item in enumerate(rank_trace_participants(result.rows, limit=limit))
+        ]
 
     def _build_entity_registry(self) -> dict[tuple[str, str], EntityBinding]:
         topology = json.loads(self.__case.observations["topology"].read_text())

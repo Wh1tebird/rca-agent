@@ -6,11 +6,13 @@ Hosts can replace this builder with their monitoring inventory. No data is queri
 from rca_agent.core.dynamic import EvidenceRegistry, RuleSpec, SignalSpec
 from rca_agent.models import (
     CallToolAction,
+    CompareMetricWindowsRequest,
     DataStatus,
     GetMetricSeriesRequest,
     GetTraceStageBreakdownRequest,
     Observation,
     ResetResponse,
+    TimeWindow,
 )
 
 TRACE_SIGNAL_CONTRACTS = {
@@ -47,19 +49,16 @@ NON_CAUSAL_SUPPORT_TRACE_RULES = frozenset({
 
 METRIC_SIGNAL_CONTRACTS = {
     "thread_pool_max": {
-        "unit": "count", "group": "thread_pool_capacity_reference",
-        "description": "observed aggregate maximum application thread count",
+        "unit": None, "group": "thread_pool_capacity_reference",
+        "description": "source-provided aggregate maximum-thread statistic",
     },
     "thread_pool_active": {
-        "unit": "count", "group": "thread_pool_capacity",
-        "description": "aggregate active application threads approach observed pool capacity",
-        "comparison": "gte", "reference_signal": "thread_pool_max", "factor": 0.8,
-        "source": "capacity",
+        "unit": None, "group": "thread_pool_activity",
+        "description": "source-provided aggregate active-thread statistic",
     },
     "thread_pool_queue_depth": {
         "unit": "count", "group": "thread_pool_queueing",
-        "description": "aggregate application thread-pool queue depth is materially elevated",
-        "comparison": "gte", "threshold": 5, "source": "configuration",
+        "description": "aggregate application thread-pool queue depth",
     },
     "thread_pool_rejected_tasks": {
         "unit": "count", "group": "thread_pool_failure",
@@ -68,19 +67,19 @@ METRIC_SIGNAL_CONTRACTS = {
     },
     "jvm_runnable_threads": {
         "unit": "count", "group": "jvm_scheduler_pressure",
-        "description": "aggregate runnable JVM thread count is elevated",
-        "comparison": "gte", "threshold": 1, "source": "configuration",
+        "description": "aggregate runnable JVM thread count",
     },
     "jvm_thread_count": {
         "unit": "count", "group": "jvm_thread_population",
-        "description": "aggregate JVM thread population is unusually high",
-        "comparison": "gte", "threshold": 100, "source": "configuration",
+        "description": "aggregate JVM thread population",
+    },
+    "jvm_thread_cpu_time_ns": {
+        "unit": "ns", "group": "jvm_thread_cpu_pressure",
+        "description": "aggregate grouped JVM thread CPU time",
     },
     "jvm_heap_used_bytes": {
         "unit": "bytes", "group": "jvm_heap_capacity",
-        "description": "aggregate JVM heap usage approaches the observed maximum heap",
-        "comparison": "gte", "reference_signal": "jvm_heap_max_bytes", "factor": 0.8,
-        "source": "capacity",
+        "description": "aggregate JVM heap usage",
     },
     "jvm_heap_max_bytes": {
         "unit": "bytes", "group": "jvm_heap_capacity_reference",
@@ -88,13 +87,54 @@ METRIC_SIGNAL_CONTRACTS = {
     },
     "jvm_gc_collection_delta": {
         "unit": "count", "group": "jvm_gc_frequency",
-        "description": "aggregate JVM garbage-collection count delta is elevated",
-        "comparison": "gte", "threshold": 100, "source": "configuration",
+        "description": "aggregate JVM garbage-collection count delta",
     },
     "jvm_gc_pause_seconds_delta": {
         "unit": "s", "group": "jvm_gc_pause",
-        "description": "aggregate JVM garbage-collection pause-time delta is elevated",
-        "comparison": "gte", "threshold": 5, "source": "configuration",
+        "description": "aggregate JVM garbage-collection pause-time delta",
+    },
+}
+
+BASELINE_SIGNAL_CONTRACTS = {
+    "thread_pool_active_baseline_ratio": {
+        "base_signal": "thread_pool_active", "group": "thread_pool_activity",
+        "description": "active thread-pool fraction increased at least twofold from baseline",
+        "threshold": 2.0,
+    },
+    "thread_pool_queue_depth_baseline_ratio": {
+        "base_signal": "thread_pool_queue_depth", "group": "thread_pool_queueing",
+        "description": "thread-pool queue depth increased materially from baseline",
+        "threshold": 1.5,
+    },
+    "jvm_runnable_threads_baseline_ratio": {
+        "base_signal": "jvm_runnable_threads", "group": "jvm_scheduler_pressure",
+        "description": "runnable JVM threads increased materially from baseline",
+        "threshold": 2.0,
+    },
+    "jvm_thread_count_baseline_ratio": {
+        "base_signal": "jvm_thread_count", "group": "jvm_thread_population",
+        "description": "JVM thread population increased materially from baseline",
+        "threshold": 1.2,
+    },
+    "jvm_thread_cpu_time_ns_baseline_ratio": {
+        "base_signal": "jvm_thread_cpu_time_ns", "group": "jvm_thread_cpu_pressure",
+        "description": "grouped JVM thread CPU time increased at least fivefold from baseline",
+        "threshold": 5.0,
+    },
+    "jvm_heap_used_bytes_baseline_ratio": {
+        "base_signal": "jvm_heap_used_bytes", "group": "jvm_heap_growth",
+        "description": "JVM heap usage increased at least forty percent from baseline",
+        "threshold": 1.4,
+    },
+    "jvm_gc_collection_delta_baseline_ratio": {
+        "base_signal": "jvm_gc_collection_delta", "group": "jvm_gc_frequency",
+        "description": "generic garbage-collection frequency increased at least threefold",
+        "threshold": 3.0,
+    },
+    "jvm_gc_pause_seconds_delta_baseline_ratio": {
+        "base_signal": "jvm_gc_pause_seconds_delta", "group": "jvm_gc_pause",
+        "description": "generic garbage-collection pause time increased at least tenfold",
+        "threshold": 10.0,
     },
 }
 
@@ -173,7 +213,9 @@ def rca100_evidence_registry(
     issued_entity_types = {bootstrap.alert_entity.entity_ref: bootstrap.alert_entity.entity_type}
     for observation in observations:
         for value in (
-            observation.value if observation.signal == "related_entity" else None,
+            observation.value
+            if observation.signal in {"related_entity", "trace_participant"}
+            else None,
             observation.details.get("neighbor"),
             observation.details.get("resolved_entity"),
             observation.details.get("resolved_service"),
@@ -185,6 +227,7 @@ def rca100_evidence_registry(
         if observation.signal in {"cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"}:
             issued_entity_types[observation.entity_ref] = "k8s.node"
     metric_specs: dict[tuple[str, str], SignalSpec] = {}
+    comparison_specs: dict[tuple[str, str], SignalSpec] = {}
     if "get_metric_series" in tools:
         for entity_ref, entity_type in issued_entity_types.items():
             if entity_type == "apm.service":
@@ -220,7 +263,31 @@ def rca100_evidence_registry(
                     ),
                 )
                 metric_specs[(entity_ref, signal)] = spec
+            if entity_type == "apm.service" and "compare_metric_windows" in tools:
+                horizon = bootstrap.observation_horizon
+                incident_start = horizon.start + (horizon.end - horizon.start) / 2
+                incident_window = TimeWindow(start=incident_start, end=horizon.end)
+                for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
+                    spec = SignalSpec(
+                        signal=signal,
+                        entity_ref=entity_ref,
+                        data_type="number",
+                        unit="ratio",
+                        description=contract["description"],
+                        independent_group=contract["group"],
+                        minimum=0,
+                        query=CallToolAction(
+                            tool_name="compare_metric_windows",
+                            request=CompareMetricWindowsRequest(
+                                entity_ref=entity_ref,
+                                signal=contract["base_signal"],
+                                incident_window=incident_window,
+                            ),
+                        ),
+                    )
+                    comparison_specs[(entity_ref, signal)] = spec
     specs.update(metric_specs)
+    specs.update(comparison_specs)
     for signal in ("cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"):
         if any(spec.signal == signal for spec in metric_specs.values()):
             rules[signal] = RuleSpec(
@@ -255,4 +322,15 @@ def rca100_evidence_registry(
             aggregation="max",
             description=contract["description"],
         )
+    for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
+        if any(spec.signal == signal for spec in comparison_specs.values()):
+            rules[signal] = RuleSpec(
+                rule_id=signal,
+                signal=signal,
+                comparison="gte",
+                threshold=contract["threshold"],
+                source="configuration",
+                provenance="RCA100 equal-window baseline-change contract v1",
+                description=contract["description"],
+            )
     return EvidenceRegistry(signals=tuple(specs.values()), rules=tuple(rules.values()))

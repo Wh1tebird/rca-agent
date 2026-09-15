@@ -32,6 +32,16 @@ class TraceStageObservation(BaseModel):
     query_refs: list[str] = Field(min_length=1)
 
 
+class TraceParticipant(BaseModel):
+    """A neutral service location derived from one already-issued trace."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    service: str = Field(min_length=1, max_length=200)
+    max_depth: int = Field(ge=0)
+    max_duration_ms: float = Field(ge=0)
+
+
 def extract_trace_stage_observation(
     rows: tuple[dict[str, Any], ...],
     service: str,
@@ -90,6 +100,45 @@ def extract_trace_stage_observation(
     )
 
 
+def rank_trace_participants(
+    rows: tuple[dict[str, Any], ...],
+    *,
+    limit: int = 8,
+) -> tuple[TraceParticipant, ...]:
+    """Rank services on a trace by downstream depth, without causal interpretation."""
+
+    if limit < 1:
+        return ()
+    by_id = {row["span_id"]: row for row in rows if row.get("span_id")}
+
+    def depth(row: dict[str, Any]) -> int:
+        current = row
+        seen: set[str] = set()
+        result = 0
+        while current.get("parent_span_id") in by_id:
+            parent = current["parent_span_id"]
+            if parent in seen:
+                break
+            seen.add(parent)
+            result += 1
+            current = by_id[parent]
+        return result
+
+    ranked: dict[str, tuple[int, float]] = {}
+    for row in rows:
+        service = str(row.get("service") or "").strip()
+        if not service:
+            continue
+        candidate = (depth(row), float(row.get("duration_ms") or 0))
+        current = ranked.get(service)
+        if current is None or candidate > current:
+            ranked[service] = candidate
+    return tuple(
+        TraceParticipant(service=service, max_depth=value[0], max_duration_ms=value[1])
+        for service, value in sorted(
+            ranked.items(), key=lambda item: (-item[1][0], -item[1][1], item[0])
+        )[:limit]
+    )
 def _stage_bundle(rows, service: str, operation: str):
     operation_spans = [
         row for row in rows if row["service"] == service and row["span_name"] == operation

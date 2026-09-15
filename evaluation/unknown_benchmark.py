@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from rca_agent.langchain_policy import LangChainPolicyAdapter, PolicyEnvelope
 from rca_agent.langgraph_orchestrator import LangGraphInvestigation
 from rca_agent.models import (
     CallToolAction,
+    GetMetricSeriesRequest,
     GetServiceTraceSummaryRequest,
     GetTraceStageBreakdownRequest,
     HypothesisProposal,
@@ -31,6 +34,14 @@ from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, EventType, Rec
 class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
     """Acquire bounded trace context, then force a genuinely unmatched hypothesis."""
 
+    SCREEN_SIGNALS = (
+        "thread_pool_active",
+        "thread_pool_rejected_tasks",
+        "jvm_thread_cpu_time_ns",
+        "jvm_gc_pause_seconds_delta",
+        "jvm_heap_used_bytes",
+    )
+
     def __init__(self) -> None:
         self._step = 0
         self._tried_trace_refs: set[str] = set()
@@ -38,6 +49,8 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
         self._expanded_entities: set[str] = set()
         self._acquisition_actions = 0
         self._pending_expand: str | None = None
+        self._screened: set[tuple[str, str]] = set()
+        self._screen_target_refs: tuple[str, ...] | None = None
 
     def invoke(self, input: dict[str, Any], config: Any = None, **kwargs: Any) -> PolicyEnvelope:
         del config, kwargs
@@ -70,14 +83,44 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
              if trace_ref and trace_ref not in self._tried_trace_refs),
             None,
         )
-        if not has_stage_context and next_trace is not None:
+        participant_seen = any(
+            item.get("signal") == "trace_participant" for item in observations
+        )
+        if not has_stage_context and not participant_seen and next_trace is not None:
             self._tried_trace_refs.add(next_trace)
             self._acquisition_actions += 1
             return PolicyEnvelope(action=CallToolAction(
                 tool_name=ToolName.GET_TRACE_STAGE_BREAKDOWN,
                 request=GetTraceStageBreakdownRequest(trace_ref=next_trace, max_stages=12),
             ))
-        if not has_stage_context and self._acquisition_actions < 16:
+        if participant_seen or has_stage_context:
+            if self._screen_target_refs is None:
+                self._screen_target_refs = tuple(
+                    entity["entity_ref"]
+                    for entity in _history_entities(context)
+                    if entity["entity_type"] == "apm.service"
+                )[:2]
+            for entity_ref in self._screen_target_refs:
+                for signal in self.SCREEN_SIGNALS:
+                    key = (entity_ref, signal)
+                    if key in self._screened:
+                        continue
+                    self._screened.add(key)
+                    self._acquisition_actions += 1
+                    return PolicyEnvelope(action=CallToolAction(
+                        tool_name=ToolName.GET_METRIC_SERIES,
+                        request=GetMetricSeriesRequest(
+                            entity_ref=entity_ref,
+                            signal=signal,
+                            window=context["bootstrap"]["observation_horizon"],
+                            max_points=100,
+                        ),
+                    ))
+        if (
+            not has_stage_context
+            and not self._screen_target_refs
+            and self._acquisition_actions < 16
+        ):
             entities = _history_entities(context)
             pending = next(
                 (entity for entity in entities
@@ -165,14 +208,16 @@ def _history_entities(context: dict[str, Any]) -> list[dict[str, Any]]:
         bootstrap["alert_entity"]["entity_ref"]: (0, bootstrap["alert_entity"]),
     }
     for observation in _history_observations(context.get("history", ())):
-        if observation.get("signal") != "related_entity" or not isinstance(
+        if observation.get("signal") not in {"related_entity", "trace_participant"} or not isinstance(
             observation.get("value"), dict
         ):
             continue
         entity = observation["value"]
         details = observation.get("details", {})
-        rank = 4
-        if details.get("relation") == "operation_of":
+        rank = 8
+        if observation.get("signal") == "trace_participant":
+            rank = int(details.get("critical_rank", 6))
+        elif details.get("relation") == "operation_of":
             rank = 0
         elif details.get("relation") == "calls" and details.get("direction") == "outgoing":
             rank = 1
@@ -220,6 +265,25 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
                   if event.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED]
     verification = [event.payload for event in runner.transcript.events
                     if event.event_type == EventType.DYNAMIC_VERIFICATION]
+    tool_responses = [event.payload for event in runner.transcript.events
+                      if event.event_type == EventType.TOOL_RESPONSE]
+    issued_services = set()
+    missing_observations = 0
+    for response in tool_responses:
+        for observation in response.get("observations", ()):
+            if observation.get("data_status") == "missing":
+                missing_observations += 1
+            value = observation.get("value")
+            if isinstance(value, dict) and value.get("entity_type") == "apm.service":
+                issued_services.add(value.get("display_name", ""))
+            for key in ("resolved_service",):
+                entity = observation.get("details", {}).get(key)
+                if isinstance(entity, dict) and entity.get("entity_type") == "apm.service":
+                    issued_services.add(entity.get("display_name", ""))
+    target_services = {
+        re.sub(r"-[a-f0-9]{9,10}-[a-z0-9]{5}$", "", entity)
+        for entity in truth.root_cause_entities
+    }
     return {
         "case_id": args.case_id,
         "holdout_candidate": args.holdout_candidate,
@@ -243,6 +307,21 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         },
         "graph_steps": report.graph_steps,
         "tool_calls": replay.tool_calls,
+        "diagnostics": {
+            "tool_status_counts": dict(sorted(Counter(
+                str(item.get("status")) for item in tool_responses
+            ).items())),
+            "missing_observations": missing_observations,
+            "issued_services": sorted(issued_services),
+            "target_service_issued": bool(target_services & issued_services),
+            "discovery_rejections": discovery[-1].get("rejections", ()) if discovery else (),
+            "verification_blockers": sorted({
+                blocker
+                for candidate in (verification[-1].get("candidates", {}).values()
+                                  if verification else ())
+                for blocker in candidate.get("blockers", ())
+            }),
+        },
         "replay_valid": replay.valid,
     }
 

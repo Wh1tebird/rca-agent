@@ -27,6 +27,8 @@ class LangChainDiscoveryAdapter:
                         "facts; otherwise propose a new mechanism with a causal explanation, alternatives "
                         "and testable support/refutation predictions. Select only advertised rule_id values. "
                         "A support prediction may use only a rule whose support_eligible field is true. "
+                        "Generic JVM GC count and pause rules establish only generic GC pressure; "
+                        "they cannot establish the specific Full GC subtype. "
                         "Rules marked false may be used for contradicting or distinguishing tests, but "
                         "they cannot prove a causal mechanism. "
                         "Polarity describes whether the advertised predicate should be true: support "

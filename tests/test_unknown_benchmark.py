@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from evaluation.capability_audit import build_matrix, render_markdown
 from evaluation.unknown_benchmark import HoldoutAcquisitionPolicy
 from evaluation.unknown_benchmark_batch import mechanism_matches, score_case, summarize
@@ -10,6 +12,7 @@ from rca_agent.langchain_policy import LangChainPolicyAdapter
 from rca_agent.langgraph_orchestrator import LangGraphInvestigation
 from rca_agent.models import DecisionStatus
 from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, RecordedReplay
+from rca_agent.runner.transcript import EventType
 
 
 def result(*, status="supported_hypothesis", mechanism="SQL execution dominates latency"):
@@ -63,6 +66,8 @@ def test_capability_audit_keeps_missing_network_and_pool_signals_explicit(
     assert mechanisms["connectionPoolExhaustion"]["queryability"] == "partial"
     assert "connection_pool_max" in mechanisms["connectionPoolExhaustion"]["missing"]
     assert mechanisms["threadExhaustion"]["queryability"] == "partial"
+    assert mechanisms["fullGC"]["queryability"] == "unsupported"
+    assert not mechanisms["fullGC"]["support"]
     tools = {item["tool_name"]: item for item in matrix["tools"]}
     assert tools["get_service_trace_summary"]["supported_entity_types"] == [
         "apm.operation", "apm.service",
@@ -107,8 +112,53 @@ def test_trace_resolved_service_advertises_jvm_rules_to_discovery(cases_root: Pa
     assert service_nodes
     advertised = set().union(*(node["available_rule_ids"] for node in service_nodes))
     assert {
-        "thread_pool_active", "thread_pool_queue_depth", "thread_pool_rejected_tasks",
-        "jvm_runnable_threads", "jvm_gc_collection_delta", "jvm_gc_pause_seconds_delta",
+        "thread_pool_active_baseline_ratio",
+        "thread_pool_queue_depth_baseline_ratio", "thread_pool_rejected_tasks",
+        "jvm_runnable_threads_baseline_ratio", "jvm_gc_collection_delta_baseline_ratio",
+        "jvm_gc_pause_seconds_delta_baseline_ratio",
     } <= advertised
     assert RecordedReplay.verify(runner.transcript.events).valid
     assert report.answer is not None
+
+
+@pytest.mark.parametrize("case_id", ["t007", "t055"])
+def test_jvm_holdout_locates_and_screens_inventory_within_budget(
+    cases_root: Path, case_id: str,
+):
+    class CaptureDiscovery:
+        def discover(self, context):
+            self.context = context
+            return DiscoveryPayload()
+
+    discovery = CaptureDiscovery()
+    runner = EpisodeRunner(
+        Rca100Environment.from_case(cases_root, case_id, query_budget=20),
+        max_rounds=30,
+        decision_provider=CoreDecisionProvider(frozenset({"threadExhaustion"})),
+        discovery=discovery,
+        evidence_registry=rca100_evidence_registry,
+    )
+    report = LangGraphInvestigation(
+        runner, LangChainPolicyAdapter(HoldoutAcquisitionPolicy())
+    ).run(recursion_limit=100)
+
+    inventory = next(
+        node for node in discovery.context["entity_graph"]["nodes"]
+        if node["entity_type"] == "apm.service" and node["display_name"] == "inventory"
+    )
+    screened = {
+        item["signal"] for item in discovery.context["observations"]
+        if item["entity_ref"] == inventory["entity_ref"]
+    }
+    assert {
+        "thread_pool_active", "thread_pool_rejected_tasks", "jvm_thread_cpu_time_ns",
+        "jvm_gc_pause_seconds_delta", "jvm_heap_used_bytes",
+    } <= screened
+    responses = [
+        event.payload for event in runner.transcript.events
+        if event.event_type == EventType.TOOL_RESPONSE
+    ]
+    assert len(responses) <= 12
+    assert all(item["status"] != "query_failed" for item in responses)
+    assert report.answer is not None
+    assert RecordedReplay.verify(runner.transcript.events).valid

@@ -10,6 +10,7 @@ from typing import Any
 import duckdb
 
 from rca_agent.core.runtime_registry import (
+    BASELINE_SIGNAL_CONTRACTS,
     METRIC_SIGNAL_CONTRACTS,
     NON_CAUSAL_SUPPORT_TRACE_RULES,
     TRACE_SIGNAL_CONTRACTS,
@@ -52,11 +53,19 @@ MECHANISM_REQUIREMENTS: tuple[dict[str, Any], ...] = (
     {
         "mechanism": "threadExhaustion",
         "support": (
-            "thread_pool_active", "thread_pool_queue_depth",
-            "thread_pool_rejected_tasks", "jvm_runnable_threads", "jvm_thread_count",
+            "thread_pool_active_baseline_ratio",
+            "thread_pool_queue_depth_baseline_ratio", "thread_pool_rejected_tasks",
+            "jvm_runnable_threads_baseline_ratio", "jvm_thread_count_baseline_ratio",
+            "jvm_thread_cpu_time_ns_baseline_ratio",
         ),
-        "refutation": ("sql_duration_share", "connection_acquisition_ms"),
-        "distinguishing": ("sql_duration_share", "thread_pool_rejected_tasks"),
+        "refutation": (
+            "sql_duration_share", "connection_acquisition_ms",
+            "jvm_gc_pause_seconds_delta_baseline_ratio",
+        ),
+        "distinguishing": (
+            "sql_duration_share", "thread_pool_rejected_tasks",
+            "jvm_gc_pause_seconds_delta_baseline_ratio",
+        ),
         "missing": ("thread_pool_queue_wait_ms",),
         "queryability": "partial",
         "note": "Aggregate thread/JVM recipes exist; thresholds still need holdout validation.",
@@ -64,22 +73,29 @@ MECHANISM_REQUIREMENTS: tuple[dict[str, Any], ...] = (
     {
         "mechanism": "memoryPressure",
         "support": (
-            "jvm_heap_used_bytes", "jvm_gc_collection_delta", "jvm_gc_pause_seconds_delta",
+            "jvm_heap_used_bytes_baseline_ratio",
+            "jvm_gc_collection_delta_baseline_ratio",
+            "jvm_gc_pause_seconds_delta_baseline_ratio",
         ),
-        "refutation": (),
-        "distinguishing": (),
+        "refutation": ("thread_pool_rejected_tasks",),
+        "distinguishing": (
+            "jvm_heap_used_bytes_baseline_ratio", "thread_pool_rejected_tasks",
+        ),
         "missing": ("old_gen_usage", "allocation_rate", "heap_after_gc"),
         "queryability": "partial",
         "note": "Heap and generic GC telemetry exist, but memory-specific refutation is incomplete.",
     },
     {
         "mechanism": "fullGC",
-        "support": ("jvm_gc_collection_delta", "jvm_gc_pause_seconds_delta"),
+        "support": (),
         "refutation": (),
         "distinguishing": (),
         "missing": ("full_gc_count", "full_gc_pause_duration", "heap_after_gc"),
-        "queryability": "partial",
-        "note": "Generic GC count/pause is queryable but does not identify Full GC specifically.",
+        "queryability": "unsupported",
+        "note": (
+            "Generic GC count/pause is useful context but is not Full-GC-specific support; "
+            "specific Full GC verification is blocked."
+        ),
     },
     {
         "mechanism": "nodeCpuHigh",
@@ -252,6 +268,27 @@ def _signal_inventory(
                 "raw_sample_count": coverage.get("sample_count", 0),
                 "raw_entity_count": coverage.get("entity_count", 0),
             })
+    service_mappings = PUBLIC_METRIC_MAP["apm.service"]
+    for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
+        entity_set, raw_metric, _ = service_mappings[contract["base_signal"]]
+        coverage = metric_coverage.get((entity_set, raw_metric), {})
+        signals.append({
+            "signal": signal,
+            "entity_type": "apm.service",
+            "tool": "compare_metric_windows",
+            "unit": "ratio",
+            "data_type": "number",
+            "independent_group": contract["group"],
+            "rule_ids": [signal],
+            "support_eligible": True,
+            "runtime_registered": True,
+            "raw_metric": raw_metric,
+            "raw_entity_set": entity_set,
+            "raw_data_case_count": coverage.get("case_count", 0),
+            "raw_sample_count": coverage.get("sample_count", 0),
+            "raw_entity_count": coverage.get("entity_count", 0),
+            "description": contract["description"],
+        })
     mapped = {
         (entity_set, raw_metric)
         for mappings in PUBLIC_METRIC_MAP.values()

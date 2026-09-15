@@ -336,7 +336,9 @@ class EpisodeRunner:
             target = None
             relation = observation.details.get("relation")
             direction = observation.details.get("direction", "outgoing")
-            if observation.signal == "related_entity" and isinstance(observation.value, dict):
+            if observation.signal in {"related_entity", "trace_participant"} and isinstance(
+                observation.value, dict
+            ):
                 target = observation.value
             elif observation.signal == "topology_edge":
                 target = observation.details.get("neighbor")

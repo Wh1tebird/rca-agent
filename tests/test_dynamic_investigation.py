@@ -300,6 +300,13 @@ def test_noncausal_symptom_rule_cannot_count_as_root_cause_support():
         restricted.compile(draft(), "ent-service")
 
 
+def test_generic_gc_or_other_generic_rules_cannot_claim_specific_full_gc():
+    specific = draft().model_copy(update={"mechanism": "Full GC pause storm"})
+
+    with pytest.raises(ValueError, match="cannot establish the specific Full GC subtype"):
+        registry().compile(specific, "ent-service")
+
+
 def test_nonfinite_wrong_unit_entity_and_query_are_not_evidence():
     compiled = registry().compile(draft(), "ent-service")
     env = Environment()
@@ -552,12 +559,12 @@ def test_factory_registers_jvm_thread_rules_for_an_issued_service():
     assert {spec.signal for spec in registry.signals} >= {
         "thread_pool_active", "thread_pool_max", "thread_pool_queue_depth",
         "thread_pool_rejected_tasks", "jvm_runnable_threads", "jvm_thread_count",
+        "jvm_thread_cpu_time_ns",
         "jvm_heap_used_bytes", "jvm_heap_max_bytes", "jvm_gc_collection_delta",
         "jvm_gc_pause_seconds_delta",
     }
     rules = {rule.rule_id: rule for rule in registry.rules}
-    assert rules["thread_pool_active"].reference_signal == "thread_pool_max"
-    assert rules["jvm_heap_used_bytes"].reference_signal == "jvm_heap_max_bytes"
+    assert "thread_pool_active" not in rules
     rejected = next(
         spec for spec in registry.signals if spec.signal == "thread_pool_rejected_tasks"
     )

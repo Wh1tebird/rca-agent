@@ -1,6 +1,6 @@
 # RCA Agent project context
 
-Last consolidated: 2026-09-15 after capability-aware unknown-RCA rerun
+Last consolidated: 2026-09-15 after JVM/thread/GC diagnostic hardening
 
 ## 1. Purpose
 
@@ -215,3 +215,22 @@ because queue-wait, old-gen/allocation/heap-after-GC and Full-GC-specific semant
 The compiler now distinguishes causal-support predicates from symptoms/exclusion predicates;
 operation latency, JDBC client duration and low SQL share cannot be used to manufacture a second
 root-cause support group.
+
+The JVM/thread/GC increment now derives neutral trace participants even when a Trace lacks a complete
+database stage bundle. Participants are ranked by downstream depth, and the diagnostic acquisition
+policy screens no more than two services and ten JVM/thread Metric queries before Discovery. t007
+and t055 both locate and screen the inventory service within this bound. Equal-window comparison now
+also emits a typed scalar baseline ratio, so host rules can verify changes without fixed absolute
+counts. Missing and zero baselines stay unavailable.
+
+An evaluation-only 103-case profile found that the source active-thread aggregate has inconsistent
+scale across cases. Runtime therefore does not treat it as a portable active/max capacity ratio; it
+uses only change relative to the same signal's own baseline. Grouped thread CPU time is now mapped.
+Generic GC count/pause can establish only generic GC pressure, and the compiler rejects a specific
+Full GC claim unless Full-GC-specific support telemetry is present.
+
+The frozen 12-case diagnostic probe completed 12/12 with valid replay, 0 `QUERY_FAILED`, and 0 wrong
+`DISCOVERED_VERIFIED`. All six JVM/thread/GC positives issued their target service. DeepSeek proposed
+the GT-like mechanism in t055 and t009, but both remained `SUPPORTED_HYPOTHESIS` because refutation
+or declared-alternative checks were incomplete. This is a safe diagnostic result, not an accuracy
+claim. See `analysis/jvm_signal_profile.md` and `analysis/jvm_diagnostic_probe.md`.

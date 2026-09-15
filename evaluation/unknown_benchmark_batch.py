@@ -43,6 +43,18 @@ def mechanism_matches(root_cause: str, mechanism: str) -> bool:
             or "full garbage collection" in normalized
             or ("garbage collection" in normalized and "pause" in normalized)
         )
+    if root_cause in {"cpuFullLoad", "nodeCpuHigh", "cpuDeadLoop"}:
+        return "cpu" in normalized and any(
+            word in normalized for word in ("high", "load", "saturat", "loop")
+        )
+    if root_cause == "nodeMemoryOOM":
+        return any(word in normalized for word in ("oom", "out of memory"))
+    if root_cause in {"trafficSurge", "trafficHotspot"}:
+        return "traffic" in normalized and any(
+            word in normalized for word in ("surge", "spike", "hotspot", "load")
+        )
+    if root_cause == "codeDefect":
+        return any(word in normalized for word in ("code defect", "application bug", "code bug"))
     raise ValueError("unsupported Ground-Truth mechanism in holdout manifest")
 
 
@@ -55,6 +67,9 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
     ]
     status = result["status"].strip()
     verified = status == "discovered_verified"
+    diagnostics = result.get("diagnostics", {})
+    blockers = diagnostics.get("verification_blockers", ())
+    rejections = diagnostics.get("discovery_rejections", ())
     return {
         "case_id": result["case_id"],
         "holdout_candidate": result["holdout_candidate"],
@@ -74,6 +89,11 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
                 for root_cause in root_causes
             )
         ),
+        "target_service_issued": diagnostics.get("target_service_issued"),
+        "missing_observations": diagnostics.get("missing_observations", 0),
+        "query_failed": bool(diagnostics.get("tool_status_counts", {}).get("query_failed")),
+        "rule_or_compile_failure": bool(rejections),
+        "alternative_resolution_failure": "alternative_explanations_unresolved" in blockers,
         "replay_valid": result["replay_valid"],
     }
 
@@ -94,9 +114,29 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
         "discovered_verified": sum(item["discovered_verified"] for item in scores),
         "correct_verified": sum(item["correct_verified"] for item in scores),
         "wrong_verified": sum(item["wrong_verified"] for item in scores),
+        "target_service_issued": sum(item.get("target_service_issued") is True for item in scores),
+        "query_failed_cases": sum(item.get("query_failed", False) for item in scores),
+        "rule_or_compile_failure_cases": sum(
+            item.get("rule_or_compile_failure", False) for item in scores
+        ),
+        "alternative_resolution_failure_cases": sum(
+            item.get("alternative_resolution_failure", False) for item in scores
+        ),
         "replay_valid": sum(item["replay_valid"] for item in scores),
         "status_counts": status_counts,
         "failures": failures,
+        "roles": {
+            role: {
+                "cases": sum(item.get("role") == role for item in scores),
+                "correct_verified": sum(
+                    item.get("role") == role and item["correct_verified"] for item in scores
+                ),
+                "wrong_verified": sum(
+                    item.get("role") == role and item["wrong_verified"] for item in scores
+                ),
+            }
+            for role in sorted({item.get("role") for item in scores if item.get("role")})
+        },
     }
 
 
@@ -157,7 +197,9 @@ def main() -> None:
                 result = run_case(case_args)
                 output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                                   encoding="utf-8")
-            scores.append(score_case(result))
+            score = score_case(result)
+            score["role"] = item.get("role")
+            scores.append(score)
         except Exception as exc:  # noqa: BLE001 - batch continues; provider text is not retained
             failures.append({"case_id": case_id, "error_type": type(exc).__name__})
         summary = {

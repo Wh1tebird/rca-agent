@@ -147,7 +147,14 @@ def test_same_query_replays_deterministically(cases_root: Path):
             )
         )
 
-    assert run() == run()
+    response = run()
+    assert response == run()
+    ratio = next(
+        item for item in response.observations if item.signal == "request_count_baseline_ratio"
+    )
+    assert ratio.unit == "ratio"
+    assert ratio.data_status in {DataStatus.DERIVED, DataStatus.UNKNOWN}
+    assert {"before_mean", "incident_mean", "incident_max"} <= ratio.details.keys()
 
 
 def test_missing_metric_remains_missing_without_interpolation(cases_root: Path):
@@ -256,11 +263,12 @@ def test_service_exposes_neutral_jvm_and_thread_pool_metrics(cases_root: Path):
     assert service_ref is not None
 
     for signal, unit in (
-        ("thread_pool_active", "count"),
-        ("thread_pool_max", "count"),
+        ("thread_pool_active", None),
+        ("thread_pool_max", None),
         ("thread_pool_queue_depth", "count"),
         ("thread_pool_rejected_tasks", "count"),
         ("jvm_runnable_threads", "count"),
+        ("jvm_thread_cpu_time_ns", "ns"),
         ("jvm_heap_used_bytes", "bytes"),
         ("jvm_gc_pause_seconds_delta", "s"),
     ):
@@ -376,3 +384,30 @@ def test_t021_trace_breakdown_resolves_the_downstream_database_operation(
     resolved_service = facts["sql_duration_ms"].details["resolved_service"]
     assert resolved_service["entity_type"] == "apm.service"
     assert resolved_service["entity_ref"].startswith("ent-")
+
+
+def test_non_database_trace_still_issues_ranked_service_participants(cases_root: Path):
+    environment = _environment(cases_root, "t007")
+    bootstrap = environment.reset()
+    summary = environment.get_service_trace_summary(
+        GetServiceTraceSummaryRequest(
+            entity_ref=bootstrap.alert_entity.entity_ref,
+            window=_incident_window(bootstrap),
+            min_duration_ms=100,
+            max_traces=1,
+        )
+    )
+    breakdown = environment.get_trace_stage_breakdown(
+        GetTraceStageBreakdownRequest(
+            trace_ref=summary.observations[0].details["trace_ref"],
+            max_stages=12,
+        )
+    )
+
+    participants = [
+        item for item in breakdown.observations if item.signal == "trace_participant"
+    ]
+    assert participants
+    assert participants[0].value["display_name"] == "inventory"
+    assert participants[0].details["critical_rank"] == 0
+    assert breakdown.status == ToolStatus.EMPTY

@@ -208,6 +208,31 @@ class Rca100Environment:
 
         def operation() -> tuple[ToolStatus, tuple[Observation, ...], str, bool]:
             selection = self.__traces[request.trace_ref]
+            participant_rows = self.__adapter.trace_participants(
+                selection, max(1, request.max_stages - 1)
+            )
+            participant_observations = []
+            for index, item in enumerate(participant_rows):
+                binding = item["binding"]
+                self.__entities[binding.public_ref] = binding
+                participant_observations.append(
+                    self._observation(
+                        query_ref,
+                        index + 1,
+                        Modality.TRACE,
+                        selection.source_entity_ref,
+                        "trace_participant",
+                        self._public_entity(binding).model_dump(mode="json"),
+                        DataStatus.DERIVED,
+                        details={
+                            "trace_ref": request.trace_ref,
+                            "relation": "participates_in_trace",
+                            "critical_rank": item["critical_rank"],
+                            "max_depth": item["max_depth"],
+                            "max_duration_ms": item["max_duration_ms"],
+                        },
+                    )
+                )
             try:
                 values, resolved_entity, resolved_service, resolution = (
                     self.__adapter.trace_stage_breakdown(selection)
@@ -225,8 +250,8 @@ class Rca100Environment:
                 )
                 return (
                     ToolStatus.EMPTY,
-                    (missing,),
-                    "trace has no complete database stage bundle",
+                    (missing, *participant_observations),
+                    "trace has no complete database stage bundle; participants returned",
                     False,
                 )
             self.__entities[resolved_entity.public_ref] = resolved_entity
@@ -250,7 +275,8 @@ class Rca100Environment:
                 "sql_shape": None,
             }
             items = list(values.items())
-            truncated = len(items) > request.max_stages
+            remaining = max(0, request.max_stages - len(items))
+            truncated = len(items) + len(participant_observations) > request.max_stages
             observations = tuple(
                 self._observation(
                     query_ref,
@@ -271,6 +297,11 @@ class Rca100Environment:
                     },
                 )
                 for index, (signal, value) in enumerate(items[: request.max_stages])
+            ) + tuple(
+                observation.model_copy(update={
+                    "details": {**observation.details, "resolution": resolution}
+                })
+                for observation in participant_observations[:remaining]
             )
             return ToolStatus.SUCCESS, observations, "bounded trace-stage facts returned", truncated
 
@@ -369,19 +400,26 @@ class Rca100Environment:
             _to_us(request.incident_window.end),
         )
         if row is None:
-            missing = self._observation(
-                query_ref,
-                0,
-                Modality.METRIC,
-                request.entity_ref,
-                f"{request.signal}_window_comparison",
-                None,
-                DataStatus.MISSING,
-                details={"coverage": "one_or_both_windows_missing"},
+            missing = tuple(
+                self._observation(
+                    query_ref,
+                    index,
+                    Modality.METRIC,
+                    request.entity_ref,
+                    signal,
+                    None,
+                    DataStatus.MISSING,
+                    unit="ratio" if index else None,
+                    details={"coverage": "one_or_both_windows_missing"},
+                )
+                for index, signal in enumerate((
+                    f"{request.signal}_window_comparison",
+                    f"{request.signal}_baseline_ratio",
+                ))
             )
             return (
                 ToolStatus.COVERAGE_INSUFFICIENT,
-                (missing,),
+                missing,
                 "equal-window comparison lacks source coverage",
                 False,
             )
@@ -405,7 +443,23 @@ class Rca100Environment:
             status,
             unit=target.unit,
         )
-        return ToolStatus.SUCCESS, (observation,), "equal-window comparison returned", False
+        ratio_observation = self._observation(
+            query_ref,
+            1,
+            Modality.METRIC,
+            request.entity_ref,
+            f"{request.signal}_baseline_ratio",
+            row["ratio"],
+            DataStatus.DERIVED if row["ratio"] is not None else DataStatus.UNKNOWN,
+            unit="ratio",
+            details=value,
+        )
+        return (
+            ToolStatus.SUCCESS,
+            (observation, ratio_observation),
+            "equal-window comparison returned",
+            False,
+        )
 
     def _validate_entity_and_window(
         self,
@@ -535,7 +589,7 @@ class Rca100Environment:
                 available=True,
                 query_cost=1,
                 max_window_seconds=MAX_WINDOW_SECONDS,
-                max_results=1,
+                max_results=2,
             ),
             CapabilityDescriptor(
                 tool_name="list_related_entities",

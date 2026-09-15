@@ -259,6 +259,24 @@ class EvidenceRegistry(BaseModel):
                 groups.add(by_signal[(target_entity_ref, rule.signal)].independent_group)
         if len(groups) < 2:
             raise ValueError("two host-defined independent support groups are required")
+        normalized_mechanism = " ".join(
+            draft.mechanism.casefold().replace("-", " ").split()
+        )
+        claims_full_gc = (
+            "full gc" in normalized_mechanism
+            or "full garbage collection" in normalized_mechanism
+        )
+        support_signals = {
+            rule.signal
+            for rule, prediction in zip(selected, draft.predictions, strict=True)
+            if prediction.polarity == ConditionPolarity.SUPPORT
+        }
+        if claims_full_gc and not any(
+            signal.startswith("full_gc_") for signal in support_signals
+        ):
+            raise ValueError(
+                "generic GC observations cannot establish the specific Full GC subtype"
+            )
         payload = {
             "draft": draft.model_dump(mode="json"),
             "entity": causal_entity_ref,

@@ -2,6 +2,28 @@
 
 ## Latest increment — 2026-09-15
 
+The JVM/thread/GC follow-up is complete. Trace breakdown now issues bounded neutral participant
+services even without a DB stage bundle; downstream-depth ranking plus a ten-query JVM screen locates
+inventory in both t007 and t055. Metric comparison emits a typed baseline-ratio fact. Runtime rules
+now use equal-window changes for active threads, queues, runnable/total threads, grouped thread CPU,
+heap, GC count and GC pause; only rejected tasks retains a meaningful absolute positive threshold.
+The ambiguous active-thread aggregate is no longer treated as a portable capacity ratio.
+
+Generic GC observations cannot compile into a specific Full GC claim. The evaluation-only profiler
+scanned 103 cases / 824 records, and the 12-case DeepSeek diagnostic completed 12/12 with valid
+replay, 6/6 positive target services issued, 0 query-failed cases and 0 wrong verifications. t055
+recovered thread exhaustion and t009 recovered heap/GC pressure, both safely remaining supported
+because alternative/refutation closure was incomplete. Ruff and all 147 tests pass. Results live in
+`analysis/jvm_signal_profile.*`, `analysis/jvm_diagnostic_probe_summary.json`, and
+`analysis/jvm_diagnostic_probe/`.
+
+The main remaining bottleneck is Discovery contract adherence and discriminating evidence, not JVM
+entity reachability. Eight cases had compiler rejections, especially non-exact alternative strings
+and entity/rule mismatch. Before the formal 20-30 case benchmark, improve structured alternative
+references (prefer IDs over repeated free text) and add capability-specific refutation signals.
+
+## Previous capability increment — 2026-09-15
+
 The first capability increment delivered the 1-4 implementation slice, but not every acceptance
 condition in the full seven-step plan. The audit and entity graph are now implemented; database
 differentiation remains partial because transport, pool-capacity and server-side timing are absent;
