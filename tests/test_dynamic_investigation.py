@@ -13,10 +13,11 @@ from rca_agent.core.dynamic import (
     RuleSpec,
     SignalSpec,
     assess_dynamic,
+    repair_mechanical_contract,
     verify_dynamic,
 )
 from rca_agent.core.v3.models import ConditionPolarity, MechanismFamily
-from rca_agent.langchain_discovery import LangChainDiscoveryAdapter
+from rca_agent.langchain_discovery import DiscoveryPayloadError, LangChainDiscoveryAdapter
 from rca_agent.langchain_policy import LangChainPolicyAdapter, ScriptedPolicyRunnable
 from rca_agent.langgraph_orchestrator import LangGraphInvestigation
 from rca_agent.models import (
@@ -354,6 +355,23 @@ def test_failure_and_timeout_are_bounded_and_replayable():
     assert "secret provider payload" not in str(runner.transcript.events)
     assert RecordedReplay.verify(runner.transcript.events).valid
 
+    class InvalidPayload:
+        def discover(self, context):
+            raise DiscoveryPayloadError({
+                "hypotheses": [{"mechanism": "possible heap pressure"}],
+            })
+
+    runner, report, _, _ = run(InvalidPayload())
+    rejected = next(
+        event.payload for event in runner.transcript.events
+        if event.event_type == EventType.DISCOVERY_PAYLOAD_REJECTED
+    )
+    assert rejected["raw_payload"]["hypotheses"][0]["mechanism"] == (
+        "possible heap pressure"
+    )
+    assert report.answer.authoritative_decision.status == DecisionStatus.OUT_OF_SCOPE
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
     class Slow:
         def discover(self, context):
             sleep(0.05)
@@ -379,6 +397,56 @@ def test_langchain_discovery_adapter_validates_model_output():
         RunnableLambda(lambda _: {"hypotheses": [draft().model_dump()]})
     )
     assert adapter.discover({}).hypotheses[0].mechanism == "thread pool exhaustion"
+
+
+def test_langchain_discovery_adapter_preserves_invalid_structured_json():
+    class RawMessage:
+        content = '{"hypotheses":[{"mechanism":"heap pressure"}]}'
+
+    adapter = LangChainDiscoveryAdapter(RunnableLambda(lambda _: {
+        "raw": RawMessage(), "parsed": None, "parsing_error": ValueError("private detail"),
+    }))
+    with pytest.raises(DiscoveryPayloadError) as exc_info:
+        adapter.discover({})
+    assert exc_info.value.raw_payload == {
+        "hypotheses": [{"mechanism": "heap pressure"}],
+    }
+
+
+def test_mechanical_repair_only_canonicalizes_exact_alternative_references():
+    original = draft(refute=True).model_copy(update={
+        "alternatives": ("  Downstream   Blocking  ",),
+    })
+    repaired, actions = repair_mechanical_contract(original)
+    assert actions == ("canonicalized_alternative_references",)
+    assert repaired.predictions[-1].distinguishes == ("  Downstream   Blocking  ",)
+    assert repaired.mechanism == original.mechanism
+    assert repaired.causal_explanation == original.causal_explanation
+    assert repaired.predictions[:-1] == original.predictions[:-1]
+
+    semantic_mismatch = draft(refute=True).model_copy(update={
+        "alternatives": ("downstream database latency",),
+    })
+    unchanged, actions = repair_mechanical_contract(semantic_mismatch)
+    assert unchanged == semantic_mismatch
+    assert not actions
+
+
+def test_runner_records_raw_draft_and_auditable_mechanical_repair():
+    repairable = draft(refute=True).model_copy(update={
+        "alternatives": ("Downstream Blocking",),
+    })
+    runner, _, _, _ = run(Discoverer(repairable))
+    evaluated = next(
+        event.payload for event in runner.transcript.events
+        if event.event_type == EventType.DISCOVERY_DRAFT_EVALUATED
+    )
+    assert evaluated["raw_draft"]["alternatives"] == ["Downstream Blocking"]
+    assert evaluated["initial_status"] == "rejected"
+    assert evaluated["repair_actions"] == ["canonicalized_alternative_references"]
+    assert evaluated["final_status"] == "accepted"
+    assert evaluated["final_draft"]["mechanism"] == repairable.mechanism
+    assert RecordedReplay.verify(runner.transcript.events).valid
 
 
 def test_unknown_signal_recipe_is_rejected_before_query():

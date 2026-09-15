@@ -66,12 +66,34 @@ class LangChainDiscoveryAdapter:
             | model.with_structured_output(
                 DiscoveryPayload,
                 method=structured_method,
+                include_raw=True,
             )
         )
 
     def discover(self, context: dict[str, Any]) -> DiscoveryPayload:
-        raw = self._runnable.invoke({
+        response = self._runnable.invoke({
             "schema_json": json.dumps(DiscoveryPayload.model_json_schema(), sort_keys=True),
             "context_json": json.dumps(context, sort_keys=True),
         })
-        return DiscoveryPayload.model_validate(raw)
+        if isinstance(response, dict) and "parsed" in response and "raw" in response:
+            parsed = response.get("parsed")
+            if parsed is not None:
+                return DiscoveryPayload.model_validate(parsed)
+            raw_message = response.get("raw")
+            content = getattr(raw_message, "content", None)
+            raw_payload: Any = None
+            if isinstance(content, str):
+                try:
+                    raw_payload = json.loads(content)
+                except json.JSONDecodeError:
+                    raw_payload = {"unparsed_text": content[:20_000]}
+            raise DiscoveryPayloadError(raw_payload)
+        return DiscoveryPayload.model_validate(response)
+
+
+class DiscoveryPayloadError(ValueError):
+    """A provider returned content that failed the advertised Discovery schema."""
+
+    def __init__(self, raw_payload: Any) -> None:
+        super().__init__("invalid structured discovery payload")
+        self.raw_payload = raw_payload

@@ -116,6 +116,14 @@ class RecordedReplay:
                 ):
                     raise ReplayValidationError("discovery evidence snapshot mismatch")
                 provider.register_dynamic(compiled)
+            elif event.event_type == EventType.DISCOVERY_DRAFT_EVALUATED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("discovery draft evaluation is out of order")
+                if event.payload.get("final_status") not in {"accepted", "rejected"}:
+                    raise ReplayValidationError("invalid discovery draft evaluation status")
+            elif event.event_type == EventType.DISCOVERY_PAYLOAD_REJECTED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("discovery payload rejection is out of order")
             elif event.event_type == EventType.DISCOVERY_COMPLETED:
                 if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
                     raise ReplayValidationError("discovery completion is out of order")

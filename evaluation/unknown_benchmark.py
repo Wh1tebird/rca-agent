@@ -265,6 +265,27 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
                   if event.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED]
     verification = [event.payload for event in runner.transcript.events
                     if event.event_type == EventType.DYNAMIC_VERIFICATION]
+    draft_evaluations = [event.payload for event in runner.transcript.events
+                         if event.event_type == EventType.DISCOVERY_DRAFT_EVALUATED]
+    rejected_payloads = [event.payload for event in runner.transcript.events
+                         if event.event_type == EventType.DISCOVERY_PAYLOAD_REJECTED]
+    invalid_drafts = []
+    for rejection in rejected_payloads:
+        raw_payload = rejection.get("raw_payload")
+        hypotheses = raw_payload.get("hypotheses", ()) if isinstance(raw_payload, dict) else ()
+        for draft_index, raw_draft in enumerate(hypotheses):
+            if isinstance(raw_draft, dict) and isinstance(raw_draft.get("mechanism"), str):
+                invalid_drafts.append({
+                    "draft_index": draft_index,
+                    "raw_draft": raw_draft,
+                    "final_draft": raw_draft,
+                    "initial_status": "rejected",
+                    "initial_error": "invalid_discovery_payload",
+                    "repair_actions": (),
+                    "final_status": "rejected",
+                    "final_error": "invalid_discovery_payload",
+                    "registration": "none",
+                })
     tool_responses = [event.payload for event in runner.transcript.events
                       if event.event_type == EventType.TOOL_RESPONSE]
     issued_services = set()
@@ -298,6 +319,8 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             "alternatives": item["compiled"]["alternatives"],
             "predictions": item["compiled"]["predictions"],
         } for item in registered],
+        "raw_discovery_drafts": [*draft_evaluations, *invalid_drafts],
+        "discovery_payload_rejections": rejected_payloads,
         "verification": verification[-1] if verification else None,
         "discovery": discovery[-1] if discovery else None,
         "ground_truth": {

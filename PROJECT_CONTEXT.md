@@ -234,3 +234,13 @@ The frozen 12-case diagnostic probe completed 12/12 with valid replay, 0 `QUERY_
 the GT-like mechanism in t055 and t009, but both remained `SUPPORTED_HYPOTHESIS` because refutation
 or declared-alternative checks were incomplete. This is a safe diagnostic result, not an accuracy
 claim. See `analysis/jvm_signal_profile.md` and `analysis/jvm_diagnostic_probe.md`.
+
+The follow-up discovery funnel now preserves every schema-valid raw draft and its initial/final
+compile outcome in the replayable Transcript. Invalid structured provider JSON is also retained in
+bounded form for post-freeze diagnosis. A deterministic repair may only canonicalize case and
+whitespace in references to an already-declared alternative; it cannot change a mechanism, family,
+rule, entity, polarity or causal explanation. On the rerun, 6/12 cases had a raw GT-like mechanism,
+4/6 of those passed the initial contract, and 2/4 reached a correct `DISCOVERED_VERIFIED`; no wrong
+mechanism verified. The safe mechanical repair did not fire because the observed failures required
+entity/rule grounding or evidence capability rather than harmless text normalization. See
+`analysis/jvm_discovery_funnel.md` and `analysis/jvm_discovery_funnel_interpretation.md`.

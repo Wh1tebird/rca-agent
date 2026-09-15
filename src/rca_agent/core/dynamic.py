@@ -155,6 +155,37 @@ class DiscoveryPayload(BaseModel):
     hypotheses: tuple[DynamicHypothesis, ...] = Field(default=(), max_length=4)
 
 
+def repair_mechanical_contract(
+    draft: DynamicHypothesis,
+) -> tuple[DynamicHypothesis, tuple[str, ...]]:
+    """Canonicalize exact alternative references without changing hypothesis semantics."""
+
+    def reference_key(value: str) -> str:
+        return " ".join(value.strip().casefold().split())
+
+    alternatives_by_key: dict[str, list[str]] = {}
+    for alternative in draft.alternatives:
+        alternatives_by_key.setdefault(reference_key(alternative), []).append(alternative)
+
+    changed = False
+    predictions = []
+    for prediction in draft.predictions:
+        repaired_references = []
+        for reference in prediction.distinguishes:
+            matches = alternatives_by_key.get(reference_key(reference), ())
+            repaired = matches[0] if len(matches) == 1 else reference
+            changed |= repaired != reference
+            repaired_references.append(repaired)
+        predictions.append(prediction.model_copy(update={
+            "distinguishes": tuple(repaired_references),
+        }))
+    if not changed:
+        return draft, ()
+    return draft.model_copy(update={"predictions": tuple(predictions)}), (
+        "canonicalized_alternative_references",
+    )
+
+
 class CompiledCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     candidate: Candidate

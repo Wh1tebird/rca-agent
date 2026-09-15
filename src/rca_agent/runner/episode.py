@@ -9,7 +9,12 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
-from rca_agent.core.dynamic import DiscoveryPayload, EvidenceRegistry, observation_fact_digest
+from rca_agent.core.dynamic import (
+    DiscoveryPayload,
+    EvidenceRegistry,
+    observation_fact_digest,
+    repair_mechanical_contract,
+)
 from rca_agent.environment.contract import RcaEnvironment
 from rca_agent.models import (
     AnswerArtifact,
@@ -217,8 +222,12 @@ class EpisodeRunner:
         def invoke():
             try:
                 mailbox.put((True, generator.discover(deepcopy(context))))
-            except Exception as exc:  # noqa: BLE001 - no provider text crosses the boundary
-                mailbox.put((False, type(exc).__name__))
+            except Exception as exc:  # noqa: BLE001 - failure is sanitized and bounded below
+                failure = {"error_type": type(exc).__name__}
+                raw_payload = getattr(exc, "raw_payload", None)
+                if isinstance(raw_payload, (dict, list)):
+                    failure["raw_payload"] = raw_payload
+                mailbox.put((False, failure))
 
         Thread(target=invoke, daemon=True).start()
         registered = 0
@@ -227,10 +236,19 @@ class EpisodeRunner:
         try:
             ok, raw = mailbox.get(timeout=self.__discovery_timeout)
             if not ok:
-                raise ValueError("discovery failed")
+                self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, raw)
+                result = {
+                    "status": "failed", "registered": 0,
+                    "error_type": raw["error_type"],
+                }
+                self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+                return result
             payload = DiscoveryPayload.model_validate(raw)
             seen = set()
-            for draft in payload.hypotheses:
+            for draft_index, draft in enumerate(payload.hypotheses):
+                evaluated_draft = draft
+                initial_error = None
+                repair_actions: tuple[str, ...] = ()
                 try:
                     original = proposals.get(draft.source_hypothesis_id)
                     discovery_key = (
@@ -248,22 +266,33 @@ class EpisodeRunner:
                     }
                     if not referenced_entities <= self.__issued_entities:
                         raise ValueError("dynamic hypothesis references an unissued entity")
-                    compiled = registry.compile(
-                        draft, original.causal_entity_ref,
-                        discovery_query_refs=tuple(sorted({
+                    compile_kwargs = {
+                        "discovery_query_refs": tuple(sorted({
                             r.query_ref for r in self.__observation_ledger.values()
                         })),
-                        discovery_observation_refs=tuple(sorted(self.__observation_ledger)),
-                        discovery_fact_digests=tuple(sorted({
+                        "discovery_observation_refs": tuple(sorted(self.__observation_ledger)),
+                        "discovery_fact_digests": tuple(sorted({
                             observation_fact_digest(r.observation)
                             for r in self.__observation_ledger.values()
                         })),
-                    )
+                    }
+                    try:
+                        compiled = registry.compile(
+                            evaluated_draft, original.causal_entity_ref, **compile_kwargs
+                        )
+                    except ValueError as exc:
+                        initial_error = str(exc)
+                        evaluated_draft, repair_actions = repair_mechanical_contract(draft)
+                        if not repair_actions:
+                            raise
+                        compiled = registry.compile(
+                            evaluated_draft, original.causal_entity_ref, **compile_kwargs
+                        )
                     if not all(self._signal_executable(s) for s in compiled.signals):
                         raise ValueError("query recipe is not executable in this episode")
                     existing = next((c for c in self.__decision_provider.catalog(
                                      compiled.candidate.causal_entity)
-                                     if draft.mechanism.casefold() in {
+                                     if evaluated_draft.mechanism.casefold() in {
                                          c.candidate_id.casefold(), c.fault_type.casefold()
                                      } and c.family == draft.family), None)
                     if existing is not None:
@@ -280,12 +309,16 @@ class EpisodeRunner:
                             hypothesis_id=hypothesis_id, candidate_id=existing.candidate_id,
                             mechanism=existing.fault_type,
                             causal_entity_ref=compiled.candidate.causal_entity,
-                            rationale=draft.causal_explanation,
+                            rationale=evaluated_draft.causal_explanation,
                         ))
                         queries = {query_fingerprint(s.query.tool_name, s.query.request): s.query
                                    for s in compiled.signals}
                         self.__verification_queries.extend((hypothesis_id, q) for q in queries.values())
                         aligned += 1
+                        self._record_discovery_draft(
+                            draft_index, draft, evaluated_draft, initial_error,
+                            repair_actions, "accepted", None, "catalog_aligned",
+                        )
                         continue
                     # Preserve the original hypothesis and its evidence; discovery gets its own ID.
                     hypothesis_id = "h-discovered-" + compiled.version[:20]
@@ -297,9 +330,9 @@ class EpisodeRunner:
                     })
                     self._submit_hypothesis(HypothesisProposal(
                         hypothesis_id=hypothesis_id, candidate_id=compiled.candidate.candidate_id,
-                        mechanism=draft.mechanism,
+                        mechanism=evaluated_draft.mechanism,
                         causal_entity_ref=compiled.candidate.causal_entity,
-                        rationale=draft.causal_explanation,
+                        rationale=evaluated_draft.causal_explanation,
                     ))
                     candidate = compiled.candidate
                     self.__dynamic_options.append({
@@ -312,9 +345,18 @@ class EpisodeRunner:
                                for s in compiled.signals}
                     self.__verification_queries.extend((hypothesis_id, q) for q in queries.values())
                     registered += 1
+                    self._record_discovery_draft(
+                        draft_index, draft, evaluated_draft, initial_error,
+                        repair_actions, "accepted", None, "dynamic_registered",
+                    )
                 except ValueError as exc:
-                    rejections.append(str(exc) if type(exc) is ValueError
-                                      else "invalid compiled candidate contract")
+                    final_error = (str(exc) if type(exc) is ValueError
+                                   else "invalid compiled candidate contract")
+                    rejections.append(final_error)
+                    self._record_discovery_draft(
+                        draft_index, draft, evaluated_draft, initial_error,
+                        repair_actions, "rejected", final_error, "none",
+                    )
             result = {"status": "completed", "registered": registered,
                       "aligned": aligned, "rejections": rejections}
         except Empty:
@@ -323,6 +365,29 @@ class EpisodeRunner:
             result = {"status": "failed", "registered": 0}
         self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
         return result
+
+    def _record_discovery_draft(
+        self,
+        draft_index: int,
+        raw_draft,
+        final_draft,
+        initial_error: str | None,
+        repair_actions: tuple[str, ...],
+        final_status: str,
+        final_error: str | None,
+        registration: str,
+    ) -> None:
+        self.transcript.append(EventType.DISCOVERY_DRAFT_EVALUATED, {
+            "draft_index": draft_index,
+            "raw_draft": raw_draft.model_dump(mode="json"),
+            "final_draft": final_draft.model_dump(mode="json"),
+            "initial_status": "rejected" if initial_error is not None else final_status,
+            "initial_error": initial_error,
+            "repair_actions": repair_actions,
+            "final_status": final_status,
+            "final_error": final_error,
+            "registration": registration,
+        })
 
     def _discovery_entity_graph(self, registry: EvidenceRegistry) -> dict[str, Any]:
         assert self.__bootstrap is not None

@@ -61,6 +61,15 @@ def mechanism_matches(root_cause: str, mechanism: str) -> bool:
 def score_case(result: dict[str, Any]) -> dict[str, Any]:
     root_causes = result["ground_truth"]["root_cause_types"]
     mechanisms = result["dynamic_mechanisms"]
+    drafts = result.get("raw_discovery_drafts", ())
+    raw_matched = [
+        item for item in drafts
+        if any(mechanism_matches(root_cause, item["raw_draft"]["mechanism"])
+               for root_cause in root_causes)
+    ]
+    initially_accepted = [item for item in drafts if item["initial_status"] == "accepted"]
+    finally_accepted = [item for item in drafts if item["final_status"] == "accepted"]
+    repaired = [item for item in drafts if item.get("repair_actions")]
     matched = [
         mechanism for mechanism in mechanisms
         if any(mechanism_matches(root_cause, mechanism) for root_cause in root_causes)
@@ -76,6 +85,19 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "discovery_completed": (result.get("discovery") or {}).get("status") == "completed",
         "compiled": bool(mechanisms),
+        "raw_draft_count": len(drafts),
+        "raw_gt_mechanism_proposed": bool(raw_matched),
+        "initial_contract_passed": bool(initially_accepted),
+        "gt_initial_contract_passed": any(
+            item in initially_accepted for item in raw_matched
+        ),
+        "mechanical_repair_attempted": bool(repaired),
+        "mechanical_repair_succeeded": any(
+            item["final_status"] == "accepted" for item in repaired
+        ),
+        "gt_contract_passed_after_repair": any(
+            item in finally_accepted for item in raw_matched
+        ),
         "gt_mechanism_proposed": bool(matched),
         "matched_mechanisms": matched,
         "discovered_verified": verified,
@@ -110,6 +132,25 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
         "execution_failures": len(failures),
         "discovery_completed": sum(item["discovery_completed"] for item in scores),
         "compiled": sum(item["compiled"] for item in scores),
+        "raw_drafts": sum(item.get("raw_draft_count", 0) for item in scores),
+        "raw_gt_mechanism_proposed": sum(
+            item.get("raw_gt_mechanism_proposed", False) for item in scores
+        ),
+        "initial_contract_passed": sum(
+            item.get("initial_contract_passed", False) for item in scores
+        ),
+        "gt_initial_contract_passed": sum(
+            item.get("gt_initial_contract_passed", False) for item in scores
+        ),
+        "mechanical_repair_attempted": sum(
+            item.get("mechanical_repair_attempted", False) for item in scores
+        ),
+        "mechanical_repair_succeeded": sum(
+            item.get("mechanical_repair_succeeded", False) for item in scores
+        ),
+        "gt_contract_passed_after_repair": sum(
+            item.get("gt_contract_passed_after_repair", False) for item in scores
+        ),
         "gt_mechanism_proposed": sum(item["gt_mechanism_proposed"] for item in scores),
         "discovered_verified": sum(item["discovered_verified"] for item in scores),
         "correct_verified": sum(item["correct_verified"] for item in scores),
@@ -140,6 +181,57 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
     }
 
 
+def render_funnel_markdown(payload: dict[str, Any]) -> str:
+    summary = payload["summary"]
+    rows = [
+        "# Unknown RCA discovery funnel",
+        "",
+        "This diagnostic separates raw semantic recall from contract compilation and evidence",
+        "verification. Ground Truth is loaded only after the answer is frozen.",
+        "",
+        "## Funnel",
+        "",
+        "| Stage | Cases |",
+        "|---|---:|",
+        f"| Completed | {summary['completed_cases']} |",
+        f"| Raw GT-like mechanism proposed | {summary['raw_gt_mechanism_proposed']} |",
+        f"| Any initial contract passed | {summary['initial_contract_passed']} |",
+        f"| GT-like draft initially passed | {summary['gt_initial_contract_passed']} |",
+        f"| Mechanical repair attempted | {summary['mechanical_repair_attempted']} |",
+        f"| Mechanical repair succeeded | {summary['mechanical_repair_succeeded']} |",
+        f"| GT-like draft passed after repair | {summary['gt_contract_passed_after_repair']} |",
+        f"| Correct `DISCOVERED_VERIFIED` | {summary['correct_verified']} |",
+        f"| Wrong `DISCOVERED_VERIFIED` | {summary['wrong_verified']} |",
+        "",
+        "## Cases",
+        "",
+        "| Case | Role | Holdout GT | Raw GT | Initial GT pass | Repaired | Final status |",
+        "|---|---|---|---:|---:|---:|---|",
+    ]
+    for item in payload["cases"]:
+        rows.append(
+            "| {case_id} | {role} | {holdout_candidate} | {raw} | {initial} | "
+            "{repaired} | {status} |".format(
+                case_id=item["case_id"],
+                role=item.get("role") or "-",
+                holdout_candidate=item["holdout_candidate"],
+                raw="yes" if item["raw_gt_mechanism_proposed"] else "no",
+                initial="yes" if item["gt_initial_contract_passed"] else "no",
+                repaired="yes" if item["mechanical_repair_succeeded"] else "no",
+                status=item["status"],
+            )
+        )
+    rows.extend((
+        "",
+        "`Raw GT` uses the same conservative post-freeze lexical scorer as the existing benchmark.",
+        "Mechanical repair only canonicalizes case and whitespace in references to an already",
+        "declared alternative. It never changes mechanism, family, rules, entities, polarity, or",
+        "causal explanation.",
+        "",
+    ))
+    return "\n".join(rows)
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument(
@@ -150,6 +242,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--output-dir", type=Path, default=Path("analysis/unknown_benchmark_batch"))
     value.add_argument("--summary-output", type=Path,
                        default=Path("analysis/unknown_benchmark_batch_summary.json"))
+    value.add_argument("--report-output", type=Path,
+                       default=Path("analysis/unknown_benchmark_batch.md"))
     value.add_argument("--model", default="deepseek-chat")
     value.add_argument("--thinking-enabled", action="store_true")
     value.add_argument("--rerun-existing", action="store_true")
@@ -212,6 +306,8 @@ def main() -> None:
         args.summary_output.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        args.report_output.parent.mkdir(parents=True, exist_ok=True)
+        args.report_output.write_text(render_funnel_markdown(summary), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

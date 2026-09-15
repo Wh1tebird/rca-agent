@@ -1,5 +1,21 @@
 # RCA Agent handoff
 
+## Latest increment — discovery A/B attribution
+
+Discovery diagnostics now retain raw model drafts before compilation, per-draft initial and final
+contract outcomes, rejection reasons, repair provenance, and bounded invalid structured JSON. These
+events are hash-chained and order-checked by Recorded Replay. The only automatic repair is exact
+case/whitespace canonicalization for references to an already-declared alternative; Signal, Entity,
+Rule and mechanism semantics remain model-owned.
+
+The repeated 12-case `deepseek-chat` run completed 12/12 with valid replay and no query failures.
+Raw semantic recall was 6/12; four of those six correct directions initially compiled; two were
+correctly `DISCOVERED_VERIFIED` (t055 thread exhaustion and t021 slow SQL); and no wrong mechanism
+verified. t024 and t025 show "thought of it but could not ground it" failures. t007 and t009 show
+correct compiled ideas that did not close refutation/alternatives. Six cases did not state the GT
+mechanism specifically enough. The deterministic repair fired zero times, so the current bottleneck
+is not cosmetic JSON cleanup. Results are in `analysis/jvm_discovery_funnel*`.
+
 ## Latest increment — 2026-09-15
 
 The JVM/thread/GC follow-up is complete. Trace breakdown now issues bounded neutral participant

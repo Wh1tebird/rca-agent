@@ -15,12 +15,18 @@ from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, RecordedReplay
 from rca_agent.runner.transcript import EventType
 
 
-def result(*, status="supported_hypothesis", mechanism="SQL execution dominates latency"):
+def result(
+    *,
+    status="supported_hypothesis",
+    mechanism="SQL execution dominates latency",
+    raw_discovery_drafts=(),
+):
     return {
         "case_id": "t-test",
         "holdout_candidate": "slowSQL",
         "status": status,
         "dynamic_mechanisms": [mechanism],
+        "raw_discovery_drafts": raw_discovery_drafts,
         "winner": {"mechanism": mechanism} if status == "discovered_verified" else None,
         "discovery": {"status": "completed"},
         "ground_truth": {"root_cause_types": ["slowSQL"]},
@@ -52,6 +58,21 @@ def test_batch_score_separates_proposal_recall_from_wrong_verification():
     aggregate = summarize([proposed, wrong], [])
     assert aggregate["gt_mechanism_proposed"] == 1
     assert aggregate["wrong_verified"] == 1
+
+
+def test_batch_score_separates_raw_semantics_contract_and_repair():
+    mechanism = "SQL execution dominates latency"
+    raw = {
+        "raw_draft": {"mechanism": mechanism},
+        "initial_status": "rejected",
+        "repair_actions": ["canonicalized_alternative_references"],
+        "final_status": "accepted",
+    }
+    score = score_case(result(mechanism=mechanism, raw_discovery_drafts=[raw]))
+    assert score["raw_gt_mechanism_proposed"]
+    assert not score["gt_initial_contract_passed"]
+    assert score["mechanical_repair_succeeded"]
+    assert score["gt_contract_passed_after_repair"]
 
 
 def test_capability_audit_keeps_missing_network_and_pool_signals_explicit(

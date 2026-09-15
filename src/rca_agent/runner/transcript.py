@@ -26,6 +26,8 @@ class EventType(StrEnum):
     HYPOTHESIS_SUBMITTED = "hypothesis_submitted"
     CANDIDATE_EVIDENCE_UPDATED = "candidate_evidence_updated"
     DISCOVERY_STARTED = "discovery_started"
+    DISCOVERY_PAYLOAD_REJECTED = "discovery_payload_rejected"
+    DISCOVERY_DRAFT_EVALUATED = "discovery_draft_evaluated"
     DISCOVERY_COMPLETED = "discovery_completed"
     DYNAMIC_CANDIDATE_REGISTERED = "dynamic_candidate_registered"
     CATALOG_CANDIDATE_ALIGNED = "catalog_candidate_aligned"
