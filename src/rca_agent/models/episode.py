@@ -20,6 +20,7 @@ class EpisodeStatus(StrEnum):
 class DecisionStatus(StrEnum):
     INCONCLUSIVE = "inconclusive"
     SUPPORTED_HYPOTHESIS = "supported_hypothesis"
+    MULTIPLE_SUPPORTED = "multiple_supported"
     CONFIRMED_ROOT_CAUSE = "confirmed_root_cause"
     DISCOVERED_VERIFIED = "discovered_verified"
     OUT_OF_SCOPE = "out_of_scope"
@@ -46,6 +47,7 @@ class AuthoritativeDecision(BaseModel):
     status: DecisionStatus
     source: DecisionSource
     winning_hypothesis_id: str | None = None
+    supported_hypothesis_ids: tuple[str, ...] = ()
     reason: str = Field(min_length=1, max_length=1000)
 
     @model_validator(mode="after")
@@ -54,6 +56,12 @@ class AuthoritativeDecision(BaseModel):
             self.source != DecisionSource.CORE or self.winning_hypothesis_id is None
         ):
             raise ValueError("confirmed root cause requires domain-core authority and a winner")
+        if self.status == DecisionStatus.MULTIPLE_SUPPORTED and (
+            self.source != DecisionSource.CORE
+            or self.winning_hypothesis_id is not None
+            or len(self.supported_hypothesis_ids) < 2
+        ):
+            raise ValueError("multiple supported requires Core authority and at least two candidates")
         return self
 
 

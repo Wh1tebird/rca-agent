@@ -261,6 +261,11 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
          if p.hypothesis_id == decision.winning_hypothesis_id),
         None,
     )
+    supported_candidates = [
+        proposal.model_dump(mode="json")
+        for proposal in report.answer.policy_proposals
+        if proposal.hypothesis_id in decision.supported_hypothesis_ids
+    ]
     discovery = [event.payload for event in runner.transcript.events
                  if event.event_type == EventType.DISCOVERY_COMPLETED]
     registered = [event.payload for event in runner.transcript.events
@@ -363,6 +368,8 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "thinking_enabled": not args.disable_thinking,
         "catalog_candidate_visible": args.holdout_candidate not in runner.excluded_catalog_candidate_ids,
         "status": decision.status.value,
+        "supported_hypothesis_ids": list(decision.supported_hypothesis_ids),
+        "supported_candidates": supported_candidates,
         "winner": winner.model_dump(mode="json") if winner else None,
         "dynamic_mechanisms": [item["compiled"]["candidate"]["fault_type"] for item in registered],
         "dynamic_plans": [{

@@ -83,6 +83,7 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
     ]
     status = result["status"].strip()
     verified = status == "discovered_verified"
+    multiple_supported = status == "multiple_supported"
     diagnostics = result.get("diagnostics", {})
     blockers = diagnostics.get("verification_blockers", ())
     rejections = diagnostics.get("discovery_rejections", ())
@@ -115,6 +116,8 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
         "gt_mechanism_proposed": bool(matched),
         "matched_mechanisms": matched,
         "discovered_verified": verified,
+        "multiple_supported": multiple_supported,
+        "supported_hypothesis_ids": result.get("supported_hypothesis_ids", []),
         "correct_verified": verified and bool(result.get("winner")) and any(
             mechanism_matches(root_cause, result["winner"]["mechanism"])
             for root_cause in root_causes
@@ -176,6 +179,7 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
         ),
         "gt_mechanism_proposed": sum(item["gt_mechanism_proposed"] for item in scores),
         "discovered_verified": sum(item["discovered_verified"] for item in scores),
+        "multiple_supported": sum(item.get("multiple_supported", False) for item in scores),
         "correct_verified": sum(item["correct_verified"] for item in scores),
         "wrong_verified": sum(item["wrong_verified"] for item in scores),
         "target_service_issued": sum(item.get("target_service_issued") is True for item in scores),
@@ -228,6 +232,7 @@ def render_funnel_markdown(payload: dict[str, Any]) -> str:
         f"| GT-like plan rescued by retry | {summary['gt_planner_retry_succeeded']} |",
         f"| Correct `DISCOVERED_VERIFIED` | {summary['correct_verified']} |",
         f"| Wrong `DISCOVERED_VERIFIED` | {summary['wrong_verified']} |",
+        f"| `MULTIPLE_SUPPORTED` | {summary['multiple_supported']} |",
         "",
         "## Cases",
         "",

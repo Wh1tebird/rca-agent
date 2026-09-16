@@ -7,6 +7,7 @@ from typing import Any
 from rca_agent.core.dynamic import (
     CompiledCandidate,
     DynamicVerification,
+    DynamicVerificationState,
     assess_dynamic,
     verify_dynamic,
 )
@@ -181,16 +182,25 @@ class CoreDecisionProvider:
         status = _decision_status(decision.status, decision.candidate_states)
         if decision.winner in evaluation.dynamic_verifications:
             status = DecisionStatus.DISCOVERED_VERIFIED
+        viable_dynamic = _viable_dynamic_candidates(evaluation)
+        if decision.winner is None and len(viable_dynamic) >= 2:
+            status = DecisionStatus.MULTIPLE_SUPPORTED
         winning_hypothesis_id = (
             evaluation.proposals_by_candidate[decision.winner][0].hypothesis_id
             if decision.winner is not None
             else None
         )
+        supported_hypothesis_ids = tuple(sorted({
+            proposal.hypothesis_id
+            for candidate_id in viable_dynamic
+            for proposal in evaluation.proposals_by_candidate[candidate_id]
+        })) if status == DecisionStatus.MULTIPLE_SUPPORTED else ()
         notes = [*evaluation.unresolved, *evaluation.unavailable]
         return AuthoritativeDecision(
             status=status,
             source=DecisionSource.CORE,
             winning_hypothesis_id=winning_hypothesis_id,
+            supported_hypothesis_ids=supported_hypothesis_ids,
             reason=_reason(
                 "dynamic mechanism satisfies generic-root-cause-v1 and is returned as this "
                 "investigation's root cause; not promoted to Catalog; alternatives are bounded "
@@ -304,6 +314,12 @@ def _evaluate(
                 or other.origin_hypothesis_id != origin
             ):
                 continue
+            other_verification = verifications.get(other_key)
+            if (
+                other_verification is None
+                or other_verification.state == DynamicVerificationState.FAILED
+            ):
+                continue
             matched_groups = {
                 condition.independent_group
                 for condition, assessment in zip(
@@ -318,6 +334,7 @@ def _evaluate(
                 break
         if competing:
             verifications[key] = verification.model_copy(update={
+                "state": DynamicVerificationState.UNRESOLVED,
                 "passed": False,
                 "blockers": (*verification.blockers, "competing_dynamic_mechanism_unresolved"),
             })
@@ -349,6 +366,28 @@ def _evaluate(
         unavailable=tuple(unavailable),
         dynamic_verifications=verifications,
     )
+
+
+def _viable_dynamic_candidates(evaluation: _CoreEvaluation) -> tuple[str, ...]:
+    """Return strongly supported dynamic mechanisms that have not decisively failed."""
+    viable = []
+    for candidate_id, verification in evaluation.dynamic_verifications.items():
+        if verification.state == DynamicVerificationState.FAILED:
+            continue
+        compiled_assessments = evaluation.assessments_by_candidate[candidate_id]
+        candidate = next(
+            item for item in evaluation.candidates if item.candidate_id == candidate_id
+        )
+        matched_groups = {
+            condition.independent_group
+            for condition, assessment in zip(
+                candidate.conditions, compiled_assessments, strict=True
+            )
+            if condition.polarity == ConditionPolarity.SUPPORT and assessment.matched
+        }
+        if len(matched_groups) >= 2:
+            viable.append(candidate_id)
+    return tuple(sorted(viable))
 
 
 def _candidate_previews(

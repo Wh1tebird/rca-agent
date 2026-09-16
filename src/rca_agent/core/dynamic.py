@@ -7,6 +7,7 @@ The model selects predicates; it cannot author thresholds or evidence weights.
 from __future__ import annotations
 
 import math
+from enum import StrEnum
 from itertools import pairwise
 from typing import Literal
 
@@ -84,6 +85,21 @@ class SignalSpec(BaseModel):
         )
 
 
+class MechanismClass(StrEnum):
+    CPU_SATURATION = "cpu_saturation"
+    MEMORY_PRESSURE = "memory_pressure"
+    GC_PAUSE = "gc_pause"
+    THREAD_POOL_SATURATION = "thread_pool_saturation"
+    TRAFFIC_SURGE = "traffic_surge"
+    DATABASE_EXECUTION = "database_execution"
+    DATABASE_CONNECTION_POOL = "database_connection_pool"
+    NETWORK_LATENCY = "network_latency"
+    DOWNSTREAM_DEPENDENCY = "downstream_dependency"
+    APPLICATION_DEFECT = "application_defect"
+    LOCK_CONTENTION = "lock_contention"
+    UNKNOWN = "unknown"
+
+
 class RuleSpec(BaseModel):
     """An operator with a host-reviewed threshold source and explicit sample semantics."""
 
@@ -98,6 +114,7 @@ class RuleSpec(BaseModel):
         default="Host-defined observable predicate", min_length=1, max_length=500
     )
     support_eligible: bool = True
+    refutes: tuple[MechanismClass, ...] = ()
     reference_signal: str | None = None
     factor: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     aggregation: Literal["single", "max", "sustained"] = "single"
@@ -159,6 +176,7 @@ class AlternativeDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     alternative_id: str = Field(pattern=r"^alt-[a-z0-9-]{1,40}$")
     mechanism: str = Field(min_length=3, max_length=500)
+    mechanism_class: MechanismClass
 
 
 class MechanismDraft(BaseModel):
@@ -168,6 +186,7 @@ class MechanismDraft(BaseModel):
     source_hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
     causal_entity_ref: str = Field(pattern=r"^ent-[a-z0-9-]{3,40}$")
     mechanism: str = Field(min_length=3, max_length=500)
+    mechanism_class: MechanismClass
     family: MechanismFamily
     causal_explanation: str = Field(min_length=10, max_length=2000)
     alternatives: tuple[AlternativeDraft, ...] = Field(min_length=1, max_length=8)
@@ -191,6 +210,7 @@ class FrozenMechanism(BaseModel):
     source_hypothesis_id: str
     causal_entity_ref: str
     mechanism: str
+    mechanism_class: MechanismClass
     family: MechanismFamily
     causal_explanation: str
     alternatives: tuple[AlternativeDraft, ...]
@@ -218,6 +238,7 @@ class CapabilityHandle(BaseModel):
     description: str
     independent_group: str
     support_eligible: bool
+    refutes: tuple[MechanismClass, ...]
 
 
 class PlannedPrediction(BaseModel):
@@ -384,8 +405,55 @@ class EvidenceRegistry(BaseModel):
                     description=rule.description,
                     independent_group=signal.independent_group,
                     support_eligible=rule.support_eligible,
+                    refutes=rule.refutes,
                 ))
         return tuple(handles)
+
+    def normalize_plan(
+        self,
+        mechanism: FrozenMechanism,
+        plan: VerificationPlanDraft,
+    ) -> tuple[VerificationPlanDraft, tuple[str, ...]]:
+        """Remove claims the host cannot validate while retaining safe investigation tests."""
+        normalized, actions = normalize_verification_plan(plan)
+        handles = {item.capability_ref: item for item in self.capability_handles()}
+        alternatives = {item.alternative_id: item for item in mechanism.alternatives}
+        predictions = []
+        repairs = list(actions)
+        support_capabilities = {
+            prediction.capability_ref
+            for prediction in normalized.predictions
+            if prediction.polarity == ConditionPolarity.SUPPORT
+        }
+        for prediction in normalized.predictions:
+            if (
+                prediction.polarity == ConditionPolarity.CONTRADICT
+                and prediction.capability_ref in support_capabilities
+            ):
+                repairs.append("removed_support_refutation_conflict")
+                continue
+            distinguishes = prediction.distinguishes
+            handle = handles.get(prediction.capability_ref)
+            if prediction.polarity == ConditionPolarity.SUPPORT and distinguishes:
+                distinguishes = ()
+                repairs.append("removed_support_alternative_claim")
+            elif prediction.polarity == ConditionPolarity.CONTRADICT and distinguishes:
+                valid = tuple(
+                    alternative_id
+                    for alternative_id in distinguishes
+                    if alternative_id in alternatives
+                    and handle is not None
+                    and alternatives[alternative_id].mechanism_class in handle.refutes
+                )
+                distinguishes = valid if len(valid) == 1 else ()
+                if distinguishes != prediction.distinguishes:
+                    repairs.append("removed_unvalidated_refutation_claim")
+            predictions.append(prediction.model_copy(update={
+                "distinguishes": distinguishes,
+            }))
+        return normalized.model_copy(update={"predictions": tuple(predictions)}), tuple(
+            dict.fromkeys(repairs)
+        )
 
     def compile_plan(
         self,
@@ -396,9 +464,7 @@ class EvidenceRegistry(BaseModel):
         if plan.mechanism_id != mechanism.mechanism_id:
             raise ValueError("verification plan references an unknown frozen mechanism")
         handles = {item.capability_ref: item for item in self.capability_handles()}
-        alternatives = {
-            item.alternative_id: item.mechanism for item in mechanism.alternatives
-        }
+        alternatives = {item.alternative_id: item for item in mechanism.alternatives}
         predictions = []
         distinguished: set[str] = set()
         for item in plan.predictions:
@@ -407,21 +473,31 @@ class EvidenceRegistry(BaseModel):
                 raise ValueError("unknown capability reference")
             if not set(item.distinguishes) <= alternatives.keys():
                 raise ValueError("unknown alternative reference")
+            if item.polarity == ConditionPolarity.SUPPORT and item.distinguishes:
+                raise ValueError("support prediction cannot distinguish an alternative")
             if item.polarity == ConditionPolarity.CONTRADICT:
-                distinguished.update(item.distinguishes)
+                if len(item.distinguishes) > 1:
+                    raise ValueError(
+                        "each refutation prediction can distinguish at most one alternative"
+                    )
+                if item.distinguishes:
+                    alternative = alternatives[item.distinguishes[0]]
+                    if alternative.mechanism_class not in handle.refutes:
+                        raise ValueError(
+                            "capability cannot refute the alternative mechanism class"
+                        )
+                    distinguished.update(item.distinguishes)
             predictions.append(Prediction(
                 rule_id=handle.rule_id,
                 target_entity_ref=handle.entity_ref,
                 polarity=item.polarity,
                 rationale=item.rationale,
-                distinguishes=tuple(alternatives[value] for value in item.distinguishes),
+                distinguishes=tuple(
+                    alternatives[value].mechanism for value in item.distinguishes
+                ),
             ))
         if not any(item.polarity == ConditionPolarity.CONTRADICT for item in plan.predictions):
             raise ValueError("verification plan requires a refutation prediction")
-        if distinguished != set(alternatives):
-            raise ValueError(
-                "every alternative requires a dedicated refutation prediction"
-            )
         draft = DynamicHypothesis(
             source_hypothesis_id=mechanism.source_hypothesis_id,
             causal_entity_ref=mechanism.causal_entity_ref,
@@ -429,7 +505,7 @@ class EvidenceRegistry(BaseModel):
             family=mechanism.family,
             causal_explanation=mechanism.causal_explanation,
             predictions=tuple(predictions),
-            alternatives=tuple(alternatives.values()),
+            alternatives=tuple(item.mechanism for item in alternatives.values()),
         )
         return self.compile(draft, mechanism.causal_entity_ref, **compile_kwargs)
 
@@ -472,8 +548,6 @@ class EvidenceRegistry(BaseModel):
             selected.append(rule)
             if prediction.polarity == ConditionPolarity.SUPPORT:
                 groups.add(by_signal[(target_entity_ref, rule.signal)].independent_group)
-        if len(groups) < 2:
-            raise ValueError("two host-defined independent support groups are required")
         normalized_mechanism = " ".join(
             draft.mechanism.casefold().replace("-", " ").split()
         )
@@ -554,11 +628,18 @@ class EvidenceRegistry(BaseModel):
         )
 
 
+class DynamicVerificationState(StrEnum):
+    VERIFIED = "verified"
+    FAILED = "failed"
+    UNRESOLVED = "unresolved"
+
+
 class DynamicVerification(BaseModel):
     """One mechanism-independent standard, with auditable test outcomes."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     standard: Literal["generic-root-cause-v1"] = "generic-root-cause-v1"
+    state: DynamicVerificationState
     passed: bool
     blockers: tuple[str, ...]
     support_signals: tuple[str, ...]
@@ -594,7 +675,7 @@ def verify_dynamic(
         blockers.append("insufficient_independent_support")
     if any(a.observation is None for _, a in pairs):
         blockers.append("required_observations_unavailable")
-    if any(not a.matched for _, a in support):
+    if any(a.observation is not None and not a.matched for _, a in support):
         blockers.append("support_predictions_not_satisfied")
     if not refutations:
         blockers.append("refutation_test_absent")
@@ -633,7 +714,16 @@ def verify_dynamic(
             new_queries.add(fresh_assessment.observation.query_ref)
     if not new_queries:
         blockers.append("no_new_support_verification")
+    decisive_failures = {"support_predictions_not_satisfied", "refutation_observed"}
+    state = (
+        DynamicVerificationState.FAILED
+        if decisive_failures.intersection(blockers)
+        else DynamicVerificationState.UNRESOLVED
+        if blockers
+        else DynamicVerificationState.VERIFIED
+    )
     return DynamicVerification(
+        state=state,
         passed=not blockers,
         blockers=tuple(blockers),
         support_signals=tuple(sorted(c.signal for c, a in support if a.matched)),

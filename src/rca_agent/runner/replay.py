@@ -280,7 +280,10 @@ class RecordedReplay:
                     raise ReplayValidationError("answer artifact digest is invalid")
                 if answer.transcript_digest != event.previous_digest:
                     raise ReplayValidationError("answer is not bound to the inference transcript")
-                if answer.authoritative_decision.status == DecisionStatus.DISCOVERED_VERIFIED:
+                if answer.authoritative_decision.status in {
+                    DecisionStatus.DISCOVERED_VERIFIED,
+                    DecisionStatus.MULTIPLE_SUPPORTED,
+                }:
                     if verification_report is None or tuple(proposals.values()) != answer.policy_proposals:
                         raise ReplayValidationError("dynamic result lacks its verification record")
                     final_reports = provider.verification_reports(

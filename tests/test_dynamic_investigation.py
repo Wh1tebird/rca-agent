@@ -10,6 +10,7 @@ from rca_agent.core.dynamic import (
     DiscoveryPayload,
     DynamicHypothesis,
     EvidenceRegistry,
+    MechanismClass,
     MechanismDiscoveryPayload,
     MechanismDraft,
     PlannedPrediction,
@@ -19,6 +20,7 @@ from rca_agent.core.dynamic import (
     VerificationPlanDraft,
     VerificationPlanPayload,
     assess_dynamic,
+    freeze_mechanism,
     normalize_verification_plan,
     repair_mechanical_contract,
     verify_dynamic,
@@ -84,6 +86,8 @@ def registry():
                 ("active_ratio", "busy workers divided by maximum workers"),
                 ("queue_ratio", "queued tasks divided by queue capacity"),
                 ("downstream_wait_ratio", "fraction of worker time blocked on downstream"),
+                ("gc_pause_ratio", "fraction of time paused for garbage collection"),
+                ("traffic_growth_ratio", "incoming traffic relative to baseline"),
             )
         ),
         rules=tuple(
@@ -94,11 +98,14 @@ def registry():
                 threshold=threshold,
                 source="configuration",
                 provenance="test-only load-test contract",
+                refutes=tuple(MechanismClass),
             )
             for s, threshold in (
                 ("active_ratio", 0.9),
                 ("queue_ratio", 0.8),
                 ("downstream_wait_ratio", 0.1),
+                ("gc_pause_ratio", 0.1),
+                ("traffic_growth_ratio", 0.1),
             )
         ),
     )
@@ -140,6 +147,8 @@ class Environment:
             "active_ratio": 0.95,
             "queue_ratio": 0.9,
             "downstream_wait_ratio": 0,
+            "gc_pause_ratio": 0,
+            "traffic_growth_ratio": 0,
         }
         self.remaining = budget
         self.calls = []
@@ -286,15 +295,29 @@ def test_bad_rule_contract_rejected(change):
         EvidenceRegistry.model_validate(raw)
 
 
-def test_model_cannot_author_threshold_or_groups():
+def test_model_cannot_author_threshold_and_host_groups_limit_verification():
     raw = draft().model_dump()
     raw["predictions"][0]["threshold"] = -100
     with pytest.raises(ValidationError):
         DynamicHypothesis.model_validate(raw)
     raw = registry().model_dump()
     raw["signals"][1]["independent_group"] = "active_ratio"
-    with pytest.raises(ValueError):
-        EvidenceRegistry.model_validate(raw).compile(draft(), "ent-service")
+    reg = EvidenceRegistry.model_validate(raw)
+    compiled = reg.compile(draft(), "ent-service")
+    env = Environment()
+    records = tuple(
+        IssuedObservation(
+            response.observations[0], response.query_ref,
+        )
+        for response in (
+            env.get_metric_series(query("active_ratio").request),
+            env.get_metric_series(query("queue_ratio").request),
+        )
+    )
+    verification = verify_dynamic(
+        compiled, tuple(assess_dynamic(compiled, records)), records
+    )
+    assert "insufficient_independent_support" in verification.blockers
 
 
 def test_noncausal_symptom_rule_cannot_count_as_root_cause_support():
@@ -465,11 +488,13 @@ class TwoStageDiscoverer:
             source_hypothesis_id="h-unknown",
             causal_entity_ref="ent-service",
             mechanism="thread pool exhaustion",
+            mechanism_class=MechanismClass.THREAD_POOL_SATURATION,
             family=MechanismFamily.APPLICATION,
             causal_explanation="Workers are occupied and incoming tasks wait in the queue.",
             alternatives=(AlternativeDraft(
                 alternative_id="alt-downstream",
                 mechanism="downstream blocking",
+                mechanism_class=MechanismClass.DOWNSTREAM_DEPENDENCY,
             ),),
         ),))
 
@@ -517,22 +542,26 @@ class CompetingMechanismsDiscoverer:
                 source_hypothesis_id="h-unknown",
                 causal_entity_ref="ent-service",
                 mechanism="local thread pool exhaustion",
+                mechanism_class=MechanismClass.THREAD_POOL_SATURATION,
                 family=MechanismFamily.APPLICATION,
                 causal_explanation="Local workers are occupied while work queues locally.",
                 alternatives=(AlternativeDraft(
                     alternative_id="alt-load-spike",
                     mechanism="transient incoming load spike",
+                    mechanism_class=MechanismClass.TRAFFIC_SURGE,
                 ),),
             ),
             MechanismDraft(
                 source_hypothesis_id="h-unknown",
                 causal_entity_ref="ent-service",
                 mechanism="downstream wait induced worker starvation",
+                mechanism_class=MechanismClass.DOWNSTREAM_DEPENDENCY,
                 family=MechanismFamily.DATABASE_DEPENDENCY,
                 causal_explanation="Workers remain occupied because downstream calls block them.",
                 alternatives=(AlternativeDraft(
                     alternative_id="alt-lock-contention",
                     mechanism="local lock contention",
+                    mechanism_class=MechanismClass.LOCK_CONTENTION,
                 ),),
             ),
         ))
@@ -549,6 +578,7 @@ class CompetingMechanismsPlanner:
             alternatives = tuple(
                 item["alternative_id"] for item in mechanism["alternatives"]
             )
+            refutation_rules = ("downstream_wait_ratio", "gc_pause_ratio")
             plans.append(VerificationPlanDraft(
                 mechanism_id=mechanism["mechanism_id"],
                 predictions=(
@@ -562,12 +592,57 @@ class CompetingMechanismsPlanner:
                         polarity=ConditionPolarity.SUPPORT,
                         rationale="Queued work should accumulate.",
                     ),
+                ) + tuple(
                     PlannedPrediction(
-                        capability_ref=handles["downstream_wait_ratio"],
+                        capability_ref=handles[refutation_rules[index]],
                         polarity=ConditionPolarity.CONTRADICT,
                         rationale="This observation must separate the peer explanation.",
-                        distinguishes=alternatives,
-                    ),
+                        distinguishes=(alternative,),
+                    )
+                    for index, alternative in enumerate(alternatives)
+                ),
+            ))
+        return VerificationPlanPayload(plans=tuple(plans))
+
+
+class FailedCompetitorPlanner:
+    def plan(self, context):
+        handles = {
+            item["rule_id"]: item["capability_ref"]
+            for item in context["capabilities"]
+        }
+        plans = []
+        for index, mechanism in enumerate(context["frozen_mechanisms"]):
+            alternatives = tuple(
+                item["alternative_id"] for item in mechanism["alternatives"]
+            )
+            support_rules = (
+                ("active_ratio", "queue_ratio")
+                if index == 0
+                else ("active_ratio", "downstream_wait_ratio")
+            )
+            contradict_rules = (
+                ("downstream_wait_ratio", "gc_pause_ratio")
+                if index == 0
+                else ("queue_ratio", "traffic_growth_ratio")
+            )
+            plans.append(VerificationPlanDraft(
+                mechanism_id=mechanism["mechanism_id"],
+                predictions=tuple(
+                    PlannedPrediction(
+                        capability_ref=handles[rule_id],
+                        polarity=ConditionPolarity.SUPPORT,
+                        rationale="The mechanism requires this independent support group.",
+                    )
+                    for rule_id in support_rules
+                ) + tuple(
+                    PlannedPrediction(
+                        capability_ref=handles[contradict_rules[alternative_index]],
+                        polarity=ConditionPolarity.CONTRADICT,
+                        rationale="This observation separates the peer explanation.",
+                        distinguishes=(alternative,),
+                    )
+                    for alternative_index, alternative in enumerate(alternatives)
                 ),
             ))
         return VerificationPlanPayload(plans=tuple(plans))
@@ -610,7 +685,25 @@ def test_competing_dynamic_mechanisms_cannot_both_be_promoted_as_root_cause():
         "competing_dynamic_mechanism_unresolved" in item["blockers"]
         for item in verification.values()
     )
-    assert report.answer.authoritative_decision.status != DecisionStatus.DISCOVERED_VERIFIED
+    decision = report.answer.authoritative_decision
+    assert decision.status == DecisionStatus.MULTIPLE_SUPPORTED
+    assert len(decision.supported_hypothesis_ids) == 2
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_decisively_failed_dynamic_competitor_does_not_block_verified_mechanism():
+    runner, report, _, _ = run(
+        CompetingMechanismsDiscoverer(),
+        verification_planner=FailedCompetitorPlanner(),
+    )
+    verification = next(
+        event.payload["candidates"]
+        for event in runner.transcript.events
+        if event.event_type == EventType.DYNAMIC_VERIFICATION
+    )
+    states = sorted(item["state"] for item in verification.values())
+    assert states == ["failed", "verified"]
+    assert report.answer.authoritative_decision.status == DecisionStatus.DISCOVERED_VERIFIED
     assert RecordedReplay.verify(runner.transcript.events).valid
 
 
@@ -637,6 +730,97 @@ def test_plan_normalization_merges_same_capability_and_polarity_only():
     assert repairs == ("merged_duplicate_capability_predictions",)
     assert len(normalized.predictions) == 2
     assert normalized.predictions[0].distinguishes == ("alt-one", "alt-two")
+
+
+def test_two_stage_refutation_must_be_dedicated_to_one_alternative():
+    discoverer = CompetingMechanismsDiscoverer()
+    payload = discoverer.discover({})
+    mechanism = payload.mechanisms[0]
+    peer = payload.mechanisms[1]
+    frozen = freeze_mechanism(mechanism.model_copy(update={
+        "alternatives": (
+            *mechanism.alternatives,
+            AlternativeDraft(
+                alternative_id="alt-peer-mechanism",
+                mechanism=peer.mechanism,
+                mechanism_class=peer.mechanism_class,
+            ),
+        ),
+    }))
+    handles = {item.rule_id: item.capability_ref for item in registry().capability_handles()}
+    plan = VerificationPlanDraft(
+        mechanism_id=frozen.mechanism_id,
+        predictions=(
+            PlannedPrediction(
+                capability_ref=handles["active_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Independent support one.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["queue_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Independent support two.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["downstream_wait_ratio"],
+                polarity=ConditionPolarity.CONTRADICT,
+                rationale="One signal cannot discharge unrelated alternatives.",
+                distinguishes=("alt-load-spike", "alt-peer-mechanism"),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="at most one alternative"):
+        registry().compile_plan(frozen, plan)
+
+
+def test_two_stage_refutation_scope_must_match_alternative_class():
+    mechanism = TwoStageDiscoverer().discover({
+        "entity_graph": {"nodes": []},
+    }).mechanisms[0]
+    frozen = freeze_mechanism(mechanism)
+    base = registry()
+    restricted = base.model_copy(update={
+        "rules": tuple(
+            rule.model_copy(update={
+                "refutes": (MechanismClass.GC_PAUSE,)
+                if rule.rule_id == "downstream_wait_ratio"
+                else rule.refutes,
+            })
+            for rule in base.rules
+        ),
+    })
+    handles = {
+        item.rule_id: item.capability_ref for item in restricted.capability_handles()
+    }
+    plan = VerificationPlanDraft(
+        mechanism_id=frozen.mechanism_id,
+        predictions=(
+            PlannedPrediction(
+                capability_ref=handles["active_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Independent support one.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["queue_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Independent support two.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["downstream_wait_ratio"],
+                polarity=ConditionPolarity.CONTRADICT,
+                rationale="The capability scope does not match this alternative.",
+                distinguishes=("alt-downstream",),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot refute"):
+        restricted.compile_plan(frozen, plan)
+
+    normalized, repairs = restricted.normalize_plan(frozen, plan)
+    assert "removed_unvalidated_refutation_claim" in repairs
+    assert normalized.predictions[-1].distinguishes == ()
+    compiled = restricted.compile_plan(frozen, normalized)
+    assert compiled.alternatives == ("downstream blocking",)
 
 
 def test_two_stage_planner_gets_one_bounded_retry_without_changing_mechanism():
@@ -1057,6 +1241,7 @@ def test_missing_refutation_data_blocks_verified_root_cause():
     )
     assert report.answer.authoritative_decision.status == DecisionStatus.SUPPORTED_HYPOTHESIS
     assert "required_observations_unavailable" in verification_event(runner)["blockers"]
+    assert verification_event(runner)["state"] == "unresolved"
     assert report.final_preview.candidate_assessments[0].verification_pending
 
 
@@ -1187,10 +1372,14 @@ def test_same_facts_with_new_ids_and_query_limits_do_not_verify():
     compiled = reg.compile(draft(refute=True), "ent-service",
                            discovery_fact_digests=tuple(observation_fact_digest(r.observation)
                                                        for r in original_records))
+    specs_by_signal = {spec.signal: spec for spec in reg.signals}
     records = tuple(IssuedObservation(
         original.observation.model_copy(update={"observation_id": f"obs-{i:016x}"}),
-        query_fingerprint(spec.query.tool_name, spec.query.request),
-    ) for i, (original, spec) in enumerate(zip(original_records, reg.signals, strict=True)))
+        query_fingerprint(
+            specs_by_signal[original.observation.signal].query.tool_name,
+            specs_by_signal[original.observation.signal].query.request,
+        ),
+    ) for i, original in enumerate(original_records))
     report = verify_dynamic(compiled, tuple(assess_dynamic(compiled, records)), records)
     assert not report.passed
     assert "no_new_support_verification" in report.blockers

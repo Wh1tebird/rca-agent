@@ -3,7 +3,7 @@
 Hosts can replace this builder with their monitoring inventory. No data is queried here.
 """
 
-from rca_agent.core.dynamic import EvidenceRegistry, RuleSpec, SignalSpec
+from rca_agent.core.dynamic import EvidenceRegistry, MechanismClass, RuleSpec, SignalSpec
 from rca_agent.models import (
     CallToolAction,
     CompareMetricWindowsRequest,
@@ -138,6 +138,26 @@ BASELINE_SIGNAL_CONTRACTS = {
     },
 }
 
+REFUTATION_CLASSES_BY_SIGNAL = {
+    "connection_duration_ms": (MechanismClass.DATABASE_CONNECTION_POOL,),
+    "connection_acquisition_ms": (MechanismClass.DATABASE_CONNECTION_POOL,),
+    "sql_duration_ms": (MechanismClass.DATABASE_EXECUTION,),
+    "db_client_span_duration_ms": (MechanismClass.DATABASE_EXECUTION,),
+    "sql_duration_share": (MechanismClass.DATABASE_EXECUTION,),
+    "thread_pool_active": (MechanismClass.THREAD_POOL_SATURATION,),
+    "thread_pool_queue_depth": (MechanismClass.THREAD_POOL_SATURATION,),
+    "thread_pool_rejected_tasks": (MechanismClass.THREAD_POOL_SATURATION,),
+    "thread_pool_active_baseline_ratio": (MechanismClass.THREAD_POOL_SATURATION,),
+    "thread_pool_queue_depth_baseline_ratio": (MechanismClass.THREAD_POOL_SATURATION,),
+    "jvm_runnable_threads_baseline_ratio": (MechanismClass.CPU_SATURATION,),
+    "jvm_thread_cpu_time_ns_baseline_ratio": (MechanismClass.CPU_SATURATION,),
+    "jvm_heap_used_bytes_baseline_ratio": (MechanismClass.MEMORY_PRESSURE,),
+    "jvm_gc_collection_delta_baseline_ratio": (MechanismClass.GC_PAUSE,),
+    "jvm_gc_pause_seconds_delta_baseline_ratio": (MechanismClass.GC_PAUSE,),
+    "cpu_usage_rate": (MechanismClass.CPU_SATURATION,),
+    "memory_usage_rate": (MechanismClass.MEMORY_PRESSURE,),
+}
+
 
 def rca100_evidence_registry(
     bootstrap: ResetResponse,
@@ -199,6 +219,7 @@ def rca100_evidence_registry(
                     provenance="RCA100 instrumented trace-stage contract",
                     description=description,
                     support_eligible=signal not in NON_CAUSAL_SUPPORT_TRACE_RULES,
+                    refutes=REFUTATION_CLASSES_BY_SIGNAL.get(signal, ()),
                 )
             rules["sql_duration_share_low"] = RuleSpec(
                 rule_id="sql_duration_share_low",
@@ -209,6 +230,7 @@ def rca100_evidence_registry(
                 provenance="RCA100 trace-stage differential contract",
                 description="SQL client span is a small part of operation duration",
                 support_eligible=False,
+                refutes=(),
             )
     issued_entity_types = {bootstrap.alert_entity.entity_ref: bootstrap.alert_entity.entity_type}
     for observation in observations:
@@ -299,6 +321,7 @@ def rca100_evidence_registry(
                 provenance="existing v3 node saturation thresholds",
                 aggregation="max",
                 description="high utilization within the bounded window",
+                refutes=REFUTATION_CLASSES_BY_SIGNAL.get(signal, ()),
             )
     for signal, contract in METRIC_SIGNAL_CONTRACTS.items():
         if "comparison" not in contract:
@@ -321,6 +344,7 @@ def rca100_evidence_registry(
             provenance="RCA100 aggregate JVM metric contract v1",
             aggregation="max",
             description=contract["description"],
+            refutes=REFUTATION_CLASSES_BY_SIGNAL.get(signal, ()),
         )
     for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
         if any(spec.signal == signal for spec in comparison_specs.values()):
@@ -332,5 +356,6 @@ def rca100_evidence_registry(
                 source="configuration",
                 provenance="RCA100 equal-window baseline-change contract v1",
                 description=contract["description"],
+                refutes=REFUTATION_CLASSES_BY_SIGNAL.get(signal, ()),
             )
     return EvidenceRegistry(signals=tuple(specs.values()), rules=tuple(rules.values()))

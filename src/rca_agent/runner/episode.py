@@ -17,7 +17,6 @@ from rca_agent.core.dynamic import (
     MechanismDiscoveryPayload,
     VerificationPlanPayload,
     freeze_mechanism,
-    normalize_verification_plan,
     observation_fact_digest,
     repair_mechanical_contract,
 )
@@ -54,6 +53,9 @@ def _contract_error_code(message: str) -> str:
         ("unknown frozen mechanism", "UNKNOWN_FROZEN_MECHANISM"),
         ("refutation prediction", "MISSING_REFUTATION"),
         ("dedicated refutation prediction", "ALTERNATIVES_NOT_REFUTED"),
+        ("at most one alternative", "REFUTATION_NOT_DEDICATED"),
+        ("support prediction cannot distinguish", "SUPPORT_CANNOT_REFUTE"),
+        ("cannot refute the alternative mechanism class", "REFUTATION_SCOPE_MISMATCH"),
         ("not eligible as root-cause support", "SUPPORT_RULE_NOT_ELIGIBLE"),
         ("independent support groups", "INSUFFICIENT_SUPPORT_GROUPS"),
         ("generic GC observations", "FULL_GC_SIGNAL_UNAVAILABLE"),
@@ -462,6 +464,7 @@ class EpisodeRunner:
                         "mechanism": other.mechanism,
                     })[:16],
                     mechanism=other.mechanism,
+                    mechanism_class=other.mechanism_class,
                 )
                 for _, other in valid_drafts
                 if other.source_hypothesis_id == draft.source_hypothesis_id
@@ -669,7 +672,7 @@ class EpisodeRunner:
                 continue
             seen.add(plan.mechanism_id)
             try:
-                normalized_plan, plan_repairs = normalize_verification_plan(plan)
+                normalized_plan, plan_repairs = registry.normalize_plan(mechanism, plan)
                 compiled = registry.compile_plan(mechanism, normalized_plan, **compile_kwargs)
                 if not all(self._signal_executable(signal) for signal in compiled.signals):
                     raise ValueError("query recipe is not executable in this episode")

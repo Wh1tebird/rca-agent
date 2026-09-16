@@ -1,5 +1,32 @@
 # RCA Agent handoff
 
+## Latest increment — failed competitors and refutation semantics
+
+Dynamic verification now has explicit `verified`, `unresolved` and `failed` states. Observed support
+failure or an observed refutation condition is decisive failure, so that candidate no longer blocks
+a same-origin verified mechanism. Missing data remains unresolved. Two strongly supported viable
+mechanisms return `MULTIPLE_SUPPORTED` with all supported hypothesis IDs and no winner. Deterministic
+fixed-input tests cover both the multiple-candidate result and the failed-competitor release path;
+Recorded Replay recomputes them.
+
+Refutation is now scope checked. Discovery classifies mechanisms and alternatives with a small
+generic `MechanismClass`; host capabilities advertise which classes they can refute. A contradiction
+may discharge one alternative only when the scopes match. Invalid exclusion claims and
+support/refutation conflicts are removed as transcripted plan repairs, leaving the Candidate
+supported or inconclusive instead of rejecting it or falsely verifying it. One independent support
+group is enough to retain a Candidate, but never enough to verify it.
+
+The final live 12-case run completed and replayed all cases, compiled mechanisms in all cases, and
+returned 10 supported plus 2 inconclusive results. Correct verified and wrong verified were both 0.
+Across 23 mechanisms, 18 unvalidated alternative exclusions were removed; 11/12 cases retained an
+unresolved alternative. The previous two verified results therefore relied on refutation claims the
+host could not semantically authorize. Results are in `analysis/jvm_refutation_final*`; findings
+are in `analysis/competition_refinement.md` and `analysis/refutation_semantic_audit.md`.
+
+Next work should add host capabilities for request volume, database transport versus server
+execution, lock/wait state and application/deployment errors. Do not weaken the alternative check to
+restore the old verified count.
+
 ## Latest increment — two-stage discovery and planning
 
 Dynamic unknown-root-cause work now uses two adapters over one DeepSeek model binding. The first

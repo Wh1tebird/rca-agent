@@ -266,3 +266,22 @@ only contradiction checks to discharge alternatives, groups correlated thread-po
 and blocks promotion while another same-origin mechanism retains two matched independent support
 groups. See `analysis/jvm_two_stage_final.md` and
 `analysis/jvm_two_stage_final_interpretation.md`.
+
+Dynamic competition and refutation semantics are now refined. Verification reports explicitly
+classify mechanisms as `verified`, `unresolved` or `failed`. A decisively failed mechanism no longer
+blocks a same-origin candidate; missing evidence remains unresolved. When two strongly supported
+mechanisms remain viable, the authoritative result is `MULTIPLE_SUPPORTED` with all supported
+hypothesis IDs and no invented winner. Replay recomputes both this result and its candidate states.
+
+Mechanisms and alternatives now carry a generic `MechanismClass`, while host capability handles
+advertise a narrow `refutes` set. A contradiction can discharge exactly one alternative only when
+those scopes match. Invalid exclusion claims and support/refutation conflicts are removed as
+auditable safe plan repairs. Candidates with incomplete refutation or only one independent support
+group are retained as supported/inconclusive but cannot reach `DISCOVERED_VERIFIED`.
+
+The refutation-scoped 12-case run completed and replayed 12/12, compiled mechanisms in 12/12, and
+returned 10 supported plus 2 inconclusive results, with 0 correct and 0 wrong verified. Eighteen
+unvalidated refutation claims were removed across 23 compiled mechanisms. Eleven cases retained an
+unresolved alternative. This shows the present bottleneck is missing discriminating capability,
+especially traffic, network transport, locks and application defects. See
+`analysis/competition_refinement.md` and `analysis/refutation_semantic_audit.md`.

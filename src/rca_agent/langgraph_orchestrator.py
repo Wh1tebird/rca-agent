@@ -236,7 +236,11 @@ class LangGraphInvestigation:
             return "verify_discovery"
         if (
             state["core_assessment"].overall_decision.status
-            in {DecisionStatus.CONFIRMED_ROOT_CAUSE, DecisionStatus.DISCOVERED_VERIFIED}
+            in {
+                DecisionStatus.CONFIRMED_ROOT_CAUSE,
+                DecisionStatus.DISCOVERED_VERIFIED,
+                DecisionStatus.MULTIPLE_SUPPORTED,
+            }
         ):
             return "finalize"
         if self._runner.should_discover():
