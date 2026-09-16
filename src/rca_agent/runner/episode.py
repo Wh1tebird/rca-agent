@@ -10,8 +10,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from rca_agent.core.dynamic import (
+    AlternativeDraft,
     DiscoveryPayload,
     EvidenceRegistry,
+    FrozenMechanism,
+    MechanismDiscoveryPayload,
+    VerificationPlanPayload,
+    freeze_mechanism,
+    normalize_verification_plan,
     observation_fact_digest,
     repair_mechanical_contract,
 )
@@ -39,6 +45,22 @@ from rca_agent.runner.transcript import EventType, JsonlTranscriptStore, Transcr
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
 ENTITY_REF_RE = re.compile(r"^ent-[a-z0-9-]{3,40}$")
+
+
+def _contract_error_code(message: str) -> str:
+    mappings = (
+        ("unknown capability reference", "UNKNOWN_CAPABILITY_REF"),
+        ("unknown alternative reference", "UNKNOWN_ALTERNATIVE_REF"),
+        ("unknown frozen mechanism", "UNKNOWN_FROZEN_MECHANISM"),
+        ("refutation prediction", "MISSING_REFUTATION"),
+        ("dedicated refutation prediction", "ALTERNATIVES_NOT_REFUTED"),
+        ("not eligible as root-cause support", "SUPPORT_RULE_NOT_ELIGIBLE"),
+        ("independent support groups", "INSUFFICIENT_SUPPORT_GROUPS"),
+        ("generic GC observations", "FULL_GC_SIGNAL_UNAVAILABLE"),
+        ("duplicate predictions", "DUPLICATE_PREDICTIONS"),
+        ("not executable", "CAPABILITY_NOT_EXECUTABLE"),
+    )
+    return next((code for fragment, code in mappings if fragment in message), "CONTRACT_REJECTED")
 
 
 class EpisodeStateError(RuntimeError):
@@ -84,6 +106,7 @@ class EpisodeRunner:
         transcript_path: Path | None = None,
         decision_provider: DecisionProvider | None = None,
         discovery: Any | None = None,
+        verification_planner: Any | None = None,
         evidence_registry: EvidenceRegistry | Callable[..., EvidenceRegistry] | None = None,
         discovery_timeout_seconds: float = 30,
     ) -> None:
@@ -93,6 +116,8 @@ class EpisodeRunner:
             raise ValueError("discovery timeout must be in (0, 120]")
         if discovery is not None and evidence_registry is None:
             raise ValueError("discovery requires host-owned signal and rule contracts")
+        if verification_planner is not None and discovery is None:
+            raise ValueError("verification planner requires mechanism discovery")
         if isinstance(decision_provider, CoreDecisionProvider) and decision_provider.has_dynamic_candidates:
             raise ValueError("a runner requires a fresh Core decision provider")
         self.episode_id = f"ep-{uuid.uuid4().hex}"
@@ -106,6 +131,7 @@ class EpisodeRunner:
                                    if isinstance(decision_provider, CoreDecisionProvider)
                                    else decision_provider or CoreDecisionProvider())
         self.__discovery = discovery
+        self.__verification_planner = verification_planner
         self.__registry = evidence_registry
         self.__discovery_timeout = discovery_timeout_seconds
         self.__discovery_attempted = False
@@ -216,6 +242,8 @@ class EpisodeRunner:
             ],
         }
         self.transcript.append(EventType.DISCOVERY_STARTED, {"context_digest": sha256_digest(context)})
+        if self.__verification_planner is not None:
+            return self._discover_two_stage(context, registry, proposals)
         mailbox: Queue = Queue(maxsize=1)
         generator = self.__discovery
 
@@ -365,6 +393,376 @@ class EpisodeRunner:
             result = {"status": "failed", "registered": 0}
         self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
         return result
+
+    def _discover_two_stage(
+        self,
+        context: dict[str, Any],
+        registry: EvidenceRegistry,
+        proposals: dict[str, HypothesisProposal],
+    ) -> dict[str, Any]:
+        mechanism_context = {
+            key: deepcopy(value)
+            for key, value in context.items()
+            if key not in {"signals", "rules"}
+        }
+        for node in mechanism_context["entity_graph"]["nodes"]:
+            node.pop("available_rule_ids", None)
+        ok, raw = self._invoke_discovery_component(
+            lambda: self.__discovery.discover(mechanism_context)
+        )
+        if not ok:
+            self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, {
+                "stage": "mechanism_discovery", **raw,
+            })
+            result = {"status": "failed", "registered": 0, "error_type": raw["error_type"]}
+            self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+            return result
+        try:
+            payload = MechanismDiscoveryPayload.model_validate(raw)
+        except (ValueError, TypeError) as exc:
+            failure = {"stage": "mechanism_discovery", "error_type": type(exc).__name__}
+            self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, failure)
+            result = {"status": "failed", "registered": 0, "error_type": type(exc).__name__}
+            self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+            return result
+
+        frozen: dict[str, FrozenMechanism] = {}
+        valid_drafts = []
+        seen = set()
+        rejection_codes: list[str] = []
+        for draft_index, draft in enumerate(payload.mechanisms):
+            self.transcript.append(EventType.MECHANISM_DRAFT_GENERATED, {
+                "draft_index": draft_index, "draft": draft.model_dump(mode="json"),
+            })
+            key = (draft.source_hypothesis_id, draft.mechanism.strip().casefold())
+            error_code = None
+            if draft.source_hypothesis_id not in proposals:
+                error_code = "UNKNOWN_SOURCE_HYPOTHESIS"
+            elif key in seen:
+                error_code = "DUPLICATE_MECHANISM"
+            elif draft.causal_entity_ref not in self.__issued_entities:
+                error_code = "UNISSUED_CAUSAL_ENTITY"
+            if error_code is not None:
+                rejection_codes.append(error_code)
+                self.transcript.append(EventType.MECHANISM_DRAFT_REJECTED, {
+                    "draft_index": draft_index, "error_code": error_code,
+                })
+                continue
+            seen.add(key)
+            valid_drafts.append((draft_index, draft))
+
+        for draft_index, draft in valid_drafts:
+            existing_alternatives = {
+                item.mechanism.strip().casefold() for item in draft.alternatives
+            }
+            peers = tuple(
+                AlternativeDraft(
+                    alternative_id="alt-peer-" + sha256_digest({
+                        "source": other.source_hypothesis_id,
+                        "mechanism": other.mechanism,
+                    })[:16],
+                    mechanism=other.mechanism,
+                )
+                for _, other in valid_drafts
+                if other.source_hypothesis_id == draft.source_hypothesis_id
+                and other.mechanism.strip().casefold() != draft.mechanism.strip().casefold()
+                and other.mechanism.strip().casefold() not in existing_alternatives
+            )
+            frozen_draft = draft.model_copy(update={
+                "alternatives": (*draft.alternatives, *peers),
+            })
+            item = freeze_mechanism(frozen_draft)
+            frozen[item.mechanism_id] = item
+            self.transcript.append(EventType.MECHANISM_DRAFT_FROZEN, {
+                "draft_index": draft_index, "mechanism": item.model_dump(mode="json"),
+            })
+
+        if not frozen:
+            result = {
+                "status": "completed", "registered": 0, "aligned": 0,
+                "rejections": rejection_codes,
+                "planner_attempts": 0,
+            }
+            self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+            return result
+
+        handles = registry.capability_handles()
+        planner_base = {
+            "frozen_mechanisms": [item.model_dump(mode="json") for item in frozen.values()],
+            "capabilities": [item.model_dump(mode="json") for item in handles],
+            "observations": context["observations"],
+        }
+        compile_kwargs = {
+            "discovery_query_refs": tuple(sorted({
+                record.query_ref for record in self.__observation_ledger.values()
+            })),
+            "discovery_observation_refs": tuple(sorted(self.__observation_ledger)),
+            "discovery_fact_digests": tuple(sorted({
+                observation_fact_digest(record.observation)
+                for record in self.__observation_ledger.values()
+            })),
+        }
+        registered = 0
+        aligned = 0
+        accepted: set[str] = set()
+
+        first_payload, first_failure = self._invoke_planner({
+            **planner_base, "attempt": 1, "errors": [],
+        })
+        if first_payload is None:
+            code = first_failure or "PLANNER_FAILED"
+            rejection_codes.append(code)
+            initial_failures = {
+                mechanism_id: {"mechanism_id": mechanism_id, "error_code": code}
+                for mechanism_id in frozen
+            }
+            for mechanism_id in frozen:
+                self._reject_plan(mechanism_id, 1, code)
+            self.transcript.append(EventType.VERIFICATION_PLAN_RETRIED, {
+                "mechanism_ids": sorted(frozen),
+                "errors": [initial_failures[value] for value in sorted(frozen)],
+            })
+            retry_payload, retry_failure = self._invoke_planner({
+                **planner_base,
+                "attempt": 2,
+                "errors": [initial_failures[value] for value in sorted(frozen)],
+                "previous_plans": [],
+            })
+            if retry_payload is not None:
+                retry_failed, counts = self._compile_plans(
+                    retry_payload,
+                    frozen,
+                    registry,
+                    proposals,
+                    compile_kwargs,
+                    accepted,
+                    attempt=2,
+                )
+                registered += counts[0]
+                aligned += counts[1]
+                rejection_codes.extend(
+                    item["error_code"] for item in retry_failed.values()
+                )
+            else:
+                rejection_codes.append(retry_failure or "PLANNER_RETRY_FAILED")
+            result = {
+                "status": "completed", "registered": registered, "aligned": aligned,
+                "rejections": rejection_codes, "planner_attempts": 2,
+            }
+            self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+            return result
+        failed, counts = self._compile_plans(
+            first_payload, frozen, registry, proposals, compile_kwargs, accepted, attempt=1,
+        )
+        registered += counts[0]
+        aligned += counts[1]
+        rejection_codes.extend(item["error_code"] for item in failed.values())
+
+        planner_attempts = 1
+        if failed:
+            planner_attempts = 2
+            retry_ids = sorted(failed)
+            self.transcript.append(EventType.VERIFICATION_PLAN_RETRIED, {
+                "mechanism_ids": retry_ids,
+                "errors": [failed[value] for value in retry_ids],
+            })
+            retry_context = {
+                **planner_base,
+                "frozen_mechanisms": [
+                    frozen[value].model_dump(mode="json") for value in retry_ids
+                ],
+                "attempt": 2,
+                "errors": [failed[value] for value in retry_ids],
+                "previous_plans": [
+                    failed[value]["plan"] for value in retry_ids if failed[value].get("plan")
+                ],
+            }
+            retry_payload, retry_failure = self._invoke_planner(retry_context)
+            if retry_payload is None:
+                rejection_codes.append(retry_failure or "PLANNER_RETRY_FAILED")
+            else:
+                retry_failed, counts = self._compile_plans(
+                    retry_payload,
+                    {value: frozen[value] for value in retry_ids},
+                    registry,
+                    proposals,
+                    compile_kwargs,
+                    accepted,
+                    attempt=2,
+                )
+                registered += counts[0]
+                aligned += counts[1]
+                rejection_codes.extend(
+                    item["error_code"] for item in retry_failed.values()
+                )
+        result = {
+            "status": "completed", "registered": registered, "aligned": aligned,
+            "rejections": rejection_codes, "planner_attempts": planner_attempts,
+        }
+        self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
+        return result
+
+    def _invoke_discovery_component(self, invoke) -> tuple[bool, Any]:
+        from queue import Empty, Queue
+        from threading import Thread
+
+        mailbox: Queue = Queue(maxsize=1)
+
+        def target():
+            try:
+                mailbox.put((True, invoke()))
+            except Exception as exc:  # noqa: BLE001 - bounded structured output only
+                failure = {"error_type": type(exc).__name__}
+                raw_payload = getattr(exc, "raw_payload", None)
+                if isinstance(raw_payload, (dict, list)):
+                    failure["raw_payload"] = raw_payload
+                mailbox.put((False, failure))
+
+        Thread(target=target, daemon=True).start()
+        try:
+            return mailbox.get(timeout=self.__discovery_timeout)
+        except Empty:
+            return False, {"error_type": "TimeoutError"}
+
+    def _invoke_planner(
+        self, context: dict[str, Any]
+    ) -> tuple[VerificationPlanPayload | None, str | None]:
+        ok, raw = self._invoke_discovery_component(
+            lambda: self.__verification_planner.plan(deepcopy(context))
+        )
+        if not ok:
+            self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, {
+                "stage": "verification_planner", **raw,
+            })
+            return None, "PLANNER_" + raw["error_type"].upper()
+        try:
+            return VerificationPlanPayload.model_validate(raw), None
+        except (ValueError, TypeError) as exc:
+            self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, {
+                "stage": "verification_planner", "error_type": type(exc).__name__,
+            })
+            return None, "PLANNER_INVALID_PAYLOAD"
+
+    def _compile_plans(
+        self,
+        payload: VerificationPlanPayload,
+        mechanisms: dict[str, FrozenMechanism],
+        registry: EvidenceRegistry,
+        proposals: dict[str, HypothesisProposal],
+        compile_kwargs: dict[str, Any],
+        accepted: set[str],
+        *,
+        attempt: int,
+    ) -> tuple[dict[str, dict[str, Any]], tuple[int, int]]:
+        failed: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
+        registered = 0
+        aligned = 0
+        for plan in payload.plans:
+            self.transcript.append(EventType.VERIFICATION_PLAN_GENERATED, {
+                "attempt": attempt, "plan": plan.model_dump(mode="json"),
+            })
+            mechanism = mechanisms.get(plan.mechanism_id)
+            if mechanism is None or plan.mechanism_id in seen or plan.mechanism_id in accepted:
+                code = "UNKNOWN_OR_DUPLICATE_MECHANISM"
+                self._reject_plan(plan.mechanism_id, attempt, code)
+                continue
+            seen.add(plan.mechanism_id)
+            try:
+                normalized_plan, plan_repairs = normalize_verification_plan(plan)
+                compiled = registry.compile_plan(mechanism, normalized_plan, **compile_kwargs)
+                if not all(self._signal_executable(signal) for signal in compiled.signals):
+                    raise ValueError("query recipe is not executable in this episode")
+                registration = self._register_two_stage_candidate(
+                    compiled, mechanism, proposals[mechanism.source_hypothesis_id]
+                )
+                accepted.add(plan.mechanism_id)
+                registered += registration == "dynamic_registered"
+                aligned += registration == "catalog_aligned"
+                self.transcript.append(EventType.VERIFICATION_PLAN_COMPILED, {
+                    "attempt": attempt,
+                    "mechanism_id": plan.mechanism_id,
+                    "mechanism_digest": mechanism.digest,
+                    "plan": normalized_plan.model_dump(mode="json"),
+                    "plan_repairs": plan_repairs,
+                    "registration": registration,
+                })
+            except ValueError as exc:
+                code = _contract_error_code(str(exc))
+                failed[plan.mechanism_id] = {
+                    "mechanism_id": plan.mechanism_id, "error_code": code,
+                    "plan": plan.model_dump(mode="json"),
+                }
+                self._reject_plan(plan.mechanism_id, attempt, code)
+        for mechanism_id in mechanisms.keys() - seen - accepted:
+            code = "MISSING_VERIFICATION_PLAN"
+            failed[mechanism_id] = {
+                "mechanism_id": mechanism_id, "error_code": code,
+            }
+            self._reject_plan(mechanism_id, attempt, code)
+        return failed, (registered, aligned)
+
+    def _reject_plan(self, mechanism_id: str, attempt: int, error_code: str) -> None:
+        self.transcript.append(EventType.VERIFICATION_PLAN_REJECTED, {
+            "attempt": attempt, "mechanism_id": mechanism_id, "error_code": error_code,
+        })
+
+    def _register_two_stage_candidate(
+        self,
+        compiled,
+        mechanism: FrozenMechanism,
+        original: HypothesisProposal,
+    ) -> str:
+        existing = next((candidate for candidate in self.__decision_provider.catalog(
+            compiled.candidate.causal_entity
+        ) if mechanism.mechanism.casefold() in {
+            candidate.candidate_id.casefold(), candidate.fault_type.casefold()
+        } and candidate.family == mechanism.family), None)
+        if existing is not None:
+            required = {condition.signal for condition in existing.conditions}
+            if not required <= {signal.signal for signal in compiled.signals}:
+                raise ValueError("catalog alignment lacks executable signal recipes")
+            hypothesis_id = "h-aligned-" + compiled.version[:20]
+            self.transcript.append(EventType.CATALOG_CANDIDATE_ALIGNED, {
+                "candidate_id": existing.candidate_id,
+                "hypothesis_id": hypothesis_id,
+                "source_hypothesis_id": original.hypothesis_id,
+            })
+            candidate_id = existing.candidate_id
+            registration = "catalog_aligned"
+        else:
+            hypothesis_id = "h-discovered-" + compiled.version[:20]
+            rebound = compiled.model_copy(update={"source_hypothesis_id": hypothesis_id})
+            self.__decision_provider.register_dynamic(rebound)
+            self.transcript.append(EventType.DYNAMIC_CANDIDATE_REGISTERED, {
+                "compiled": rebound.model_dump(mode="json"),
+                "source_hypothesis_id": original.hypothesis_id,
+                "mechanism_id": mechanism.mechanism_id,
+                "mechanism_digest": mechanism.digest,
+            })
+            candidate_id = compiled.candidate.candidate_id
+            candidate = compiled.candidate
+            self.__dynamic_options.append({
+                "candidate_id": candidate.candidate_id,
+                "fault_type": candidate.fault_type,
+                "family": candidate.family.value,
+                "required_signals": tuple(signal.signal for signal in compiled.signals),
+                "required_capabilities": tuple(candidate.required_capabilities),
+            })
+            registration = "dynamic_registered"
+        self._submit_hypothesis(HypothesisProposal(
+            hypothesis_id=hypothesis_id,
+            candidate_id=candidate_id,
+            mechanism=mechanism.mechanism if existing is None else existing.fault_type,
+            causal_entity_ref=compiled.candidate.causal_entity,
+            rationale=mechanism.causal_explanation,
+        ))
+        queries = {
+            query_fingerprint(signal.query.tool_name, signal.query.request): signal.query
+            for signal in compiled.signals
+        }
+        self.__verification_queries.extend((hypothesis_id, query) for query in queries.values())
+        return registration
 
     def _record_discovery_draft(
         self,

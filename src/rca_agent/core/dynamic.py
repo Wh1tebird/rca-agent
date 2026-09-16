@@ -155,6 +155,116 @@ class DiscoveryPayload(BaseModel):
     hypotheses: tuple[DynamicHypothesis, ...] = Field(default=(), max_length=4)
 
 
+class AlternativeDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    alternative_id: str = Field(pattern=r"^alt-[a-z0-9-]{1,40}$")
+    mechanism: str = Field(min_length=3, max_length=500)
+
+
+class MechanismDraft(BaseModel):
+    """A causal proposal with no evidence-query or verification-plan fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    source_hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
+    causal_entity_ref: str = Field(pattern=r"^ent-[a-z0-9-]{3,40}$")
+    mechanism: str = Field(min_length=3, max_length=500)
+    family: MechanismFamily
+    causal_explanation: str = Field(min_length=10, max_length=2000)
+    alternatives: tuple[AlternativeDraft, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def unique_alternative_ids(self):
+        identifiers = [item.alternative_id for item in self.alternatives]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("alternative IDs must be unique")
+        return self
+
+
+class MechanismDiscoveryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mechanisms: tuple[MechanismDraft, ...] = Field(default=(), max_length=4)
+
+
+class FrozenMechanism(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mechanism_id: str = Field(pattern=r"^mech-[a-f0-9]{20}$")
+    source_hypothesis_id: str
+    causal_entity_ref: str
+    mechanism: str
+    family: MechanismFamily
+    causal_explanation: str
+    alternatives: tuple[AlternativeDraft, ...]
+    digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+def freeze_mechanism(draft: MechanismDraft) -> FrozenMechanism:
+    payload = draft.model_dump(mode="json")
+    digest = sha256_digest(payload)
+    return FrozenMechanism(
+        mechanism_id="mech-" + digest[:20],
+        digest=digest,
+        **payload,
+    )
+
+
+class CapabilityHandle(BaseModel):
+    """One host-authorized Entity, Signal, Rule and query-recipe combination."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    capability_ref: str = Field(pattern=r"^cap-[a-f0-9]{20}$")
+    entity_ref: str
+    rule_id: str
+    signal: str
+    description: str
+    independent_group: str
+    support_eligible: bool
+
+
+class PlannedPrediction(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    capability_ref: str = Field(pattern=r"^cap-[a-f0-9]{20}$")
+    polarity: ConditionPolarity
+    rationale: str = Field(min_length=1, max_length=500)
+    distinguishes: tuple[str, ...] = Field(default=(), max_length=8)
+
+
+class VerificationPlanDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mechanism_id: str = Field(pattern=r"^mech-[a-f0-9]{20}$")
+    predictions: tuple[PlannedPrediction, ...] = Field(min_length=2, max_length=12)
+
+
+class VerificationPlanPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    plans: tuple[VerificationPlanDraft, ...] = Field(default=(), max_length=4)
+
+
+def normalize_verification_plan(
+    plan: VerificationPlanDraft,
+) -> tuple[VerificationPlanDraft, tuple[str, ...]]:
+    """Merge repeated uses of the same capability with the same polarity."""
+    grouped: dict[tuple[str, ConditionPolarity], PlannedPrediction] = {}
+    changed = False
+    for prediction in plan.predictions:
+        key = (prediction.capability_ref, prediction.polarity)
+        previous = grouped.get(key)
+        if previous is None:
+            grouped[key] = prediction
+            continue
+        changed = True
+        grouped[key] = previous.model_copy(update={
+            "distinguishes": tuple(dict.fromkeys((
+                *previous.distinguishes, *prediction.distinguishes,
+            ))),
+        })
+    if not changed:
+        return plan, ()
+    return VerificationPlanDraft(
+        mechanism_id=plan.mechanism_id,
+        predictions=tuple(grouped.values()),
+    ), ("merged_duplicate_capability_predictions",)
+
+
 def repair_mechanical_contract(
     draft: DynamicHypothesis,
 ) -> tuple[DynamicHypothesis, tuple[str, ...]]:
@@ -190,6 +300,7 @@ class CompiledCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     candidate: Candidate
     source_hypothesis_id: str
+    origin_hypothesis_id: str | None = None
     rules: tuple[RuleSpec, ...]
     signals: tuple[SignalSpec, ...]
     predictions: tuple[Prediction, ...] = ()
@@ -248,6 +359,79 @@ class EvidenceRegistry(BaseModel):
                     ):
                         raise ValueError("reference signal type or unit mismatch")
         return self
+
+    def capability_handles(self) -> tuple[CapabilityHandle, ...]:
+        handles = []
+        for signal in self.signals:
+            if not signal.available:
+                continue
+            for rule in self.rules:
+                if rule.signal != signal.signal:
+                    continue
+                if rule.reference_signal is not None and not any(
+                    reference.entity_ref == signal.entity_ref
+                    and reference.signal == rule.reference_signal
+                    and reference.available
+                    for reference in self.signals
+                ):
+                    continue
+                identity = {"entity_ref": signal.entity_ref, "rule_id": rule.rule_id}
+                handles.append(CapabilityHandle(
+                    capability_ref="cap-" + sha256_digest(identity)[:20],
+                    entity_ref=signal.entity_ref,
+                    rule_id=rule.rule_id,
+                    signal=signal.signal,
+                    description=rule.description,
+                    independent_group=signal.independent_group,
+                    support_eligible=rule.support_eligible,
+                ))
+        return tuple(handles)
+
+    def compile_plan(
+        self,
+        mechanism: FrozenMechanism,
+        plan: VerificationPlanDraft,
+        **compile_kwargs,
+    ) -> CompiledCandidate:
+        if plan.mechanism_id != mechanism.mechanism_id:
+            raise ValueError("verification plan references an unknown frozen mechanism")
+        handles = {item.capability_ref: item for item in self.capability_handles()}
+        alternatives = {
+            item.alternative_id: item.mechanism for item in mechanism.alternatives
+        }
+        predictions = []
+        distinguished: set[str] = set()
+        for item in plan.predictions:
+            handle = handles.get(item.capability_ref)
+            if handle is None:
+                raise ValueError("unknown capability reference")
+            if not set(item.distinguishes) <= alternatives.keys():
+                raise ValueError("unknown alternative reference")
+            if item.polarity == ConditionPolarity.CONTRADICT:
+                distinguished.update(item.distinguishes)
+            predictions.append(Prediction(
+                rule_id=handle.rule_id,
+                target_entity_ref=handle.entity_ref,
+                polarity=item.polarity,
+                rationale=item.rationale,
+                distinguishes=tuple(alternatives[value] for value in item.distinguishes),
+            ))
+        if not any(item.polarity == ConditionPolarity.CONTRADICT for item in plan.predictions):
+            raise ValueError("verification plan requires a refutation prediction")
+        if distinguished != set(alternatives):
+            raise ValueError(
+                "every alternative requires a dedicated refutation prediction"
+            )
+        draft = DynamicHypothesis(
+            source_hypothesis_id=mechanism.source_hypothesis_id,
+            causal_entity_ref=mechanism.causal_entity_ref,
+            mechanism=mechanism.mechanism,
+            family=mechanism.family,
+            causal_explanation=mechanism.causal_explanation,
+            predictions=tuple(predictions),
+            alternatives=tuple(alternatives.values()),
+        )
+        return self.compile(draft, mechanism.causal_entity_ref, **compile_kwargs)
 
     def compile(
         self,
@@ -358,6 +542,7 @@ class EvidenceRegistry(BaseModel):
         return CompiledCandidate(
             candidate=candidate,
             source_hypothesis_id=draft.source_hypothesis_id,
+            origin_hypothesis_id=draft.source_hypothesis_id,
             rules=tuple(selected),
             signals=tuple(specs.values()),
             predictions=draft.predictions,

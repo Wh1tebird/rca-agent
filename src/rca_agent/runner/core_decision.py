@@ -292,6 +292,35 @@ def _evaluate(
         key: verify_dynamic(value, assessments_by_candidate[key], records_by_candidate[key])
         for key, value in dynamic.items() if key in assessments_by_candidate
     }
+    for key, verification in tuple(verifications.items()):
+        if not verification.passed:
+            continue
+        origin = dynamic[key].origin_hypothesis_id
+        competing = False
+        for other_key, other in dynamic.items():
+            if (
+                other_key == key
+                or other_key not in assessments_by_candidate
+                or other.origin_hypothesis_id != origin
+            ):
+                continue
+            matched_groups = {
+                condition.independent_group
+                for condition, assessment in zip(
+                    other.candidate.conditions,
+                    assessments_by_candidate[other_key],
+                    strict=True,
+                )
+                if condition.polarity == ConditionPolarity.SUPPORT and assessment.matched
+            }
+            if len(matched_groups) >= 2:
+                competing = True
+                break
+        if competing:
+            verifications[key] = verification.model_copy(update={
+                "passed": False,
+                "blockers": (*verification.blockers, "competing_dynamic_mechanism_unresolved"),
+            })
     eligible = []
     for key in route.eligible_candidates:
         compiled = dynamic.get(key)

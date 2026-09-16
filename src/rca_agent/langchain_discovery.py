@@ -7,7 +7,7 @@ from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from rca_agent.core.dynamic import DiscoveryPayload
+from rca_agent.core.dynamic import DiscoveryPayload, MechanismDiscoveryPayload
 
 
 class LangChainDiscoveryAdapter:
@@ -97,3 +97,62 @@ class DiscoveryPayloadError(ValueError):
     def __init__(self, raw_payload: Any) -> None:
         super().__init__("invalid structured discovery payload")
         self.raw_payload = raw_payload
+
+
+class LangChainMechanismDiscoveryAdapter:
+    """A semantic-only discovery call that cannot author an evidence plan."""
+
+    def __init__(self, runnable: Any) -> None:
+        self._runnable = runnable
+
+    @classmethod
+    def from_chat_model(cls, model: Any, *, structured_method: str = "function_calling"):
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                (
+                    "Propose up to four bounded causal mechanisms for the supplied source "
+                    "hypotheses. Return only the advertised schema. Keep source_hypothesis_id and "
+                    "choose causal_entity_ref only from entity_graph.nodes. Explain the causal "
+                    "chain rather than merely restating a symptom. Include at least one plausible "
+                    "alternative for every mechanism and assign each alternative a short unique "
+                    "alt-* ID. Do not select Signals, Rules, queries, thresholds, evidence weights "
+                    "or a final decision. Reuse a visible Catalog mechanism only when it genuinely "
+                    "explains the facts; otherwise name a new mechanism. Return an empty mechanisms "
+                    "list when no bounded causal proposal is justified."
+                ),
+            ),
+            (
+                "human",
+                "JSON schema:\n{schema_json}\n\nInvestigation context:\n{context_json}",
+            ),
+        ])
+        return cls(prompt | model.with_structured_output(
+            MechanismDiscoveryPayload,
+            method=structured_method,
+            include_raw=True,
+        ))
+
+    def discover(self, context: dict[str, Any]) -> MechanismDiscoveryPayload:
+        response = self._runnable.invoke({
+            "schema_json": json.dumps(
+                MechanismDiscoveryPayload.model_json_schema(), sort_keys=True
+            ),
+            "context_json": json.dumps(context, sort_keys=True),
+        })
+        if isinstance(response, dict) and "parsed" in response and "raw" in response:
+            parsed = response.get("parsed")
+            if parsed is not None:
+                return MechanismDiscoveryPayload.model_validate(parsed)
+            raise DiscoveryPayloadError(_raw_message_payload(response.get("raw")))
+        return MechanismDiscoveryPayload.model_validate(response)
+
+
+def _raw_message_payload(raw_message: Any) -> Any:
+    content = getattr(raw_message, "content", None)
+    if not isinstance(content, str):
+        return None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return {"unparsed_text": content[:20_000]}

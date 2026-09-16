@@ -6,13 +6,20 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
 from rca_agent.core.dynamic import (
+    AlternativeDraft,
     DiscoveryPayload,
     DynamicHypothesis,
     EvidenceRegistry,
+    MechanismDiscoveryPayload,
+    MechanismDraft,
+    PlannedPrediction,
     Prediction,
     RuleSpec,
     SignalSpec,
+    VerificationPlanDraft,
+    VerificationPlanPayload,
     assess_dynamic,
+    normalize_verification_plan,
     repair_mechanical_contract,
     verify_dynamic,
 )
@@ -449,6 +456,230 @@ def test_runner_records_raw_draft_and_auditable_mechanical_repair():
     assert RecordedReplay.verify(runner.transcript.events).valid
 
 
+class TwoStageDiscoverer:
+    def discover(self, context):
+        assert "signals" not in context
+        assert "rules" not in context
+        assert all("available_rule_ids" not in node for node in context["entity_graph"]["nodes"])
+        return MechanismDiscoveryPayload(mechanisms=(MechanismDraft(
+            source_hypothesis_id="h-unknown",
+            causal_entity_ref="ent-service",
+            mechanism="thread pool exhaustion",
+            family=MechanismFamily.APPLICATION,
+            causal_explanation="Workers are occupied and incoming tasks wait in the queue.",
+            alternatives=(AlternativeDraft(
+                alternative_id="alt-downstream",
+                mechanism="downstream blocking",
+            ),),
+        ),))
+
+
+class TwoStagePlanner:
+    def __init__(self, *, fail_first=False, always_fail=False):
+        self.calls = 0
+        self.fail_first = fail_first
+        self.always_fail = always_fail
+
+    def plan(self, context):
+        self.calls += 1
+        mechanism_id = context["frozen_mechanisms"][0]["mechanism_id"]
+        handles = {item["rule_id"]: item["capability_ref"]
+                   for item in context["capabilities"]}
+        invalid = self.always_fail or (self.fail_first and self.calls == 1)
+        active = "cap-" + "0" * 20 if invalid else handles["active_ratio"]
+        return VerificationPlanPayload(plans=(VerificationPlanDraft(
+            mechanism_id=mechanism_id,
+            predictions=(
+                PlannedPrediction(
+                    capability_ref=active,
+                    polarity=ConditionPolarity.SUPPORT,
+                    rationale="Workers should be busy.",
+                ),
+                PlannedPrediction(
+                    capability_ref=handles["queue_ratio"],
+                    polarity=ConditionPolarity.SUPPORT,
+                    rationale="Tasks should wait in the queue.",
+                ),
+                PlannedPrediction(
+                    capability_ref=handles["downstream_wait_ratio"],
+                    polarity=ConditionPolarity.CONTRADICT,
+                    rationale="Downstream blocking would refute local pool exhaustion.",
+                    distinguishes=("alt-downstream",),
+                ),
+            ),
+        ),))
+
+
+class CompetingMechanismsDiscoverer:
+    def discover(self, context):
+        return MechanismDiscoveryPayload(mechanisms=(
+            MechanismDraft(
+                source_hypothesis_id="h-unknown",
+                causal_entity_ref="ent-service",
+                mechanism="local thread pool exhaustion",
+                family=MechanismFamily.APPLICATION,
+                causal_explanation="Local workers are occupied while work queues locally.",
+                alternatives=(AlternativeDraft(
+                    alternative_id="alt-load-spike",
+                    mechanism="transient incoming load spike",
+                ),),
+            ),
+            MechanismDraft(
+                source_hypothesis_id="h-unknown",
+                causal_entity_ref="ent-service",
+                mechanism="downstream wait induced worker starvation",
+                family=MechanismFamily.DATABASE_DEPENDENCY,
+                causal_explanation="Workers remain occupied because downstream calls block them.",
+                alternatives=(AlternativeDraft(
+                    alternative_id="alt-lock-contention",
+                    mechanism="local lock contention",
+                ),),
+            ),
+        ))
+
+
+class CompetingMechanismsPlanner:
+    def plan(self, context):
+        handles = {
+            item["rule_id"]: item["capability_ref"]
+            for item in context["capabilities"]
+        }
+        plans = []
+        for mechanism in context["frozen_mechanisms"]:
+            alternatives = tuple(
+                item["alternative_id"] for item in mechanism["alternatives"]
+            )
+            plans.append(VerificationPlanDraft(
+                mechanism_id=mechanism["mechanism_id"],
+                predictions=(
+                    PlannedPrediction(
+                        capability_ref=handles["active_ratio"],
+                        polarity=ConditionPolarity.SUPPORT,
+                        rationale="Workers should be occupied.",
+                    ),
+                    PlannedPrediction(
+                        capability_ref=handles["queue_ratio"],
+                        polarity=ConditionPolarity.SUPPORT,
+                        rationale="Queued work should accumulate.",
+                    ),
+                    PlannedPrediction(
+                        capability_ref=handles["downstream_wait_ratio"],
+                        polarity=ConditionPolarity.CONTRADICT,
+                        rationale="This observation must separate the peer explanation.",
+                        distinguishes=alternatives,
+                    ),
+                ),
+            ))
+        return VerificationPlanPayload(plans=tuple(plans))
+
+
+def test_two_stage_discovery_freezes_mechanism_and_compiles_capability_handles():
+    planner = TwoStagePlanner()
+    runner, _, _, _ = run(TwoStageDiscoverer(), verification_planner=planner)
+    assert planner.calls == 1
+    events = runner.transcript.events
+    assert sum(event.event_type == EventType.MECHANISM_DRAFT_FROZEN for event in events) == 1
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_COMPILED for event in events) == 1
+    assert EventType.VERIFICATION_PLAN_RETRIED not in {event.event_type for event in events}
+    assert runner.dynamic_candidate_options
+    assert RecordedReplay.verify(events).valid
+
+    compiled = next(event.payload for event in events
+                    if event.event_type == EventType.VERIFICATION_PLAN_COMPILED)
+    with pytest.raises(ValidationError):
+        VerificationPlanDraft.model_validate({
+            "mechanism_id": compiled["plan"]["mechanism_id"],
+            "mechanism": "attempted mutation",
+            "predictions": compiled["plan"]["predictions"],
+        })
+
+
+def test_competing_dynamic_mechanisms_cannot_both_be_promoted_as_root_cause():
+    runner, report, _, _ = run(
+        CompetingMechanismsDiscoverer(),
+        verification_planner=CompetingMechanismsPlanner(),
+    )
+    verification = next(
+        event.payload["candidates"]
+        for event in runner.transcript.events
+        if event.event_type == EventType.DYNAMIC_VERIFICATION
+    )
+    assert len(verification) == 2
+    assert all(not item["passed"] for item in verification.values())
+    assert all(
+        "competing_dynamic_mechanism_unresolved" in item["blockers"]
+        for item in verification.values()
+    )
+    assert report.answer.authoritative_decision.status != DecisionStatus.DISCOVERED_VERIFIED
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_plan_normalization_merges_same_capability_and_polarity_only():
+    base = PlannedPrediction(
+        capability_ref="cap-" + "1" * 20,
+        polarity=ConditionPolarity.CONTRADICT,
+        rationale="One bounded refutation test.",
+        distinguishes=("alt-one",),
+    )
+    plan = VerificationPlanDraft(
+        mechanism_id="mech-" + "2" * 20,
+        predictions=(
+            base,
+            base.model_copy(update={"distinguishes": ("alt-two",)}),
+            base.model_copy(update={
+                "capability_ref": "cap-" + "3" * 20,
+                "polarity": ConditionPolarity.SUPPORT,
+                "distinguishes": (),
+            }),
+        ),
+    )
+    normalized, repairs = normalize_verification_plan(plan)
+    assert repairs == ("merged_duplicate_capability_predictions",)
+    assert len(normalized.predictions) == 2
+    assert normalized.predictions[0].distinguishes == ("alt-one", "alt-two")
+
+
+def test_two_stage_planner_gets_one_bounded_retry_without_changing_mechanism():
+    planner = TwoStagePlanner(fail_first=True)
+    runner, _, _, _ = run(TwoStageDiscoverer(), verification_planner=planner)
+    assert planner.calls == 2
+    events = runner.transcript.events
+    frozen = next(event.payload["mechanism"] for event in events
+                  if event.event_type == EventType.MECHANISM_DRAFT_FROZEN)
+    compiled = next(event.payload for event in events
+                    if event.event_type == EventType.VERIFICATION_PLAN_COMPILED)
+    assert compiled["attempt"] == 2
+    assert compiled["mechanism_digest"] == frozen["digest"]
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_RETRIED for event in events) == 1
+    assert RecordedReplay.verify(events).valid
+
+    failed = TwoStagePlanner(always_fail=True)
+    runner, _, _, _ = run(TwoStageDiscoverer(), verification_planner=failed)
+    assert failed.calls == 2
+    assert not runner.dynamic_candidate_options
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_RETRIED
+               for event in runner.transcript.events) == 1
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_two_stage_planner_retries_one_transient_invocation_failure():
+    class TransientPlanner(TwoStagePlanner):
+        def plan(self, context):
+            if self.calls == 0:
+                self.calls += 1
+                raise RuntimeError("private provider failure")
+            return super().plan(context)
+
+    planner = TransientPlanner()
+    runner, _, _, _ = run(TwoStageDiscoverer(), verification_planner=planner)
+    assert planner.calls == 2
+    assert runner.dynamic_candidate_options
+    assert "private provider failure" not in str(runner.transcript.events)
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_RETRIED
+               for event in runner.transcript.events) == 1
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
 def test_unknown_signal_recipe_is_rejected_before_query():
     raw = registry().model_dump()
     raw["signals"][0]["query"]["request"]["window"] = {
@@ -636,7 +867,12 @@ def test_factory_registers_jvm_thread_rules_for_an_issued_service():
     rejected = next(
         spec for spec in registry.signals if spec.signal == "thread_pool_rejected_tasks"
     )
-    assert rejected.independent_group == "thread_pool_failure"
+    assert rejected.independent_group == "thread_pool_saturation"
+    gc_groups = {
+        spec.independent_group for spec in registry.signals
+        if spec.signal in {"jvm_gc_collection_delta", "jvm_gc_pause_seconds_delta"}
+    }
+    assert gc_groups == {"jvm_gc_activity"}
     assert {spec.entity_ref for spec in registry.signals} == {"ent-inventory"}
     assert "thread_pool_max" not in rules
     assert "jvm_heap_max_bytes" not in rules

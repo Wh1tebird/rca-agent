@@ -53,15 +53,15 @@ METRIC_SIGNAL_CONTRACTS = {
         "description": "source-provided aggregate maximum-thread statistic",
     },
     "thread_pool_active": {
-        "unit": None, "group": "thread_pool_activity",
+        "unit": None, "group": "thread_pool_saturation",
         "description": "source-provided aggregate active-thread statistic",
     },
     "thread_pool_queue_depth": {
-        "unit": "count", "group": "thread_pool_queueing",
+        "unit": "count", "group": "thread_pool_saturation",
         "description": "aggregate application thread-pool queue depth",
     },
     "thread_pool_rejected_tasks": {
-        "unit": "count", "group": "thread_pool_failure",
+        "unit": "count", "group": "thread_pool_saturation",
         "description": "the aggregate application thread-pool rejected-task signal is positive",
         "comparison": "gte", "threshold": 1, "source": "configuration",
     },
@@ -86,23 +86,23 @@ METRIC_SIGNAL_CONTRACTS = {
         "description": "observed aggregate maximum JVM heap",
     },
     "jvm_gc_collection_delta": {
-        "unit": "count", "group": "jvm_gc_frequency",
+        "unit": "count", "group": "jvm_gc_activity",
         "description": "aggregate JVM garbage-collection count delta",
     },
     "jvm_gc_pause_seconds_delta": {
-        "unit": "s", "group": "jvm_gc_pause",
+        "unit": "s", "group": "jvm_gc_activity",
         "description": "aggregate JVM garbage-collection pause-time delta",
     },
 }
 
 BASELINE_SIGNAL_CONTRACTS = {
     "thread_pool_active_baseline_ratio": {
-        "base_signal": "thread_pool_active", "group": "thread_pool_activity",
+        "base_signal": "thread_pool_active", "group": "thread_pool_saturation",
         "description": "active thread-pool fraction increased at least twofold from baseline",
         "threshold": 2.0,
     },
     "thread_pool_queue_depth_baseline_ratio": {
-        "base_signal": "thread_pool_queue_depth", "group": "thread_pool_queueing",
+        "base_signal": "thread_pool_queue_depth", "group": "thread_pool_saturation",
         "description": "thread-pool queue depth increased materially from baseline",
         "threshold": 1.5,
     },
@@ -127,12 +127,12 @@ BASELINE_SIGNAL_CONTRACTS = {
         "threshold": 1.4,
     },
     "jvm_gc_collection_delta_baseline_ratio": {
-        "base_signal": "jvm_gc_collection_delta", "group": "jvm_gc_frequency",
+        "base_signal": "jvm_gc_collection_delta", "group": "jvm_gc_activity",
         "description": "generic garbage-collection frequency increased at least threefold",
         "threshold": 3.0,
     },
     "jvm_gc_pause_seconds_delta_baseline_ratio": {
-        "base_signal": "jvm_gc_pause_seconds_delta", "group": "jvm_gc_pause",
+        "base_signal": "jvm_gc_pause_seconds_delta", "group": "jvm_gc_activity",
         "description": "generic garbage-collection pause time increased at least tenfold",
         "threshold": 10.0,
     },

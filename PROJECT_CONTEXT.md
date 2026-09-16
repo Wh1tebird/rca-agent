@@ -244,3 +244,25 @@ rule, entity, polarity or causal explanation. On the rerun, 6/12 cases had a raw
 mechanism verified. The safe mechanical repair did not fire because the observed failures required
 entity/rule grounding or evidence capability rather than harmless text normalization. See
 `analysis/jvm_discovery_funnel.md` and `analysis/jvm_discovery_funnel_interpretation.md`.
+
+The next increment splits dynamic discovery into two structured calls over the same DeepSeek model
+binding. Mechanism Discovery sees incident evidence and the issued entity graph, but no Signal/Rule
+inventory; it proposes mechanism, entity, explanation and alternatives. Runner freezes accepted
+mechanisms. Verification Planner sees those immutable mechanisms plus opaque capability handles and
+selects evidence checks. It gets at most one bounded retry for invocation or compilation failure and
+cannot rewrite causal semantics. Transcript and Replay bind drafts, frozen digests, plans, retries
+and compiled candidates.
+
+The clean 12-case rerun compiled at least one mechanism in 12/12 cases versus 7/12 in the one-stage
+baseline. All five GT-like raw mechanisms passed the mechanism contract, versus four of six before.
+Correct `DISCOVERED_VERIFIED` remained 2/12 (t055 thread exhaustion and t009 memory pressure), raw
+GT recall was 5/12, and wrong verification remained 0. Planner retry recovered a compilable plan in
+5/7 attempted cases, but rescued no additional GT-like result. The split therefore improves
+contract reliability, not demonstrated semantic recall or final accuracy.
+
+An initial naive split exposed four wrong verifications because sibling explanations reused generic
+correlated evidence. The production revision makes siblings mandatory peer alternatives, permits
+only contradiction checks to discharge alternatives, groups correlated thread-pool/GC evidence,
+and blocks promotion while another same-origin mechanism retains two matched independent support
+groups. See `analysis/jvm_two_stage_final.md` and
+`analysis/jvm_two_stage_final_interpretation.md`.

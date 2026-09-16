@@ -3,9 +3,12 @@ from pydantic import SecretStr
 from rca_agent.deepseek_policy import (
     DEFAULT_DEEPSEEK_MODEL,
     create_deepseek_chat_model,
+    create_deepseek_discovery_pipeline,
     create_deepseek_policy,
 )
+from rca_agent.langchain_discovery import LangChainMechanismDiscoveryAdapter
 from rca_agent.langchain_policy import LangChainPolicyAdapter
+from rca_agent.langchain_verification_planner import LangChainVerificationPlannerAdapter
 
 
 def test_deepseek_model_uses_accuracy_first_agent_configuration():
@@ -25,6 +28,12 @@ def test_deepseek_policy_binds_to_closed_structured_output_without_network_acces
     policy = create_deepseek_policy(api_key=SecretStr("test-only-secret"))
 
     assert isinstance(policy, LangChainPolicyAdapter)
+
+    discovery, planner = create_deepseek_discovery_pipeline(
+        api_key=SecretStr("test-only-secret")
+    )
+    assert isinstance(discovery, LangChainMechanismDiscoveryAdapter)
+    assert isinstance(planner, LangChainVerificationPlannerAdapter)
 
 
 def test_deepseek_model_reads_default_environment_credential(monkeypatch):

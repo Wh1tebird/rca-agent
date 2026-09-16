@@ -70,6 +70,13 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
     initially_accepted = [item for item in drafts if item["initial_status"] == "accepted"]
     finally_accepted = [item for item in drafts if item["final_status"] == "accepted"]
     repaired = [item for item in drafts if item.get("repair_actions")]
+    plan_events = result.get("verification_plan_events", {})
+    retry_compiled = [
+        item for item in plan_events.get("compiled", ()) if item.get("attempt") == 2
+    ]
+    raw_gt_ids = {
+        item.get("mechanism_id") for item in raw_matched if item.get("mechanism_id")
+    }
     matched = [
         mechanism for mechanism in mechanisms
         if any(mechanism_matches(root_cause, mechanism) for root_cause in root_causes)
@@ -97,6 +104,13 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "gt_contract_passed_after_repair": any(
             item in finally_accepted for item in raw_matched
+        ),
+        "planner_retry_attempted": any(
+            item.get("attempt") == 2 for item in plan_events.get("generated", ())
+        ),
+        "planner_retry_succeeded": bool(retry_compiled),
+        "gt_planner_retry_succeeded": any(
+            item.get("mechanism_id") in raw_gt_ids for item in retry_compiled
         ),
         "gt_mechanism_proposed": bool(matched),
         "matched_mechanisms": matched,
@@ -151,6 +165,15 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
         "gt_contract_passed_after_repair": sum(
             item.get("gt_contract_passed_after_repair", False) for item in scores
         ),
+        "planner_retry_attempted": sum(
+            item.get("planner_retry_attempted", False) for item in scores
+        ),
+        "planner_retry_succeeded": sum(
+            item.get("planner_retry_succeeded", False) for item in scores
+        ),
+        "gt_planner_retry_succeeded": sum(
+            item.get("gt_planner_retry_succeeded", False) for item in scores
+        ),
         "gt_mechanism_proposed": sum(item["gt_mechanism_proposed"] for item in scores),
         "discovered_verified": sum(item["discovered_verified"] for item in scores),
         "correct_verified": sum(item["correct_verified"] for item in scores),
@@ -200,6 +223,9 @@ def render_funnel_markdown(payload: dict[str, Any]) -> str:
         f"| Mechanical repair attempted | {summary['mechanical_repair_attempted']} |",
         f"| Mechanical repair succeeded | {summary['mechanical_repair_succeeded']} |",
         f"| GT-like draft passed after repair | {summary['gt_contract_passed_after_repair']} |",
+        f"| Planner retry attempted | {summary['planner_retry_attempted']} |",
+        f"| Planner retry succeeded | {summary['planner_retry_succeeded']} |",
+        f"| GT-like plan rescued by retry | {summary['gt_planner_retry_succeeded']} |",
         f"| Correct `DISCOVERED_VERIFIED` | {summary['correct_verified']} |",
         f"| Wrong `DISCOVERED_VERIFIED` | {summary['wrong_verified']} |",
         "",

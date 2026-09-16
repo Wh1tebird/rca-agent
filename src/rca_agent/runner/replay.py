@@ -65,6 +65,8 @@ class RecordedReplay:
         verification_report = None
         discovery_refs = ()
         discovery_queries = ()
+        frozen_mechanisms = {}
+        planner_retry_seen = False
         for expected_sequence, event in enumerate(events, start=1):
             if event.episode_id != episode_id:
                 raise ReplayValidationError("episode ID changed inside transcript")
@@ -116,6 +118,68 @@ class RecordedReplay:
                 ):
                     raise ReplayValidationError("discovery evidence snapshot mismatch")
                 provider.register_dynamic(compiled)
+                mechanism_id = event.payload.get("mechanism_id")
+                if mechanism_id is not None:
+                    frozen = frozen_mechanisms.get(mechanism_id)
+                    if frozen is None or event.payload.get("mechanism_digest") != frozen.digest:
+                        raise ReplayValidationError("dynamic candidate changed frozen mechanism")
+            elif event.event_type == EventType.MECHANISM_DRAFT_GENERATED:
+                from rca_agent.core.dynamic import MechanismDraft
+
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("mechanism draft is out of order")
+                MechanismDraft.model_validate(event.payload["draft"])
+            elif event.event_type == EventType.MECHANISM_DRAFT_REJECTED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("mechanism rejection is out of order")
+            elif event.event_type == EventType.MECHANISM_DRAFT_FROZEN:
+                from rca_agent.core.dynamic import FrozenMechanism, MechanismDraft, freeze_mechanism
+
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("mechanism freeze is out of order")
+                frozen = FrozenMechanism.model_validate(event.payload["mechanism"])
+                draft = MechanismDraft.model_validate(
+                    frozen.model_dump(exclude={"mechanism_id", "digest"})
+                )
+                if freeze_mechanism(draft).model_dump() != frozen.model_dump():
+                    raise ReplayValidationError("frozen mechanism digest is invalid")
+                if frozen.mechanism_id in frozen_mechanisms:
+                    raise ReplayValidationError("mechanism frozen twice")
+                frozen_mechanisms[frozen.mechanism_id] = frozen
+            elif event.event_type == EventType.VERIFICATION_PLAN_RETRIED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("verification retry is out of order")
+                if planner_retry_seen:
+                    raise ReplayValidationError("verification planner retried more than once")
+                if not set(event.payload["mechanism_ids"]) <= frozen_mechanisms.keys():
+                    raise ReplayValidationError("retry references unknown frozen mechanism")
+                planner_retry_seen = True
+            elif event.event_type in {
+                EventType.VERIFICATION_PLAN_GENERATED,
+                EventType.VERIFICATION_PLAN_COMPILED,
+            }:
+                from rca_agent.core.dynamic import VerificationPlanDraft
+
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("verification plan is out of order")
+                plan = VerificationPlanDraft.model_validate(event.payload["plan"])
+                if plan.mechanism_id not in frozen_mechanisms:
+                    raise ReplayValidationError("plan references unknown frozen mechanism")
+                if event.payload["attempt"] not in {1, 2}:
+                    raise ReplayValidationError("invalid verification-plan attempt")
+                if event.payload["attempt"] == 2 and not planner_retry_seen:
+                    raise ReplayValidationError("verification retry plan has no retry event")
+                if event.event_type == EventType.VERIFICATION_PLAN_COMPILED:
+                    frozen = frozen_mechanisms[plan.mechanism_id]
+                    if event.payload["mechanism_digest"] != frozen.digest:
+                        raise ReplayValidationError("compiled plan changed frozen mechanism")
+            elif event.event_type == EventType.VERIFICATION_PLAN_REJECTED:
+                if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
+                    raise ReplayValidationError("verification rejection is out of order")
+                if event.payload["mechanism_id"] not in frozen_mechanisms:
+                    raise ReplayValidationError("rejected plan references unknown mechanism")
+                if event.payload["attempt"] == 2 and not planner_retry_seen:
+                    raise ReplayValidationError("retry rejection has no retry event")
             elif event.event_type == EventType.DISCOVERY_DRAFT_EVALUATED:
                 if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
                     raise ReplayValidationError("discovery draft evaluation is out of order")

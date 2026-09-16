@@ -1,5 +1,35 @@
 # RCA Agent handoff
 
+## Latest increment — two-stage discovery and planning
+
+Dynamic unknown-root-cause work now uses two adapters over one DeepSeek model binding. The first
+adapter proposes only mechanisms, causal entities, explanations and alternatives. Runner validates
+and freezes each mechanism. The second adapter receives immutable mechanisms and opaque capability
+handles, and writes verification plans. It may retry once after a bounded planner/compile failure,
+but cannot change mechanism semantics. Transcript and Recorded Replay validate the complete draft,
+freeze, retry, plan and compilation chain. The legacy one-stage adapter remains supported for
+existing callers.
+
+The final clean 12-case run completed and replayed 12/12, compiled at least one mechanism in 12/12,
+and converted all 5/5 stated GT-like mechanisms through the mechanism contract. The one-stage
+baseline compiled any mechanism in 7/12 and converted 4/6 GT-like raw ideas. Final accuracy did not
+increase: both runs correctly verified 2/12 and wrongly verified 0. The new correct pair is t055
+thread exhaustion and t009 memory pressure. Seven planner retries recovered five compilable plans,
+but no additional GT-like plan. Current evidence therefore says the split fixes much of the
+"thought of it but could not say it in the contract" loss; raw semantic recall and evidence
+discrimination remain the larger bottlenecks.
+
+The first naive split produced four wrong verifications and was not retained as the final design.
+Safety hardening now treats sibling proposals as mandatory alternatives, requires contradiction
+rather than support to distinguish alternatives, groups correlated thread-pool/GC signals, and
+blocks a candidate when a same-origin competitor still has two independent matched support groups.
+A deterministic regression covers this condition. Final results and interpretation are in
+`analysis/jvm_two_stage_final*`.
+
+Next work should repeat the fixed benchmark enough times to quantify model variance, and separately
+stratify semantic misses, capability gaps and evidence-closure failures. Do not add a semantic
+auto-rewriter or weaken `DISCOVERED_VERIFIED`.
+
 ## Latest increment — discovery A/B attribution
 
 Discovery diagnostics now retain raw model drafts before compilation, per-draft initial and final

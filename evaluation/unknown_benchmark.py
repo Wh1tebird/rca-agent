@@ -13,7 +13,7 @@ from langchain_core.runnables import Runnable
 
 from evaluation.ground_truth import FlatGroundTruthRepository
 from rca_agent.core.runtime_registry import rca100_evidence_registry
-from rca_agent.deepseek_policy import create_deepseek_discovery
+from rca_agent.deepseek_policy import create_deepseek_discovery_pipeline
 from rca_agent.environment import Rca100Environment
 from rca_agent.langchain_policy import LangChainPolicyAdapter, PolicyEnvelope
 from rca_agent.langgraph_orchestrator import LangGraphInvestigation
@@ -235,15 +235,17 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     environment = Rca100Environment.from_case(
         args.cases_root, args.case_id, query_budget=args.query_budget,
     )
+    discovery, verification_planner = create_deepseek_discovery_pipeline(
+        model=args.model,
+        timeout_seconds=args.model_timeout_seconds,
+        thinking_enabled=not args.disable_thinking,
+    )
     runner = EpisodeRunner(
         environment,
         max_rounds=args.max_rounds,
         decision_provider=CoreDecisionProvider(frozenset({args.holdout_candidate})),
-        discovery=create_deepseek_discovery(
-            model=args.model,
-            timeout_seconds=args.model_timeout_seconds,
-            thinking_enabled=not args.disable_thinking,
-        ),
+        discovery=discovery,
+        verification_planner=verification_planner,
         evidence_registry=rca100_evidence_registry,
         discovery_timeout_seconds=args.discovery_timeout_seconds,
     )
@@ -269,10 +271,59 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
                          if event.event_type == EventType.DISCOVERY_DRAFT_EVALUATED]
     rejected_payloads = [event.payload for event in runner.transcript.events
                          if event.event_type == EventType.DISCOVERY_PAYLOAD_REJECTED]
+    mechanism_generated = [event.payload for event in runner.transcript.events
+                           if event.event_type == EventType.MECHANISM_DRAFT_GENERATED]
+    mechanism_frozen = [event.payload for event in runner.transcript.events
+                        if event.event_type == EventType.MECHANISM_DRAFT_FROZEN]
+    mechanism_rejected = [event.payload for event in runner.transcript.events
+                          if event.event_type == EventType.MECHANISM_DRAFT_REJECTED]
+    plan_generated = [event.payload for event in runner.transcript.events
+                      if event.event_type == EventType.VERIFICATION_PLAN_GENERATED]
+    plan_rejected = [event.payload for event in runner.transcript.events
+                     if event.event_type == EventType.VERIFICATION_PLAN_REJECTED]
+    plan_compiled = [event.payload for event in runner.transcript.events
+                     if event.event_type == EventType.VERIFICATION_PLAN_COMPILED]
+    frozen_by_index = {
+        item["draft_index"]: item["mechanism"] for item in mechanism_frozen
+    }
+    mechanism_errors = {
+        item["draft_index"]: item["error_code"] for item in mechanism_rejected
+    }
+    two_stage_drafts = []
+    for item in mechanism_generated:
+        frozen = frozen_by_index.get(item["draft_index"])
+        mechanism_id = frozen.get("mechanism_id") if frozen else None
+        first_rejection = next((event["error_code"] for event in plan_rejected
+                                if event["mechanism_id"] == mechanism_id
+                                and event["attempt"] == 1), None)
+        final_rejection = next((event["error_code"] for event in reversed(plan_rejected)
+                                if event["mechanism_id"] == mechanism_id), None)
+        initial_compile = next((event for event in plan_compiled
+                                if event["mechanism_id"] == mechanism_id
+                                and event["attempt"] == 1), None)
+        final_compile = next((event for event in plan_compiled
+                              if event["mechanism_id"] == mechanism_id), None)
+        mechanism_error = mechanism_errors.get(item["draft_index"])
+        two_stage_drafts.append({
+            "draft_index": item["draft_index"],
+            "mechanism_id": mechanism_id,
+            "raw_draft": item["draft"],
+            "final_draft": item["draft"],
+            "initial_status": "accepted" if initial_compile else "rejected",
+            "initial_error": mechanism_error or first_rejection,
+            "repair_actions": (),
+            "final_status": "accepted" if final_compile else "rejected",
+            "final_error": None if final_compile else mechanism_error or final_rejection,
+            "registration": final_compile.get("registration", "none")
+            if final_compile else "none",
+        })
     invalid_drafts = []
     for rejection in rejected_payloads:
         raw_payload = rejection.get("raw_payload")
-        hypotheses = raw_payload.get("hypotheses", ()) if isinstance(raw_payload, dict) else ()
+        hypotheses = (
+            raw_payload.get("hypotheses", raw_payload.get("mechanisms", ()))
+            if isinstance(raw_payload, dict) else ()
+        )
         for draft_index, raw_draft in enumerate(hypotheses):
             if isinstance(raw_draft, dict) and isinstance(raw_draft.get("mechanism"), str):
                 invalid_drafts.append({
@@ -319,7 +370,13 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             "alternatives": item["compiled"]["alternatives"],
             "predictions": item["compiled"]["predictions"],
         } for item in registered],
-        "raw_discovery_drafts": [*draft_evaluations, *invalid_drafts],
+        "raw_discovery_drafts": [*draft_evaluations, *two_stage_drafts, *invalid_drafts],
+        "raw_mechanism_drafts": mechanism_generated,
+        "verification_plan_events": {
+            "generated": plan_generated,
+            "rejected": plan_rejected,
+            "compiled": plan_compiled,
+        },
         "discovery_payload_rejections": rejected_payloads,
         "verification": verification[-1] if verification else None,
         "discovery": discovery[-1] if discovery else None,
