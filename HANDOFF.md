@@ -1,5 +1,143 @@
 # RCA Agent handoff
 
+## Latest increment — 2026-09-18 inquiry retention and additive feedback
+
+Completed the bounded candidate-retention and feedback implementation without changing Core's
+generic verification standard. Every valid inquiry round is transcripted before query execution.
+Exact-text candidate records survive model ID reuse and later omissions; the handoff and Recorded
+Replay check them against those rounds. Answer Artifacts return tentative candidates with their
+query/Observation references, Discovery disposition, formal mechanism links and Core evidence
+status. Ideas remain visible even if Discovery does not run or fails.
+
+The existing Verification Planner has a separate additive structured response for Core feedback:
+the model supplies only 1–2 new capability predictions, while Runner keeps old predictions,
+recompiles the same frozen mechanism with the original discovery snapshot, versions the candidate,
+executes new bounded queries and asks Core to reassess. Transcript and Replay validate the revision
+and old evidence binding. A fixed Graph test reached `DISCOVERED_VERIFIED` through this route;
+failed candidates are not reopened. The inquiry benchmark now accepts `--inquiry-query-limit` to
+reserve budget for verification and feedback. Ruff and all 197 tests passed.
+
+Three distinct Qwen thinking/json_schema Case probes completed with valid Replay; no 12-case
+batch was run. t007 retained 3/3 inquiry ideas and compiled two, but Core rejected the GT-like
+thread-pool plan's evidence. t055 retained 3/3, while Discovery timed out. t021 retained 3/3 and
+recorded both inquiry rounds in Transcript; Discovery discarded the ideas and compiled none. No
+real Qwen probe offered an eligible nonfailed compiled candidate for additive feedback, so live
+feedback success remains unobserved. Results and exact limits are in
+`analysis/inquiry_retention_feedback_acceptance.md` and `analysis/qwen_chain_smoke_20260918/`.
+Do not report improved model recall or end-to-end verification from these three probes. A future
+evaluation may select a naturally unresolved, compilable candidate to observe real feedback, then
+run the separately approved 12-case comparison.
+
+## Latest increment — 2026-09-17 local Qwen model adapter
+
+Added `src/rca_agent/qwen_policy.py` and a secret-free OpenAI-compatible model factory. The
+single-case and batch holdout benchmarks select Qwen3-30B-A3B-Thinking-2507 by default and retain
+`--provider deepseek` for comparison. The API key comes only from `RCA_LOCAL_API_KEY` or a hidden
+interactive terminal prompt. The model factory rejects credentials embedded in URLs and
+`/chat/completions` used as the base URL. Public HTTP requires explicit
+`--allow-insecure-http`; the user approved this exception after HTTPS on the advertised port
+failed and the private address proved unreachable. The user placed the key into the macOS login
+keychain under `rca-agent-qwen-local`; the test process reads it into an environment variable at
+launch, while the key is absent from tool arguments, source and reports. The clipboard was cleared.
+The complete Qwen 12-case diagnostic finished with 1 GT-like formal mechanism, 7 compiled cases,
+0 correct and 0 wrong verified. DeepSeek's historical 12-case run had 1, 11 and 0/0 respectively.
+Qwen had 16 acquisition format/choice errors versus DeepSeek's 1, so model-intelligence claims
+are not justified. A JSON-schema compatibility probe succeeded, but its follow-up batch was
+stopped at the user's request; do not include partial results in accuracy comparisons. See
+`analysis/qwen_model_comparison.md`. No further provider calls should be made without a new request.
+
+## Latest increment — 2026-09-17 inquiry handoff and feedback
+
+The inquiry arm now records bounded field-level structured-output diagnostics and tolerates longer
+mechanism explanations or more than two suggested queries (only the first two execute). A typed
+handoff carries tentative hypotheses, evidence questions, and issued query results into formal
+Discovery. Runner validates the issued references; Transcript and Recorded Replay bind the handoff.
+Discovery can state why it kept, revised or discarded each inquiry hypothesis. An optional one-pass
+Core feedback route can execute up to two still-unattempted queries from a frozen verification plan
+and bind their results through Runner. It does not change the frozen mechanism.
+
+The complete handoff-only 12-case live run finished and replayed all 12, selected 120 acquisition
+queries, and recovered 3 model-output errors with bounded retry. Final inquiry drafts had six
+GT-like lexical directions; formal Discovery retained two. Correct/wrong verification stayed 0/0.
+No Core feedback query was eligible after existing verification. A second 12-case run exercised
+the disposition schema. After the user recharged, only the three cases interrupted by HTTP 402
+(t003, t004, t098) were rerun: 12/12 Discovery calls completed, 12/12 Replays passed, and 36/36
+dispositions were reported. It compiled 11 cases, retained one GT-like formal mechanism, and had
+0/0 correct/wrong verification, with zero eligible Core feedback queries. Ruff and all 185 tests
+pass. Detailed limitations and per-run results: `analysis/inquiry_handoff_acceptance.md`.
+
+The planned three complete repetitions per arm remain outstanding; no further paid runs were made
+to conserve credits. Do not treat the earlier provider interruption as a reasoning failure. The next functional extension,
+if pursued, is a separately versioned verification plan for a genuinely new distinguishing
+prediction; rerunning already executed frozen queries cannot resolve missing upstream telemetry.
+
+## Latest increment — 2026-09-17 evidence-need-guided acquisition
+
+Added optional `--acquisition inquiry` for the 12-Case Catalog-holdout benchmark. One structured
+DeepSeek binding proposes revisable preliminary hypotheses and evidence questions, then chooses
+one or two host-built queries per round. The host maps short `qN` menu references back to opaque
+typed Actions, records evidence-need bindings, and Runner executes under existing budgets.
+At most five rounds / ten queries and one output retry per round; old fixed and AI modes remain.
+Core verification and Replay are unchanged. Ruff and all 181 tests pass.
+
+After two interface revisions and a final complete rerun: 12/12 cases completed with valid Replay;
+86 acquisition queries selected over 47 model selection calls; 11 parser errors, no remaining
+reference/entity-binding errors. Formal Discovery's raw GT-like recall was 4/12 versus 2/12 in the
+prior AI-query arm, but eligible evidence was 79/162 versus 73/139 and alternative resolution was
+14/144 versus 11/110. Both arms had zero correct and zero wrong verified results. This is a
+diagnostic single-run difference, not proven improvement. t040 and t004 selected no exploratory
+queries because two consecutive structured outputs failed to parse. Preliminary ideas are not
+currently handed explicitly to formal Discovery. See `analysis/inquiry_acquisition_acceptance.md`.
+
+Next work: make structured inquiry output more reliable, add a bounded and auditable handoff from
+revisable exploration to official Discovery without granting decision authority, and repeat the
+same 12 cases multiple times before claiming gains. Do not lower Core's alternative/refutation
+requirements to improve verified counts.
+
+## Final completion — capability plan
+
+All five plan items are implemented and audited. Added the remaining 17 source mappings, making
+35 new / 65 total public entity-signal pairs; the raw-field unmapped inventory is empty. This does
+not fix the 18 pre-existing initialization gaps or create absent transport/Full-GC telemetry.
+Counter/error-ratio semantics were audited over all 103 cases; unsupported derivations are now
+explicit contract entries with measured reasons in `analysis/metric_semantics_audit.md`.
+
+Added a bounded AI query selector with opaque references; the fixed acquisition screen remains
+default and `--acquisition ai` enables the alternative. Completed both 12-case arms: fixed compiled
+12, AI compiled 11, 24/24 replays, zero correct and zero wrong verified. AI selected 120 queries,
+including new Waiting/Timed Waiting signals, with no selector failures. Its query success and
+evidence coverage improved, but raw GT recall and alternative resolution did not. No accuracy
+improvement is claimed. Detailed per-candidate coverage inputs and post-freeze semantic review are
+saved; the review is by the coding agent, not an independent expert annotation.
+
+Final acceptance: `analysis/capability_plan_acceptance.md`, `capability_final_acceptance.md`,
+`capability_final_coverage.json`, and `capability_semantic_review.md`. Prior expansion delivery
+reports remain historical snapshots. Future work is acquisition quality and new upstream
+discriminator telemetry; it is not unfinished implementation of this plan.
+
+## Latest increment — 2026-09-16 capability expansion
+
+Added 18 public metric mappings, typed public metric descriptors and 15 explicit missing-source
+signals. Registered neutral recipes for issued instance/deployment/Pod entities in addition to
+existing service/operation/node capabilities. Added request-volume, latency and error-ratio
+equal-window recipes with conservative support eligibility; request-volume averages have no
+generic traffic-refutation authority. Seven new aggregate thread/pool statistics remain context
+only because scale and counter/reset semantics are not portable.
+
+Updated the executable capability audit and completed 172 tests plus Ruff. The same 12-case
+DeepSeek diagnostic completed with 12 compiled, 12 valid replays, 3 raw GT-like mechanisms,
+10 supported, 2 inconclusive, 0 correct verified and 0 wrong verified. Eight cases selected new
+request-volume rules; 12 retained unresolved alternatives (previously 11). This is not demonstrated
+accuracy improvement. The acquisition screen and budgets are unchanged for comparability.
+
+Reports: `analysis/capability_expansion_comparison.md`, `analysis/capability_expansion_delivery.md`,
+`analysis/capability_expansion_summary.json`, and per-case JSON in `analysis/capability_expansion_run/`.
+General Policy now sees neutral metric inventory, but this fixed benchmark uses scripted acquisition.
+Follow-up: evaluate bounded capability-aware acquisition separately; validate upstream aggregate
+semantics before adding task rates/pool utilization, and obtain genuinely missing discriminator
+telemetry before expecting verification closure. Existing unmapped raw metrics remain listed in
+the capability matrix; this increment does not claim all raw fields are exposed.
+
 ## Latest increment — failed competitors and refutation semantics
 
 Dynamic verification now has explicit `verified`, `unresolved` and `failed` states. Observed support

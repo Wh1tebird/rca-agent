@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -35,6 +36,7 @@ class InvestigationGraphState(TypedDict, total=False):
     answer: AnswerArtifact
     discovery_requested: bool
     deferred_stop: bool
+    feedback_attempted: bool
 
 
 class LangGraphRunReport(BaseModel):
@@ -50,9 +52,21 @@ class LangGraphRunReport(BaseModel):
 class LangGraphInvestigation:
     """Non-authoritative orchestration around the existing trusted EpisodeRunner."""
 
-    def __init__(self, runner: EpisodeRunner, policy: LangChainPolicyAdapter) -> None:
+    def __init__(
+        self,
+        runner: EpisodeRunner,
+        policy: LangChainPolicyAdapter,
+        discovery_notes_provider: Callable[[tuple[dict[str, Any], ...]],
+                                           dict[str, Any] | None] | None = None,
+        inquiry_rounds_provider: Callable[[], tuple[dict[str, Any], ...]] | None = None,
+        enable_core_feedback: bool = False,
+    ) -> None:
         self._runner = runner
         self._policy = policy
+        self._discovery_notes_provider = discovery_notes_provider
+        self._inquiry_rounds_provider = inquiry_rounds_provider
+        self._recorded_inquiry_rounds = 0
+        self._enable_core_feedback = enable_core_feedback
         self._bootstrap = None
         self._candidate_options: tuple[CandidateOption, ...] = ()
         self._graph_steps = 0
@@ -95,6 +109,7 @@ class LangGraphInvestigation:
         builder.add_node("finalize", self._finalize_node)
         builder.add_node("discover", self._discovery_node)
         builder.add_node("verify_discovery", self._verify_discovery_node)
+        builder.add_node("feedback", self._feedback_node)
         builder.add_edge(START, "policy")
         builder.add_conditional_edges(
             "policy",
@@ -110,10 +125,12 @@ class LangGraphInvestigation:
             "assess",
             self._route_after_assess,
             {"policy": "policy", "finalize": "finalize", "discover": "discover",
-             "verify_discovery": "verify_discovery"},
+             "verify_discovery": "verify_discovery", "feedback": "feedback"},
         )
         builder.add_edge("discover", "assess")
         builder.add_conditional_edges("verify_discovery", self._route_after_execute,
+                                      {"assess": "assess", "end": END})
+        builder.add_conditional_edges("feedback", self._route_after_execute,
                                       {"assess": "assess", "end": END})
         builder.add_edge("finalize", END)
         return builder.compile(name="rca-agent-investigation")
@@ -131,6 +148,11 @@ class LangGraphInvestigation:
                     candidate_frontier=state["candidate_frontier"],
                 )
             )
+            if self._inquiry_rounds_provider is not None:
+                rounds = self._inquiry_rounds_provider()
+                for record in rounds[self._recorded_inquiry_rounds:]:
+                    self._runner.record_inquiry_round(record)
+                    self._recorded_inquiry_rounds += 1
         except Exception as exc:  # noqa: BLE001 - only the error type crosses the trust boundary
             self._runner.reject_raw_action(
                 {"source": "langchain_policy"},
@@ -146,7 +168,9 @@ class LangGraphInvestigation:
 
     def _discovery_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         self._graph_steps += 1
-        result = self._runner.discover_candidates()
+        notes = (self._discovery_notes_provider(state.get("history", ()))
+                 if self._discovery_notes_provider is not None else None)
+        result = self._runner.discover_candidates(inquiry_handoff=notes)
         assert self._bootstrap is not None
         self._candidate_options = (
             *_candidate_options(
@@ -168,6 +192,37 @@ class LangGraphInvestigation:
             "kind": "discovery_query_completed",
             "result": result.model_dump(mode="json") if result is not None else None,
         })}
+
+    def _feedback_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
+        self._graph_steps += 1
+        if self._runner.feedback_plan_available():
+            planned = self._runner.extend_verification_plan()
+            return {"feedback_attempted": True,
+                    "history": (*state.get("history", ()),
+                                {"kind": "core_feedback_plan", "result": planned})}
+        records = []
+        for hypothesis_id, signal, action in self._runner.feedback_query_options()[:2]:
+            response = self._runner.handle(action)
+            if isinstance(response, AnswerArtifact):
+                return {"answer": response, "feedback_attempted": True}
+            observation_refs = ()
+            if isinstance(response, ToolResponse) and response.observations:
+                observation_refs = tuple(item.observation_id for item in response.observations)
+                update = self._runner.handle(UpdateCandidateEvidenceAction(
+                    hypothesis_id=hypothesis_id, observation_refs=observation_refs,
+                ))
+                if isinstance(update, AnswerArtifact):
+                    return {"answer": update, "feedback_attempted": True}
+            records.append({"hypothesis_id": hypothesis_id, "signal": signal,
+                            "observation_refs": observation_refs})
+            preview = self._runner.preview_core_assessment()
+            if preview.overall_decision.status in {
+                DecisionStatus.CONFIRMED_ROOT_CAUSE, DecisionStatus.DISCOVERED_VERIFIED,
+            }:
+                break
+        return {"feedback_attempted": True,
+                "history": (*state.get("history", ()), {"kind": "core_feedback",
+                                                  "queries": records})}
 
     def _execute_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         self._graph_steps += 1
@@ -239,12 +294,18 @@ class LangGraphInvestigation:
             in {
                 DecisionStatus.CONFIRMED_ROOT_CAUSE,
                 DecisionStatus.DISCOVERED_VERIFIED,
-                DecisionStatus.MULTIPLE_SUPPORTED,
             }
         ):
             return "finalize"
         if self._runner.should_discover():
             return "discover"
+        if (self._enable_core_feedback and not state.get("feedback_attempted")
+                and (self._runner.feedback_plan_available()
+                     or self._runner.feedback_query_options())):
+            return "feedback"
+        if (state["core_assessment"].overall_decision.status
+                == DecisionStatus.MULTIPLE_SUPPORTED):
+            return "finalize"
         if state.get("deferred_stop"):
             return "finalize"
         return "policy"

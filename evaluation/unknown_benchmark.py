@@ -13,10 +13,19 @@ from langchain_core.runnables import Runnable
 
 from evaluation.ground_truth import FlatGroundTruthRepository
 from rca_agent.core.runtime_registry import rca100_evidence_registry
-from rca_agent.deepseek_policy import create_deepseek_discovery_pipeline
+from rca_agent.deepseek_policy import create_deepseek_chat_model, create_deepseek_discovery_pipeline
 from rca_agent.environment import Rca100Environment
+from rca_agent.langchain_acquisition import (
+    InquiryHandoff,
+    InquiryOutputError,
+    LangChainAcquisitionSelector,
+    LangChainInquiryAdapter,
+    inquiry_candidate_records,
+    query_options,
+)
 from rca_agent.langchain_policy import LangChainPolicyAdapter, PolicyEnvelope
 from rca_agent.langgraph_orchestrator import LangGraphInvestigation
+from rca_agent.local_model import DEFAULT_LOCAL_MODEL, create_local_chat_model
 from rca_agent.models import (
     CallToolAction,
     GetMetricSeriesRequest,
@@ -28,6 +37,7 @@ from rca_agent.models import (
     SubmitHypothesisAction,
     ToolName,
 )
+from rca_agent.qwen_policy import create_qwen_discovery_pipeline
 from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, EventType, RecordedReplay
 
 
@@ -42,7 +52,18 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
         "jvm_heap_used_bytes",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, selector=None, inquiry=None, *, inquiry_query_limit: int = 10) -> None:
+        if not 1 <= inquiry_query_limit <= 10:
+            raise ValueError("inquiry query limit must be between one and ten")
+        self.selector = selector
+        self.inquiry = inquiry
+        self.inquiry_query_limit = inquiry_query_limit
+        self.selection_calls = 0
+        self.selection_errors: list[str] = []
+        self.selection_diagnostics: list[dict[str, Any]] = []
+        self.selected_actions: list[CallToolAction] = []
+        self.selection_queue: list[CallToolAction] = []
+        self.inquiry_drafts: list[dict[str, Any]] = []
         self._step = 0
         self._tried_trace_refs: set[str] = set()
         self._summarized_entities: set[str] = set()
@@ -94,6 +115,13 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
                 request=GetTraceStageBreakdownRequest(trace_ref=next_trace, max_stages=12),
             ))
         if participant_seen or has_stage_context:
+            if self.selector is not None or self.inquiry is not None:
+                action = (self._inquiry_screen(context) if self.inquiry is not None
+                          else self._ai_screen(context))
+                if action is not None:
+                    return PolicyEnvelope(action=action)
+                # Signal that acquisition has completed without entering the fixed screen.
+                self._screen_target_refs = ("completed",)
             if self._screen_target_refs is None:
                 self._screen_target_refs = tuple(
                     entity["entity_ref"]
@@ -101,6 +129,8 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
                     if entity["entity_type"] == "apm.service"
                 )[:2]
             for entity_ref in self._screen_target_refs:
+                if self.selector is not None or self.inquiry is not None:
+                    break
                 for signal in self.SCREEN_SIGNALS:
                     key = (entity_ref, signal)
                     if key in self._screened:
@@ -192,6 +222,158 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
             summary="The bounded holdout investigation has completed available verification."
         ))
 
+    def _ai_screen(self, context):
+        if not self.selection_queue and self.selection_calls < 2:
+            self.selection_calls += 1
+            options = query_options(context, _history_entities(context))
+            used = {a.model_dump_json() for a in self.selected_actions}
+            options = {ref: item for ref, item in options.items()
+                       if item["action"].model_dump_json() not in used}
+            try:
+                self.selection_queue = list(self.selector.select(context, options))
+            except Exception as exc:  # noqa: BLE001 - bounded provider failure, no secrets
+                self.selection_errors.append(type(exc).__name__)
+        if self.selection_queue:
+            action = self.selection_queue.pop(0)
+            self.selected_actions.append(action)
+            self._acquisition_actions += 1
+            return action
+        return None
+
+    def _inquiry_screen(self, context):
+        if len(self.selected_actions) >= self.inquiry_query_limit:
+            self.selection_queue.clear()
+            return None
+        if not self.selection_queue and self.selection_calls < 5:
+            self.selection_calls += 1
+            options = query_options(context, _history_entities(context)[:8])
+            used = {a.model_dump_json() for a in self.selected_actions}
+            # The inquiry plans baseline comparisons or entity exploration, not raw series dumps.
+            options = {ref: item for ref, item in options.items()
+                       if item["action"].model_dump_json() not in used
+                       and item["action"].tool_name != ToolName.GET_METRIC_SERIES}
+            observations = _history_observations(context.get("history", ()))
+            compact = [{
+                "signal": item.get("signal"),
+                "entity_ref": item.get("entity_ref"),
+                "data_status": item.get("data_status"),
+                "value": str(item.get("value"))[:500],
+            } for item in observations[-60:]]
+            incident = {
+                "alert": context["bootstrap"]["alert_summary"],
+                "issued_entities": _history_entities(context)[:8],
+                "recent_observations": compact,
+                "previous_inquiry": {
+                    "hypotheses": self.inquiry_drafts[-1]["draft"]["hypotheses"],
+                    "needs": self.inquiry_drafts[-1]["draft"]["needs"],
+                } if self.inquiry_drafts else None,
+                "carried_candidates": [
+                    {"hypothesis_id": item.hypothesis.hypothesis_id,
+                     "mechanism": item.hypothesis.mechanism,
+                     "alternative": item.hypothesis.alternative}
+                    for item in inquiry_candidate_records(self.inquiry_drafts)
+                ],
+            }
+            for attempt in range(2):
+                try:
+                    draft, actions = self.inquiry.plan(incident, options)
+                    remaining = self.inquiry_query_limit - len(self.selected_actions)
+                    self.selection_queue = list(actions[:remaining])
+                    self.inquiry_drafts.append({
+                        "round": self.selection_calls,
+                        "attempt": attempt + 1,
+                        "draft": draft.model_dump(mode="json"),
+                        "selected_actions": [
+                            {"need_id": choice.need_id,
+                             "query_ref": choice.query_ref,
+                             "signal": getattr(action.request, "signal", "related_entity"),
+                             "entity_ref": options[choice.query_ref]["entity"]["entity_ref"],
+                             "action": action.model_dump(mode="json")}
+                            for choice, action in zip(
+                                draft.choices, actions[:remaining], strict=False
+                            )
+                        ],
+                    })
+                    break
+                except Exception as exc:  # noqa: BLE001 - bounded provider failure, no secrets
+                    if isinstance(exc, InquiryOutputError):
+                        self.selection_diagnostics.append({
+                            "round": self.selection_calls, "attempt": attempt + 1,
+                            **exc.diagnostic(),
+                        })
+                    # Only pass a host-authored schema reminder; never echo raw provider text.
+                    safe_validation_errors = {
+                        "duplicate inquiry identifiers",
+                        "inquiry need has no hypothesis",
+                        "invalid inquiry choices",
+                        "inquiry choice is not offered",
+                    }
+                    code = (str(exc) if type(exc) is ValueError
+                            and str(exc) in safe_validation_errors else type(exc).__name__)
+                    self.selection_errors.append(code)
+                    if getattr(exc, "status_code", None) is not None or attempt == 1:
+                        break
+                    incident["validation_error"] = (
+                        "Return valid JSON in the requested schema. Choose unique offered "
+                        "query_refs, each linked to one declared evidence need."
+                    )
+        if self.selection_queue:
+            action = self.selection_queue.pop(0)
+            self.selected_actions.append(action)
+            self._acquisition_actions += 1
+            return action
+        return None
+
+    def discovery_handoff(self, history) -> dict[str, Any] | None:
+        if self.inquiry is None or not self.inquiry_drafts:
+            return None
+        candidates = inquiry_candidate_records(self.inquiry_drafts)
+        candidate_by_key = {
+            (" ".join(item.hypothesis.mechanism.casefold().split()),
+             " ".join(item.hypothesis.alternative.casefold().split())):
+            item.hypothesis.hypothesis_id for item in candidates
+        }
+        responses = {
+            json.dumps(record["action"], sort_keys=True): record["result"]["value"]
+            for record in history
+            if record.get("result", {}).get("kind") == "tool_response"
+        }
+        links = []
+        for round_record in self.inquiry_drafts:
+            questions = {need["need_id"]: need
+                         for need in round_record["draft"]["needs"]}
+            round_candidates = {
+                item["hypothesis_id"]: candidate_by_key[(
+                    " ".join(item["mechanism"].casefold().split()),
+                    " ".join(item["alternative"].casefold().split()),
+                )]
+                for item in round_record["draft"]["hypotheses"]
+            }
+            for selected in round_record["selected_actions"]:
+                response = responses.get(json.dumps(selected["action"], sort_keys=True))
+                if response is None:
+                    continue
+                need = questions[selected["need_id"]]
+                links.append({
+                    "question": need["question"],
+                    "hypothesis_id": round_candidates[need["hypothesis_id"]],
+                    "signal": selected["signal"],
+                    "entity_ref": selected["entity_ref"],
+                    "query_ref": response["query_ref"],
+                    "status": response["status"],
+                    "observation_refs": tuple(
+                        item["observation_id"] for item in response["observations"]
+                    ),
+                })
+        latest = self.inquiry_drafts[-1]
+        return InquiryHandoff(
+            revision=latest["round"],
+            hypotheses=tuple(item.hypothesis for item in candidates),
+            needs=latest["draft"]["needs"],
+            query_links=links[:10],
+            candidate_history=candidates,
+        ).model_dump(mode="json")
+
 
 def _history_observations(history) -> list[dict[str, Any]]:
     observations = []
@@ -232,14 +414,39 @@ def _history_entities(context: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def run_case(args: argparse.Namespace) -> dict[str, Any]:
+    provider = getattr(args, "provider", "deepseek")
+    model_name = args.model or (DEFAULT_LOCAL_MODEL if provider == "qwen-local"
+                                else "deepseek-v4-pro")
+    thinking_enabled = provider == "qwen-local" or not args.disable_thinking
+
+    def chat_model(*, max_retries: int = 0):
+        if provider == "qwen-local":
+            return create_local_chat_model(
+                model=model_name, base_url=getattr(args, "base_url", None),
+                timeout_seconds=args.model_timeout_seconds, max_retries=max_retries,
+                allow_insecure_http=getattr(args, "allow_insecure_http", False),
+            )
+        return create_deepseek_chat_model(
+            model=model_name, timeout_seconds=args.model_timeout_seconds,
+            max_retries=max_retries, thinking_enabled=thinking_enabled,
+        )
+
     environment = Rca100Environment.from_case(
         args.cases_root, args.case_id, query_budget=args.query_budget,
     )
-    discovery, verification_planner = create_deepseek_discovery_pipeline(
-        model=args.model,
-        timeout_seconds=args.model_timeout_seconds,
-        thinking_enabled=not args.disable_thinking,
-    )
+    if provider == "qwen-local":
+        discovery, verification_planner = create_qwen_discovery_pipeline(
+            model=model_name,
+            base_url=getattr(args, "base_url", None),
+            timeout_seconds=args.model_timeout_seconds,
+            allow_insecure_http=getattr(args, "allow_insecure_http", False),
+        )
+    else:
+        discovery, verification_planner = create_deepseek_discovery_pipeline(
+            model=model_name,
+            timeout_seconds=args.model_timeout_seconds,
+            thinking_enabled=thinking_enabled,
+        )
     runner = EpisodeRunner(
         environment,
         max_rounds=args.max_rounds,
@@ -249,8 +456,30 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         evidence_registry=rca100_evidence_registry,
         discovery_timeout_seconds=args.discovery_timeout_seconds,
     )
-    policy = LangChainPolicyAdapter(HoldoutAcquisitionPolicy())
-    report = LangGraphInvestigation(runner, policy).run(recursion_limit=args.recursion_limit)
+    selector = None
+    inquiry = None
+    if getattr(args, "acquisition", "fixed") == "ai":
+        selector = LangChainAcquisitionSelector.from_chat_model(
+            chat_model(), structured_method="json_schema" if provider == "qwen-local"
+            else "json_mode",
+        )
+    elif getattr(args, "acquisition", "fixed") == "inquiry":
+        inquiry = LangChainInquiryAdapter.from_chat_model(
+            chat_model(), structured_method="json_schema" if provider == "qwen-local"
+            else "json_mode",
+        )
+    acquisition = HoldoutAcquisitionPolicy(
+        selector, inquiry,
+        inquiry_query_limit=getattr(args, "inquiry_query_limit", 10),
+    )
+    policy = LangChainPolicyAdapter(acquisition)
+    report = LangGraphInvestigation(
+        runner, policy,
+        discovery_notes_provider=acquisition.discovery_handoff if inquiry is not None else None,
+        inquiry_rounds_provider=(lambda: tuple(acquisition.inquiry_drafts))
+        if inquiry is not None else None,
+        enable_core_feedback=inquiry is not None,
+    ).run(recursion_limit=args.recursion_limit)
     replay = RecordedReplay.verify(runner.transcript.events)
 
     # Ground truth is loaded only after AnswerArtifact freeze and replay verification.
@@ -268,6 +497,8 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     ]
     discovery = [event.payload for event in runner.transcript.events
                  if event.event_type == EventType.DISCOVERY_COMPLETED]
+    discovery_started = [event.payload for event in runner.transcript.events
+                         if event.event_type == EventType.DISCOVERY_STARTED]
     registered = [event.payload for event in runner.transcript.events
                   if event.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED]
     verification = [event.payload for event in runner.transcript.events
@@ -363,9 +594,29 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     }
     return {
         "case_id": args.case_id,
+        "acquisition_mode": getattr(args, "acquisition", "fixed"),
+        "inquiry_query_limit": acquisition.inquiry_query_limit,
+        "acquisition_selection_calls": acquisition.selection_calls,
+        "acquisition_selection_errors": acquisition.selection_errors,
+        "acquisition_selection_diagnostics": acquisition.selection_diagnostics,
+        "acquisition_selected_actions": [a.model_dump(mode="json")
+                                         for a in acquisition.selected_actions],
+        "acquisition_inquiry_drafts": acquisition.inquiry_drafts,
+        "transcript_inquiry_rounds": sum(
+            event.event_type == EventType.INQUIRY_ROUND_RECORDED
+            for event in runner.transcript.events
+        ),
+        "acquisition_handoff": (discovery_started[-1].get("inquiry_handoff")
+                                if discovery_started else None),
+        "inquiry_candidates": [item.model_dump(mode="json")
+                               for item in report.answer.inquiry_candidates],
+        "tool_responses": tool_responses,
+        "registered_candidates": registered,
+        "policy_proposals": [p.model_dump(mode="json") for p in report.answer.policy_proposals],
         "holdout_candidate": args.holdout_candidate,
-        "model": args.model,
-        "thinking_enabled": not args.disable_thinking,
+        "provider": provider,
+        "model": model_name,
+        "thinking_enabled": thinking_enabled,
         "catalog_candidate_visible": args.holdout_candidate not in runner.excluded_catalog_candidate_ids,
         "status": decision.status.value,
         "supported_hypothesis_ids": list(decision.supported_hypothesis_ids),
@@ -393,6 +644,28 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             "expected_fault_id": truth.expected_fault_id,
         },
         "graph_steps": report.graph_steps,
+        "core_feedback_queries": [record for item in report.history
+                                  if item.get("kind") == "core_feedback"
+                                  for record in item["queries"]],
+        "core_feedback_plans": [item["result"] for item in report.history
+                                if item.get("kind") == "core_feedback_plan"],
+        "core_feedback_plan_events": [
+            {"kind": event.event_type.value, **event.payload}
+            for event in runner.transcript.events
+            if event.event_type in {
+                EventType.VERIFICATION_PLAN_EXTENSION_STARTED,
+                EventType.VERIFICATION_PLAN_EXTENSION_REJECTED,
+                EventType.VERIFICATION_PLAN_EXTENDED,
+            }
+        ],
+        "core_feedback_gaps": [{
+            "candidate_id": item.candidate_id,
+            "missing_signals": item.missing_signals,
+            "unavailable_signals": item.unavailable_signals,
+        } for item in report.final_preview.candidate_assessments
+            if item.verification_pending and (
+                item.missing_signals or item.unavailable_signals
+            )],
         "tool_calls": replay.tool_calls,
         "diagnostics": {
             "tool_status_counts": dict(sorted(Counter(
@@ -417,13 +690,18 @@ def parser() -> argparse.ArgumentParser:
     default_dataset = Path.home() / "study/AgenticOpsEval/RCA100"
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--case-id", default="t025")
+    value.add_argument("--acquisition", choices=("fixed", "ai", "inquiry"), default="fixed")
+    value.add_argument("--inquiry-query-limit", type=int, default=10)
     value.add_argument("--holdout-candidate", default="dbNetworkLatency")
     value.add_argument("--cases-root", type=Path,
                        default=Path(os.getenv("RCA100_CASES_ROOT", default_dataset / "cases")))
     value.add_argument("--answer-key-root", type=Path,
                        default=Path(os.getenv("RCA100_ANSWER_KEY_ROOT",
                                                default_dataset / "answer_key")))
-    value.add_argument("--model", default="deepseek-v4-pro")
+    value.add_argument("--provider", choices=("qwen-local", "deepseek"), default="qwen-local")
+    value.add_argument("--model")
+    value.add_argument("--base-url", help="OpenAI-compatible /v1 root; local provider only")
+    value.add_argument("--allow-insecure-http", action="store_true")
     value.add_argument("--disable-thinking", action="store_true")
     value.add_argument("--query-budget", type=int, default=20)
     value.add_argument("--max-rounds", type=int, default=30)

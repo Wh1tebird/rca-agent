@@ -6,11 +6,17 @@ from pathlib import Path
 from typing import Any
 
 from rca_agent.environment._private_adapter import (
+    PUBLIC_METRIC_MAP,
     EntityBinding,
     PrivateRca100Adapter,
     TraceSelection,
 )
 from rca_agent.environment.budget import QueryBudget
+from rca_agent.environment.metric_catalog import (
+    MISSING_SIGNALS,
+    UNSUPPORTED_DERIVATIONS,
+    metric_description,
+)
 from rca_agent.models import (
     CapabilityDescriptor,
     CompareMetricWindowsRequest,
@@ -30,6 +36,7 @@ from rca_agent.models import (
     ToolResponse,
     ToolStatus,
 )
+from rca_agent.models.contract import MetricDescriptor
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
 MAX_WINDOW_SECONDS = 3600
@@ -574,6 +581,14 @@ class Rca100Environment:
 
     @staticmethod
     def _capabilities() -> tuple[CapabilityDescriptor, ...]:
+        metrics = tuple(
+            MetricDescriptor(
+                entity_type=entity_type, signal=signal, unit=spec[2],
+                description=metric_description(signal),
+            )
+            for entity_type, mappings in PUBLIC_METRIC_MAP.items()
+            for signal, spec in mappings.items()
+        )
         return (
             CapabilityDescriptor(
                 tool_name="get_metric_series",
@@ -582,6 +597,9 @@ class Rca100Environment:
                 query_cost=1,
                 max_window_seconds=MAX_WINDOW_SECONDS,
                 max_results=100,
+                metrics=metrics,
+                unavailable_signals=MISSING_SIGNALS,
+                unsupported_derivations=UNSUPPORTED_DERIVATIONS,
             ),
             CapabilityDescriptor(
                 tool_name="compare_metric_windows",
@@ -590,6 +608,7 @@ class Rca100Environment:
                 query_cost=1,
                 max_window_seconds=MAX_WINDOW_SECONDS,
                 max_results=2,
+                metrics=metrics,
             ),
             CapabilityDescriptor(
                 tool_name="list_related_entities",

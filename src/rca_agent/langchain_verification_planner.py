@@ -7,15 +7,17 @@ from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from rca_agent.core.dynamic import VerificationPlanPayload
+from rca_agent.core.dynamic import VerificationPlanExtension, VerificationPlanPayload
 from rca_agent.langchain_discovery import DiscoveryPayloadError, _raw_message_payload
 
 
 class LangChainVerificationPlannerAdapter:
     """Select host-advertised capability handles without changing mechanism semantics."""
 
-    def __init__(self, runnable: Any) -> None:
+    def __init__(self, runnable: Any, extension_runnable: Any | None = None) -> None:
         self._runnable = runnable
+        self._extension_runnable = extension_runnable
+        self.supports_plan_extension = extension_runnable is not None
 
     @classmethod
     def from_chat_model(cls, model: Any, *, structured_method: str = "function_calling"):
@@ -43,7 +45,11 @@ class LangChainVerificationPlannerAdapter:
                     "REFUTATION_SCOPE_MISMATCH, choose a contradict capability whose refutes list "
                     "contains that alternative class. If none exists, leave that alternative "
                     "unreferenced; the host will retain the mechanism as unresolved rather than "
-                    "treating an unrelated signal as proof."
+                    "treating an unrelated signal as proof. When core_feedback is present, copy "
+                    "every existing_plan prediction exactly, then add one or two different "
+                    "capability predictions that address its reported evidence gap. Never remove "
+                    "or change an earlier prediction. If no new executable test exists, return "
+                    "an empty plans list."
                 ),
             ),
             (
@@ -51,11 +57,26 @@ class LangChainVerificationPlannerAdapter:
                 "JSON schema:\n{schema_json}\n\nPlanning context:\n{context_json}",
             ),
         ])
-        return cls(prompt | model.with_structured_output(
-            VerificationPlanPayload,
-            method=structured_method,
-            include_raw=True,
-        ))
+        extension_prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "Return only the advertised JSON schema for an ADDITIVE verification plan. "
+                "The host keeps every existing_plan prediction unchanged. Select one or two "
+                "new capability_ref values not present in existing_plan. Choose tests that "
+                "address core_feedback blockers or distinguish a declared alternative. "
+                "Use only advertised entity-scoped capabilities and copy the frozen mechanism_id. "
+                "Do not change mechanism semantics, thresholds, old predictions or evidence. "
+                "If a missing upstream measurement has no advertised capability, do not invent it."
+            )),
+            ("human", "JSON schema:\n{schema_json}\n\nPlanning context:\n{context_json}"),
+        ])
+        return cls(
+            prompt | model.with_structured_output(
+                VerificationPlanPayload, method=structured_method, include_raw=True,
+            ),
+            extension_prompt | model.with_structured_output(
+                VerificationPlanExtension, method=structured_method, include_raw=True,
+            ),
+        )
 
     def plan(self, context: dict[str, Any]) -> VerificationPlanPayload:
         response = self._runnable.invoke({
@@ -68,3 +89,19 @@ class LangChainVerificationPlannerAdapter:
                 return VerificationPlanPayload.model_validate(parsed)
             raise DiscoveryPayloadError(_raw_message_payload(response.get("raw")))
         return VerificationPlanPayload.model_validate(response)
+
+    def plan_extension(self, context: dict[str, Any]) -> VerificationPlanExtension:
+        if self._extension_runnable is None:
+            raise ValueError("extension planning is not configured")
+        response = self._extension_runnable.invoke({
+            "schema_json": json.dumps(
+                VerificationPlanExtension.model_json_schema(), sort_keys=True
+            ),
+            "context_json": json.dumps(context, sort_keys=True),
+        })
+        if isinstance(response, dict) and "parsed" in response and "raw" in response:
+            parsed = response.get("parsed")
+            if parsed is not None:
+                return VerificationPlanExtension.model_validate(parsed)
+            raise DiscoveryPayloadError(_raw_message_payload(response.get("raw")))
+        return VerificationPlanExtension.model_validate(response)

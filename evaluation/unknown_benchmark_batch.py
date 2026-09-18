@@ -9,6 +9,7 @@ from typing import Any
 
 from evaluation.unknown_benchmark import parser as case_parser
 from evaluation.unknown_benchmark import run_case
+from rca_agent.local_model import DEFAULT_LOCAL_MODEL
 
 
 def mechanism_matches(root_cause: str, mechanism: str) -> bool:
@@ -87,6 +88,18 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
     diagnostics = result.get("diagnostics", {})
     blockers = diagnostics.get("verification_blockers", ())
     rejections = diagnostics.get("discovery_rejections", ())
+    inquiry_drafts = result.get("acquisition_inquiry_drafts", ())
+    preliminary_mechanisms = [
+        hypothesis["mechanism"]
+        for item in inquiry_drafts
+        for hypothesis in item["draft"]["hypotheses"]
+    ]
+    final_inquiry = inquiry_drafts[-1]["draft"]["hypotheses"] if inquiry_drafts else ()
+    handoff_gt = any(
+        mechanism_matches(root_cause, item["mechanism"])
+        for root_cause in root_causes for item in final_inquiry
+    )
+    dispositions = (result.get("discovery") or {}).get("inquiry_dispositions", ())
     return {
         "case_id": result["case_id"],
         "holdout_candidate": result["holdout_candidate"],
@@ -133,6 +146,24 @@ def score_case(result: dict[str, Any]) -> dict[str, Any]:
         "query_failed": bool(diagnostics.get("tool_status_counts", {}).get("query_failed")),
         "rule_or_compile_failure": bool(rejections),
         "alternative_resolution_failure": "alternative_explanations_unresolved" in blockers,
+        "acquisition_selection_calls": result.get("acquisition_selection_calls", 0),
+        "acquisition_selection_errors": len(result.get("acquisition_selection_errors", ())),
+        "acquisition_queries": len(result.get("acquisition_selected_actions", ())),
+        "preliminary_gt_direction": any(
+            mechanism_matches(root_cause, mechanism)
+            for root_cause in root_causes for mechanism in preliminary_mechanisms
+        ),
+        "handoff_gt_direction": handoff_gt,
+        "handoff_gt_retained": handoff_gt and bool(raw_matched),
+        "inquiry_dispositions_reported": sum(
+            item["disposition"] != "unreported" for item in dispositions
+        ),
+        "inquiry_dispositions_total": len(dispositions),
+        "core_feedback_queries": len(result.get("core_feedback_queries", ())),
+        "core_feedback_gap_cases": any(
+            item.get("missing_signals") or item.get("unavailable_signals")
+            for item in result.get("core_feedback_gaps", ())
+        ),
         "replay_valid": result["replay_valid"],
     }
 
@@ -190,6 +221,30 @@ def summarize(scores: list[dict[str, Any]], failures: list[dict[str, str]]) -> d
         "alternative_resolution_failure_cases": sum(
             item.get("alternative_resolution_failure", False) for item in scores
         ),
+        "acquisition_selection_calls": sum(
+            item.get("acquisition_selection_calls", 0) for item in scores
+        ),
+        "acquisition_selection_errors": sum(
+            item.get("acquisition_selection_errors", 0) for item in scores
+        ),
+        "acquisition_queries": sum(item.get("acquisition_queries", 0) for item in scores),
+        "preliminary_gt_direction": sum(
+            item.get("preliminary_gt_direction", False) for item in scores
+        ),
+        "handoff_gt_direction": sum(item.get("handoff_gt_direction", False)
+                                    for item in scores),
+        "handoff_gt_retained": sum(item.get("handoff_gt_retained", False)
+                                   for item in scores),
+        "inquiry_dispositions_reported": sum(
+            item.get("inquiry_dispositions_reported", 0) for item in scores
+        ),
+        "inquiry_dispositions_total": sum(
+            item.get("inquiry_dispositions_total", 0) for item in scores
+        ),
+        "core_feedback_queries": sum(item.get("core_feedback_queries", 0)
+                                     for item in scores),
+        "core_feedback_gap_cases": sum(item.get("core_feedback_gap_cases", False)
+                                       for item in scores),
         "replay_valid": sum(item["replay_valid"] for item in scores),
         "status_counts": status_counts,
         "failures": failures,
@@ -221,6 +276,15 @@ def render_funnel_markdown(payload: dict[str, Any]) -> str:
         "| Stage | Cases |",
         "|---|---:|",
         f"| Completed | {summary['completed_cases']} |",
+        f"| Acquisition query selections | {summary['acquisition_queries']} |",
+        f"| Acquisition selector errors | {summary['acquisition_selection_errors']} |",
+        f"| Preliminary GT-like direction (lexical) | {summary['preliminary_gt_direction']} |",
+        f"| Final inquiry GT-like direction (lexical) | {summary['handoff_gt_direction']} |",
+        f"| Inquiry GT-like direction retained in Discovery | {summary['handoff_gt_retained']} |",
+        ("| Inquiry disposition explanations | "
+         f"{summary['inquiry_dispositions_reported']}/"
+         f"{summary['inquiry_dispositions_total']} |"),
+        f"| Core feedback queries | {summary['core_feedback_queries']} |",
         f"| Raw GT-like mechanism proposed | {summary['raw_gt_mechanism_proposed']} |",
         f"| Any initial contract passed | {summary['initial_contract_passed']} |",
         f"| GT-like draft initially passed | {summary['gt_initial_contract_passed']} |",
@@ -275,7 +339,11 @@ def parser() -> argparse.ArgumentParser:
                        default=Path("analysis/unknown_benchmark_batch_summary.json"))
     value.add_argument("--report-output", type=Path,
                        default=Path("analysis/unknown_benchmark_batch.md"))
-    value.add_argument("--model", default="deepseek-chat")
+    value.add_argument("--provider", choices=("qwen-local", "deepseek"), default="qwen-local")
+    value.add_argument("--model")
+    value.add_argument("--base-url", help="OpenAI-compatible /v1 root; local provider only")
+    value.add_argument("--allow-insecure-http", action="store_true")
+    value.add_argument("--acquisition", choices=("fixed", "ai", "inquiry"), default="fixed")
     value.add_argument("--thinking-enabled", action="store_true")
     value.add_argument("--rerun-existing", action="store_true")
     value.add_argument("--model-timeout-seconds", type=float, default=115)
@@ -285,6 +353,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    model_name = args.model or (DEFAULT_LOCAL_MODEL if args.provider == "qwen-local"
+                                else "deepseek-chat")
+    thinking_enabled = args.provider == "qwen-local" or args.thinking_enabled
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if not isinstance(manifest, list) or not manifest:
         raise ValueError("holdout manifest must be a nonempty list")
@@ -303,20 +374,26 @@ def main() -> None:
             if output.exists() and not args.rerun_existing:
                 cached = json.loads(output.read_text(encoding="utf-8"))
                 if (
-                    cached.get("model") == args.model
-                    and cached.get("thinking_enabled") == args.thinking_enabled
+                    cached.get("provider", "deepseek") == args.provider
+                    and cached.get("model") == model_name
+                    and cached.get("thinking_enabled") == thinking_enabled
                     and cached.get("holdout_candidate") == item["holdout_candidate"]
+                    and cached.get("acquisition_mode", "fixed") == args.acquisition
                 ):
                     result = cached
             if result is None:
                 case_values = vars(defaults) | {
                     "case_id": case_id,
                     "holdout_candidate": item["holdout_candidate"],
-                    "model": args.model,
-                    "disable_thinking": not args.thinking_enabled,
+                    "provider": args.provider,
+                    "model": model_name,
+                    "base_url": args.base_url,
+                    "allow_insecure_http": args.allow_insecure_http,
+                    "disable_thinking": not thinking_enabled,
                     "model_timeout_seconds": args.model_timeout_seconds,
                     "discovery_timeout_seconds": args.discovery_timeout_seconds,
                     "output": None,
+                    "acquisition": args.acquisition,
                 }
                 case_args = argparse.Namespace(**case_values)
                 result = run_case(case_args)
@@ -328,8 +405,9 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 - batch continues; provider text is not retained
             failures.append({"case_id": case_id, "error_type": type(exc).__name__})
         summary = {
-            "model": args.model,
-            "thinking_enabled": args.thinking_enabled,
+            "provider": args.provider,
+            "model": model_name,
+            "thinking_enabled": thinking_enabled,
             "summary": summarize(scores, failures),
             "cases": scores,
         }

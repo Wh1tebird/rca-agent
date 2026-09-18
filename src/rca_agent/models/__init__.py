@@ -32,6 +32,7 @@ from rca_agent.models.episode import (
     DecisionStatus,
     DiscriminatingSignalView,
     EpisodeStatus,
+    InquiryCandidateOutcome,
 )
 from rca_agent.models.queries import (
     CompareMetricWindowsRequest,
@@ -63,6 +64,7 @@ __all__ = [
     "GetServiceTraceSummaryRequest",
     "GetTraceStageBreakdownRequest",
     "HypothesisProposal",
+    "InquiryCandidateOutcome",
     "InspectTopologyRequest",
     "ListRelatedEntitiesRequest",
     "Modality",

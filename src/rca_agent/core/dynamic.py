@@ -199,9 +199,20 @@ class MechanismDraft(BaseModel):
         return self
 
 
+class InquiryDisposition(BaseModel):
+    """Model explanation of what happened to a tentative exploration hypothesis."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+    hypothesis_id: str = Field(min_length=1, max_length=40)
+    disposition: Literal["kept", "revised", "discarded", "deferred"]
+    reason: str = Field(min_length=1, max_length=2000)
+    formal_mechanism: str | None = Field(default=None, max_length=500)
+
+
 class MechanismDiscoveryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     mechanisms: tuple[MechanismDraft, ...] = Field(default=(), max_length=4)
+    inquiry_dispositions: tuple[InquiryDisposition, ...] = Field(default=(), max_length=20)
 
 
 class FrozenMechanism(BaseModel):
@@ -258,6 +269,14 @@ class VerificationPlanDraft(BaseModel):
 class VerificationPlanPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     plans: tuple[VerificationPlanDraft, ...] = Field(default=(), max_length=4)
+
+
+class VerificationPlanExtension(BaseModel):
+    """Only new tests; the host retains all prior predictions verbatim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mechanism_id: str = Field(pattern=r"^mech-[a-f0-9]{20}$")
+    added_predictions: tuple[PlannedPrediction, ...] = Field(min_length=1, max_length=2)
 
 
 def normalize_verification_plan(

@@ -18,6 +18,7 @@ from rca_agent.core.dynamic import (
     RuleSpec,
     SignalSpec,
     VerificationPlanDraft,
+    VerificationPlanExtension,
     VerificationPlanPayload,
     assess_dynamic,
     freeze_mechanism,
@@ -48,8 +49,10 @@ from rca_agent.models import (
     TimeWindow,
     ToolResponse,
     ToolStatus,
+    UpdateCandidateEvidenceAction,
 )
 from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, IssuedObservation, RecordedReplay
+from rca_agent.runner.plan_extension import added_predictions
 from rca_agent.runner.transcript import EventType
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
@@ -223,7 +226,7 @@ def unknown_action():
     )
 
 
-def run(discoverer=None, reg=None, environment=None, **kwargs):
+def run(discoverer=None, reg=None, environment=None, *, enable_core_feedback=False, **kwargs):
     discoverer = discoverer or Discoverer()
     environment = environment or Environment()
     runner = EpisodeRunner(
@@ -238,7 +241,9 @@ def run(discoverer=None, reg=None, environment=None, **kwargs):
             )
         )
     )
-    return runner, LangGraphInvestigation(runner, policy).run(), discoverer, environment
+    return (runner, LangGraphInvestigation(
+        runner, policy, enable_core_feedback=enable_core_feedback,
+    ).run(), discoverer, environment)
 
 
 def test_unknown_candidate_full_runner_query_loop_and_replay():
@@ -253,6 +258,31 @@ def test_unknown_candidate_full_runner_query_loop_and_replay():
     assert "threshold" not in str(discoverer.context)
     assert "comparison" not in str(discoverer.context)
     assert len(runner.dynamic_candidate_options) == 1
+
+
+def test_post_freeze_coverage_respects_candidate_bindings_and_completeness():
+    from copy import deepcopy
+
+    from evaluation.evidence_coverage import evidence_coverage
+
+    runner, report, _, _ = run(Discoverer(draft(refute=True)))
+    result = {
+        "tool_responses": [e.payload for e in runner.transcript.events
+                           if e.event_type == EventType.TOOL_RESPONSE],
+        "registered_candidates": [e.payload for e in runner.transcript.events
+                                  if e.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED],
+        "policy_proposals": [p.model_dump(mode="json") for p in report.answer.policy_proposals],
+    }
+    full = evidence_coverage(result)
+    assert full["checks_with_eligible_evidence"] == full["required_checks"] == 3
+    detached = deepcopy(result)
+    for proposal in detached["policy_proposals"]:
+        proposal["observation_refs"] = []
+    assert evidence_coverage(detached)["checks_with_eligible_evidence"] == 0
+    partial = deepcopy(result)
+    for response in partial["tool_responses"]:
+        response["truncated"] = True
+    assert evidence_coverage(partial)["checks_with_eligible_evidence"] == 0
 
 
 def test_generic_verification_without_per_mechanism_configuration():
@@ -373,6 +403,33 @@ def test_registration_is_immutable_and_episode_scoped():
         CoreDecisionProvider().decide((proposal,), (), StopReason.POLICY_REQUEST).status
         == DecisionStatus.OUT_OF_SCOPE
     )
+
+
+def test_core_feedback_only_offers_unattempted_frozen_queries():
+    runner = EpisodeRunner(
+        Environment(), discovery=Discoverer(hypothesis=draft(refute=True)),
+        evidence_registry=registry(), max_rounds=20,
+    )
+    runner.start()
+    runner.handle(query("active_ratio"))
+    runner.handle(unknown_action())
+    runner.discover_candidates()
+    assert runner.has_verification_queries
+    assert not runner.feedback_query_options()
+    # Simulate a queued verification query that was not run before handoff.
+    runner._EpisodeRunner__verification_queries.clear()
+    options = runner.feedback_query_options()
+    assert {item[1] for item in options} >= {"queue_ratio", "downstream_wait_ratio"}
+    assert "active_ratio" not in {item[1] for item in options}
+    hypothesis_id, _, action = options[0]
+    response = runner.handle(action)
+    runner.handle(UpdateCandidateEvidenceAction(
+        hypothesis_id=hypothesis_id,
+        observation_refs=tuple(item.observation_id for item in response.observations),
+    ))
+    assert action not in {item[2] for item in runner.feedback_query_options()}
+    runner.handle(RequestStopAction(summary="bounded feedback test complete"))
+    assert RecordedReplay.verify(runner.transcript.events).valid
 
 
 def test_failure_and_timeout_are_bounded_and_replayable():
@@ -667,6 +724,73 @@ def test_two_stage_discovery_freezes_mechanism_and_compiles_capability_handles()
             "mechanism": "attempted mutation",
             "predictions": compiled["plan"]["predictions"],
         })
+
+
+def test_core_feedback_adds_a_distinguishing_plan_and_replays():
+    class FeedbackPlanner(TwoStagePlanner):
+        supports_plan_extension = True
+
+        def plan(self, context):
+            initial = super().plan(context)
+            item = initial.plans[0]
+            predictions = tuple(
+                prediction.model_copy(update={"distinguishes": ()})
+                if prediction.polarity == ConditionPolarity.CONTRADICT else prediction
+                for prediction in item.predictions
+            )
+            return VerificationPlanPayload(plans=(item.model_copy(update={
+                "predictions": predictions,
+            }),))
+
+        def plan_extension(self, context):
+            handle = next(item["capability_ref"] for item in context["capabilities"]
+                          if item["rule_id"] == "traffic_growth_ratio")
+            return VerificationPlanExtension(
+                mechanism_id=context["frozen_mechanisms"][0]["mechanism_id"],
+                added_predictions=(PlannedPrediction(
+                    capability_ref=handle,
+                    polarity=ConditionPolarity.CONTRADICT,
+                    rationale="No traffic rise distinguishes local pool pressure.",
+                    distinguishes=("alt-downstream",),
+                ),),
+            )
+
+    runner, report, _, _ = run(
+        TwoStageDiscoverer(), verification_planner=FeedbackPlanner(),
+        max_rounds=30, enable_core_feedback=True,
+    )
+    answer = report.answer
+    assert answer.authoritative_decision.status == DecisionStatus.DISCOVERED_VERIFIED
+    assert any(item.get("kind") == "core_feedback_plan"
+               and item["result"]["status"] == "extended" for item in report.history)
+    for previous_event, following_event in zip(
+        runner.transcript.events, runner.transcript.events[1:], strict=False,
+    ):
+        assert following_event.previous_digest == previous_event.digest, (
+            previous_event.sequence, following_event.sequence,
+        )
+    assert RecordedReplay.verify(runner.transcript.events).valid
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_EXTENDED
+               for event in runner.transcript.events) == 1
+
+
+def test_feedback_plan_cannot_remove_or_rewrite_prior_predictions():
+    old = VerificationPlanDraft(
+        mechanism_id="mech-" + "a" * 20,
+        predictions=(
+            PlannedPrediction(capability_ref="cap-" + "a" * 20,
+                              polarity=ConditionPolarity.SUPPORT, rationale="first"),
+            PlannedPrediction(capability_ref="cap-" + "b" * 20,
+                              polarity=ConditionPolarity.CONTRADICT, rationale="second"),
+        ),
+    )
+    added = PlannedPrediction(capability_ref="cap-" + "c" * 20,
+                              polarity=ConditionPolarity.CONTRADICT, rationale="third")
+    with pytest.raises(ValueError, match="removed or changed"):
+        added_predictions(old, old.model_copy(update={
+            "predictions": (old.predictions[0].model_copy(update={"rationale": "rewritten"}),
+                            old.predictions[1], added),
+        }))
 
 
 def test_competing_dynamic_mechanisms_cannot_both_be_promoted_as_root_cause():

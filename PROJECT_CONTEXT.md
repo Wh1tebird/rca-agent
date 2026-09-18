@@ -1,6 +1,111 @@
 # RCA Agent project context
 
-Last consolidated: 2026-09-15 after JVM/thread/GC diagnostic hardening
+Last consolidated: 2026-09-18 after inquiry retention and additive verification feedback
+
+## Inquiry retention and additive verification feedback — 2026-09-18
+
+The inquiry arm records each schema-valid exploration round in the episode Transcript before its
+selected query executes. A stable candidate record merges only exact normalized mechanism and
+alternative text; reused model IDs for different ideas remain distinct. Discovery receives every
+recorded direction, and Runner plus Recorded Replay compare the handoff against the recorded rounds.
+The Answer Artifact includes every tentative direction, its inquiry query/Observation references,
+Discovery disposition, any exact formal mechanism/compiled candidate link, and Core-derived evidence
+status. If Discovery never runs or fails, the recorded ideas remain visible as unformalized ideas;
+they never gain Core decision authority by being retained.
+
+The existing Verification Planner can answer a Core evidence gap with one or two new capability
+predictions. The host appends these to the immutable previous plan, recompiles the same frozen
+mechanism with the original discovery evidence snapshot, and registers a versioned replacement
+candidate. Old predictions and prior evidence cannot be removed. Runner executes only new bounded
+queries and binds their observations to the revised candidate; Core recomputes its unchanged generic
+verification standard. Transcript and Recorded Replay validate the plan revision and evidence
+binding. A failed candidate is not reopened for feedback. The inquiry benchmark exposes a bounded
+query-limit setting so small live probes can reserve queries for verification and feedback.
+
+## Optional local Qwen provider — 2026-09-17
+
+`src/rca_agent/qwen_policy.py` binds the same Policy, Discovery and Verification Planner
+interfaces to the Qwen3-30B-A3B-Thinking-2507 OpenAI-compatible model. The holdout benchmark
+defaults to this local provider; `--provider deepseek` retains the old provider. The local binding
+reads `RCA_LOCAL_API_KEY` from the process environment or prompts without echo on an interactive
+terminal. It never writes the key into code or case reports. It accepts HTTPS or a loopback-only
+HTTP tunnel by default. Public HTTP requires an explicit `--allow-insecure-http` opt-in; this
+protects against accidental cleartext transmission while permitting the user's stated exception.
+One complete 12-case Qwen diagnostic is recorded in `analysis/qwen_model_comparison.md`:
+1 GT-like formal mechanism, 7 cases with compiled mechanisms, and no correct or wrong verified
+answer. The result is constrained by structured-output failures and model-run variance.
+
+## Inquiry handoff and Core feedback — 2026-09-17
+
+The optional inquiry arm now gives formal Discovery a typed, transcript-bound summary of the
+latest tentative hypotheses, evidence questions, and issued query results. The Runner validates
+query/Observation references, and Recorded Replay rechecks the handoff against prior tool
+responses. Mechanism Discovery can report a kept/revised/discarded reason for each inquiry
+hypothesis; omitted reasons are explicit `unreported` diagnostics and carry no decision authority.
+Core feedback may execute at most two previously unattempted queries from a frozen candidate plan
+when Core reports corresponding missing evidence. Runner still owns execution and candidate
+evidence binding. It does not rewrite mechanism semantics or predictions. The existing 12-case
+dataset offered no such unattempted frozen-plan query after verification, so this path is covered
+by deterministic tests but did not fire in live runs. See
+`analysis/inquiry_handoff_acceptance.md` for both completed probes; the second required targeted
+recovery of three provider-interrupted cases.
+
+## Evidence-need-guided acquisition — 2026-09-17
+
+The optional `--acquisition inquiry` benchmark arm adds a non-authoritative, revisable
+pre-discovery inquiry. One structured DeepSeek call per round proposes up to three preliminary
+mechanisms, competing explanations and evidence questions with contrasting predictions. It chooses
+one or two short menu references from host-built, entity-scoped query options. The host resolves
+those references to typed actions and records the need-to-query binding; Runner alone executes them.
+After their observations arrive, the next round replans. At most five rounds / ten selected queries
+are allowed, with one bounded output retry per round. A preliminary idea is not a Core proposal,
+does not freeze verification predictions, and has no effect on sufficiency or stopping. Official
+Discovery, Planner, Core and Recorded Replay remain unchanged. The old fixed and AI acquisition
+arms remain available for comparison.
+
+## Final capability acceptance — 2026-09-16
+
+All raw metric entity/field pairs discovered across 103 source files now have a query mapping:
+65 public entity/signal mappings in total, 35 added during this plan. Field coverage is distinct
+from per-entity sample availability, initialization coverage (still 85/103) and causal sufficiency.
+Host audit of aggregate counters finds frequent decreases; service errors sometimes exceed aligned
+workload. Four unsupported derivations are explicitly disclosed rather than fabricated. Existing
+source GC deltas remain usable without re-differentiation.
+
+`LangChainAcquisitionSelector` selects only opaque host-built query references on issued entities.
+The diagnostic AI screen makes at most two selection calls and ten queries; Runner executes every
+action with normal cost, scope and replay checks. The fixed screen remains default. Planner also
+receives missing-signal and unsupported-derivation explanations.
+
+The final fixed/AI arms each ran the same 12 cases with matching model and query budgets; all 24
+replayed. Fixed: 12 compiled, 10 supported, 2 inconclusive; AI: 11 compiled, 6 supported,
+5 inconclusive, 1 out of scope. Neither arm verified a correct or wrong root cause. AI querying
+increased successful queries from 62.9% to 81.0% and eligible evidence coverage from 42.8% to 52.5%,
+but alternative resolution fell from 14.3% to 10.0%. These are diagnostic observations with model
+variance, not causal improvement claims. Post-freeze coverage reuses Core checks with candidate
+bindings, complete responses and query fingerprints. Semantic review distinguishes partial
+memory/GC directions from exact GT recovery. See `analysis/capability_plan_acceptance.md`,
+`analysis/capability_final_acceptance.md` and `analysis/capability_semantic_review.md`.
+
+## Capability expansion — 2026-09-16
+
+The Environment now exposes 18 additional entity/signal mappings: seven aggregate JVM/thread
+statistics, five deployment resource/availability metrics, five instance metrics and Pod restart
+count. Bootstrap metric descriptors disclose public signal names, entity types, units, semantics
+and explicit unavailable signals, without private source names, paths or Core thresholds.
+The runtime registry registers neutral query recipes for every issued supported entity type.
+Request-volume baseline growth is one support group; latency/error-rate baseline changes are
+symptom-only rules. Service data has error counts but no documented error ratio; ratio comparisons
+are available for operation/instance entities. Missing and zero baselines retain existing semantics.
+
+Aggregate pool sizes, waiting-thread statistics and task/restart counters have insufficient scale
+or reset semantics for portable utilization/rate derivations. They remain queryable context and do
+not refute lock contention, OOM or throttling. No new refutation authority is invented. The fixed
+12-case run preserves the existing five-signal screen, model and query budget: all cases compiled
+and replayed; raw lexical GT recall stayed 3/12; 10 supported and 2 inconclusive; correct and wrong
+verified both 0. Eight cases selected new request-volume rules, but all retained unresolved
+alternatives. This measures verification-capability expansion, not autonomous acquisition quality.
+See `analysis/capability_expansion_comparison.md` and `analysis/capability_expansion_delivery.md`.
 
 ## 1. Purpose
 

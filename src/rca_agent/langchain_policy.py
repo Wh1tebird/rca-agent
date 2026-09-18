@@ -59,7 +59,7 @@ class LangChainPolicyAdapter:
         cls,
         model: Any,
         *,
-        structured_method: Literal["function_calling", "json_mode"] = "function_calling",
+        structured_method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling",
     ) -> LangChainPolicyAdapter:
         """Bind a future chat model to the closed action schema without invoking it now."""
 

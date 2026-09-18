@@ -109,9 +109,27 @@ class CoreDecisionProvider:
             raise ValueError("dynamic candidate already registered")
         self._dynamic[key] = compiled.model_copy(deep=True)
 
+    def supersede_dynamic(self, old_candidate_id: str, compiled: CompiledCandidate) -> None:
+        """Replace one plan revision; the old proposal remains in the transcript."""
+        new_id = compiled.candidate.candidate_id
+        if old_candidate_id not in self._dynamic or new_id in self._dynamic:
+            raise ValueError("invalid dynamic candidate plan revision")
+        old = self._dynamic[old_candidate_id]
+        if (old.origin_hypothesis_id != compiled.origin_hypothesis_id
+                or old.candidate.fault_type != compiled.candidate.fault_type
+                or old.candidate.causal_entity != compiled.candidate.causal_entity
+                or old.candidate.family != compiled.candidate.family):
+            raise ValueError("plan revision changed frozen mechanism semantics")
+        del self._dynamic[old_candidate_id]
+        self._dynamic[new_id] = compiled.model_copy(deep=True)
+
     @property
     def has_dynamic_candidates(self) -> bool:
         return bool(self._dynamic)
+
+    def dynamic_compiled(self, candidate_id: str) -> CompiledCandidate | None:
+        compiled = self._dynamic.get(candidate_id)
+        return compiled.model_copy(deep=True) if compiled is not None else None
 
     def verification_reports(self, proposals, observations) -> dict[str, DynamicVerification]:
         evaluation = _evaluate(

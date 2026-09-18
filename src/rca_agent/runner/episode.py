@@ -15,6 +15,8 @@ from rca_agent.core.dynamic import (
     EvidenceRegistry,
     FrozenMechanism,
     MechanismDiscoveryPayload,
+    VerificationPlanDraft,
+    VerificationPlanExtension,
     VerificationPlanPayload,
     freeze_mechanism,
     observation_fact_digest,
@@ -40,6 +42,8 @@ from rca_agent.models import (
     UpdateCandidateEvidenceAction,
 )
 from rca_agent.runner.core_decision import CoreDecisionProvider, IssuedObservation
+from rca_agent.runner.inquiry_outcomes import inquiry_outcomes
+from rca_agent.runner.plan_extension import added_predictions
 from rca_agent.runner.transcript import EventType, JsonlTranscriptStore, Transcript
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
@@ -61,6 +65,8 @@ def _contract_error_code(message: str) -> str:
         ("generic GC observations", "FULL_GC_SIGNAL_UNAVAILABLE"),
         ("duplicate predictions", "DUPLICATE_PREDICTIONS"),
         ("not executable", "CAPABILITY_NOT_EXECUTABLE"),
+        ("removed or changed a frozen prediction", "NON_ADDITIVE_PLAN"),
+        ("requires one or two new predictions", "NO_NEW_PREDICTION"),
     )
     return next((code for fragment, code in mappings if fragment in message), "CONTRACT_REJECTED")
 
@@ -139,6 +145,12 @@ class EpisodeRunner:
         self.__discovery_attempted = False
         self.__dynamic_options: list[dict[str, Any]] = []
         self.__verification_queries: list[tuple[str, CallToolAction]] = []
+        self.__resolved_registry: EvidenceRegistry | None = None
+        self.__frozen_mechanisms: dict[str, FrozenMechanism] = {}
+        self.__compiled_plans: dict[str, VerificationPlanDraft] = {}
+        self.__candidate_for_mechanism: dict[str, str] = {}
+        self.__feedback_planned = False
+        self.__inquiry_rounds: list[dict[str, Any]] = []
         self.__bootstrap: ResetResponse | None = None
         self.__budget_remaining = 0
         self.__proposals: list[HypothesisProposal] = []
@@ -182,6 +194,22 @@ class EpisodeRunner:
             else frozenset()
         )
 
+    def record_inquiry_round(self, round_record: dict[str, Any]) -> None:
+        """Bind each model-authored exploration draft before its selected query executes."""
+        from rca_agent.langchain_acquisition import InquiryDraft
+
+        self._require_status(EpisodeStatus.ACTIVE)
+        if self.__discovery_attempted or len(self.__inquiry_rounds) >= 5:
+            raise ValueError("inquiry round is out of bounds")
+        round_number = round_record["round"]
+        if (not 1 <= round_number <= 5
+                or self.__inquiry_rounds and round_number <= self.__inquiry_rounds[-1]["round"]):
+            raise ValueError("inquiry rounds must increase")
+        draft = InquiryDraft.model_validate(round_record["draft"])
+        payload = {"round": round_number, "draft": draft.model_dump(mode="json")}
+        self.__inquiry_rounds.append(payload)
+        self.transcript.append(EventType.INQUIRY_ROUND_RECORDED, payload)
+
     def should_discover(self, *, stopping: bool = False) -> bool:
         if (self.status != EpisodeStatus.ACTIVE or self.__discovery is None
                 or self.__discovery_attempted or self.__rounds >= self.__max_rounds
@@ -200,7 +228,7 @@ class EpisodeRunner:
             c.evidence_status.value == "contradicted" for c in preview.candidate_assessments
         ))
 
-    def discover_candidates(self) -> dict[str, Any]:
+    def discover_candidates(self, *, inquiry_handoff: dict[str, Any] | None = None) -> dict[str, Any]:
         """One bounded model call; only the Runner registers and binds compiled candidates."""
         from queue import Empty, Queue
         from threading import Thread
@@ -223,6 +251,7 @@ class EpisodeRunner:
                 result = {"status": "registry_unavailable", "registered": 0}
                 self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
                 return result
+        self.__resolved_registry = registry
         proposals = {p.hypothesis_id: p for p in self.__proposals}
         context = {
             "alert_summary": self.__bootstrap.alert_summary,
@@ -243,7 +272,37 @@ class EpisodeRunner:
                 for c in self.__decision_provider.catalog(self.__bootstrap.alert_entity.entity_ref)
             ],
         }
-        self.transcript.append(EventType.DISCOVERY_STARTED, {"context_digest": sha256_digest(context)})
+        if inquiry_handoff is not None:
+            from rca_agent.langchain_acquisition import InquiryHandoff
+
+            handoff = InquiryHandoff.model_validate(inquiry_handoff)
+            if self.__inquiry_rounds:
+                from rca_agent.langchain_acquisition import inquiry_candidate_records
+
+                if handoff.candidate_history != inquiry_candidate_records(self.__inquiry_rounds):
+                    raise ValueError("inquiry handoff omitted a recorded candidate")
+            completed = {
+                event.payload["query_ref"]: event.payload
+                for event in self.transcript.events
+                if event.event_type == EventType.TOOL_RESPONSE
+            }
+            for link in handoff.query_links:
+                response = completed.get(link.query_ref)
+                if (response is None or response["status"] != link.status
+                        or set(link.observation_refs) != {
+                            item["observation_id"] for item in response["observations"]
+                        }):
+                    raise ValueError("inquiry handoff references an unissued query result")
+            context["inquiry_handoff"] = handoff.model_dump(mode="json")
+        default_dispositions = [
+            {"hypothesis_id": item["hypothesis_id"], "disposition": "unreported",
+             "reason": "This discovery interface does not report inquiry dispositions."}
+            for item in context.get("inquiry_handoff", {}).get("hypotheses", ())
+        ]
+        self.transcript.append(EventType.DISCOVERY_STARTED, {
+            "context_digest": sha256_digest(context),
+            "inquiry_handoff": context.get("inquiry_handoff"),
+        })
         if self.__verification_planner is not None:
             return self._discover_two_stage(context, registry, proposals)
         mailbox: Queue = Queue(maxsize=1)
@@ -388,7 +447,8 @@ class EpisodeRunner:
                         repair_actions, "rejected", final_error, "none",
                     )
             result = {"status": "completed", "registered": registered,
-                      "aligned": aligned, "rejections": rejections}
+                      "aligned": aligned, "rejections": rejections,
+                      "inquiry_dispositions": default_dispositions}
         except Empty:
             result = {"status": "timeout", "registered": 0}
         except (ValueError, TypeError):
@@ -427,6 +487,23 @@ class EpisodeRunner:
             result = {"status": "failed", "registered": 0, "error_type": type(exc).__name__}
             self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
             return result
+
+        inquiry_ids = {
+            item["hypothesis_id"]
+            for item in context.get("inquiry_handoff", {}).get("hypotheses", ())
+        }
+        model_dispositions = {
+            item.hypothesis_id: item for item in payload.inquiry_dispositions
+            if item.hypothesis_id in inquiry_ids
+        }
+        inquiry_dispositions = [
+            (model_dispositions[item].model_dump(mode="json")
+             if item in model_dispositions else {
+                 "hypothesis_id": item, "disposition": "unreported",
+                 "reason": "The discovery model did not provide a disposition.",
+             })
+            for item in sorted(inquiry_ids)
+        ]
 
         frozen: dict[str, FrozenMechanism] = {}
         valid_drafts = []
@@ -476,6 +553,7 @@ class EpisodeRunner:
             })
             item = freeze_mechanism(frozen_draft)
             frozen[item.mechanism_id] = item
+            self.__frozen_mechanisms[item.mechanism_id] = item
             self.transcript.append(EventType.MECHANISM_DRAFT_FROZEN, {
                 "draft_index": draft_index, "mechanism": item.model_dump(mode="json"),
             })
@@ -484,6 +562,7 @@ class EpisodeRunner:
             result = {
                 "status": "completed", "registered": 0, "aligned": 0,
                 "rejections": rejection_codes,
+                "inquiry_dispositions": inquiry_dispositions,
                 "planner_attempts": 0,
             }
             self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
@@ -494,6 +573,14 @@ class EpisodeRunner:
             "frozen_mechanisms": [item.model_dump(mode="json") for item in frozen.values()],
             "capabilities": [item.model_dump(mode="json") for item in handles],
             "observations": context["observations"],
+            "unavailable_signals": {
+                signal: reason for capability in self.__bootstrap.capabilities
+                for signal, reason in capability.unavailable_signals.items()
+            },
+            "unsupported_derivations": {
+                signal: reason for capability in self.__bootstrap.capabilities
+                for signal, reason in capability.unsupported_derivations.items()
+            },
         }
         compile_kwargs = {
             "discovery_query_refs": tuple(sorted({
@@ -551,6 +638,7 @@ class EpisodeRunner:
             result = {
                 "status": "completed", "registered": registered, "aligned": aligned,
                 "rejections": rejection_codes, "planner_attempts": 2,
+                "inquiry_dispositions": inquiry_dispositions,
             }
             self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
             return result
@@ -601,6 +689,7 @@ class EpisodeRunner:
         result = {
             "status": "completed", "registered": registered, "aligned": aligned,
             "rejections": rejection_codes, "planner_attempts": planner_attempts,
+            "inquiry_dispositions": inquiry_dispositions,
         }
         self.transcript.append(EventType.DISCOVERY_COMPLETED, result)
         return result
@@ -679,6 +768,8 @@ class EpisodeRunner:
                 registration = self._register_two_stage_candidate(
                     compiled, mechanism, proposals[mechanism.source_hypothesis_id]
                 )
+                self.__compiled_plans[plan.mechanism_id] = normalized_plan
+                self.__candidate_for_mechanism[plan.mechanism_id] = compiled.candidate.candidate_id
                 accepted.add(plan.mechanism_id)
                 registered += registration == "dynamic_registered"
                 aligned += registration == "catalog_aligned"
@@ -730,6 +821,7 @@ class EpisodeRunner:
                 "candidate_id": existing.candidate_id,
                 "hypothesis_id": hypothesis_id,
                 "source_hypothesis_id": original.hypothesis_id,
+                "mechanism_id": mechanism.mechanism_id,
             })
             candidate_id = existing.candidate_id
             registration = "catalog_aligned"
@@ -873,6 +965,225 @@ class EpisodeRunner:
     def has_verification_queries(self) -> bool:
         return bool(self.__verification_queries)
 
+    def feedback_plan_available(self) -> bool:
+        if (self.status != EpisodeStatus.ACTIVE or self.__feedback_planned
+                or self.__verification_planner is None or self.__resolved_registry is None
+                or self.__verification_queries or self.__budget_remaining <= 0
+                or self.__rounds + 2 >= self.__max_rounds):
+            return False
+        return self._feedback_plan_target() is not None
+
+    def _feedback_plan_target(self):
+        assert self.__resolved_registry is not None
+        attempted = {event.payload["query_ref"] for event in self.transcript.events
+                     if event.event_type == EventType.TOOL_REQUEST}
+        registry = self.__resolved_registry
+        reports = self.__decision_provider.verification_reports(
+            tuple(self.__proposals), tuple(self.__observation_ledger.values())
+        )
+        for assessment in self.preview_core_assessment().candidate_assessments:
+            report = reports.get(assessment.candidate_id)
+            if (not assessment.verification_pending or report is None
+                    or report.state.value == "failed"):
+                continue
+            for mechanism_id, candidate_id in self.__candidate_for_mechanism.items():
+                if candidate_id != assessment.candidate_id:
+                    continue
+                used = {item.capability_ref for item in
+                        self.__compiled_plans[mechanism_id].predictions}
+                for handle in registry.capability_handles():
+                    if handle.capability_ref in used:
+                        continue
+                    signal = next((item for item in registry.signals
+                                   if item.entity_ref == handle.entity_ref
+                                   and item.signal == handle.signal), None)
+                    if signal is not None and self._signal_executable(signal) and (
+                        query_fingerprint(signal.query.tool_name, signal.query.request)
+                        not in attempted
+                    ):
+                        return mechanism_id, assessment
+        return None
+
+    def extend_verification_plan(self) -> dict[str, Any]:
+        """Request one additive plan revision from the existing Planner."""
+        if not self.feedback_plan_available():
+            return {"status": "unavailable"}
+        assert self.__resolved_registry is not None and self.__bootstrap is not None
+        self.__feedback_planned = True
+        self.__rounds += 1
+        registry = self.__resolved_registry
+        target = self._feedback_plan_target()
+        if target is None:
+            return {"status": "unavailable"}
+        mechanism_id, assessment = target
+        frozen = self.__frozen_mechanisms[mechanism_id]
+        previous = self.__compiled_plans[mechanism_id]
+        old_candidate_id = assessment.candidate_id
+        old_compiled = self.__decision_provider.dynamic_compiled(old_candidate_id)
+        assert old_compiled is not None
+        reports = self.__decision_provider.verification_reports(
+            tuple(self.__proposals), tuple(self.__observation_ledger.values())
+        )
+        blockers = reports[old_candidate_id].blockers if old_candidate_id in reports else ()
+        feedback = {
+            "candidate_id": old_candidate_id,
+            "missing_signals": assessment.missing_signals,
+            "unavailable_signals": assessment.unavailable_signals,
+            "blockers": blockers,
+        }
+        self.transcript.append(EventType.VERIFICATION_PLAN_EXTENSION_STARTED, {
+            "mechanism_id": mechanism_id,
+            "old_candidate_id": old_candidate_id,
+            "previous_plan": previous.model_dump(mode="json"),
+            "core_feedback": feedback,
+        })
+        context = {
+            "frozen_mechanisms": [frozen.model_dump(mode="json")],
+            "capabilities": [item.model_dump(mode="json")
+                             for item in registry.capability_handles()],
+            "observations": [record.observation.model_dump(mode="json")
+                             for record in self.__observation_ledger.values()],
+            "existing_plan": previous.model_dump(mode="json"),
+            "core_feedback": feedback,
+            "unavailable_signals": {
+                signal: reason for capability in self.__bootstrap.capabilities
+                for signal, reason in capability.unavailable_signals.items()
+            },
+        }
+        structured_extension = getattr(
+            self.__verification_planner, "supports_plan_extension", False
+        )
+        ok, raw = self._invoke_discovery_component(
+            (lambda: self.__verification_planner.plan_extension(deepcopy(context)))
+            if structured_extension else
+            (lambda: self.__verification_planner.plan(deepcopy(context)))
+        )
+        try:
+            if not ok:
+                raise ValueError("PLANNER_" + raw["error_type"].upper())
+            if structured_extension:
+                addition = VerificationPlanExtension.model_validate(raw)
+                if addition.mechanism_id != mechanism_id:
+                    raise ValueError("UNKNOWN_FROZEN_MECHANISM")
+                proposed = VerificationPlanDraft(
+                    mechanism_id=mechanism_id,
+                    predictions=(*previous.predictions, *addition.added_predictions),
+                )
+            else:
+                payload = VerificationPlanPayload.model_validate(raw)
+                if len(payload.plans) != 1:
+                    raise ValueError("MISSING_ADDITIVE_PLAN")
+                proposed = payload.plans[0]
+            plan, repairs = registry.normalize_plan(frozen, proposed)
+            new_refs = added_predictions(previous, plan)
+            compiled = registry.compile_plan(
+                frozen, plan,
+                discovery_query_refs=old_compiled.discovery_query_refs,
+                discovery_observation_refs=old_compiled.discovery_observation_refs,
+                discovery_fact_digests=old_compiled.discovery_fact_digests,
+            )
+            if not all(self._signal_executable(item) for item in compiled.signals):
+                raise ValueError("CAPABILITY_NOT_EXECUTABLE")
+            attempted = {event.payload["query_ref"] for event in self.transcript.events
+                         if event.event_type == EventType.TOOL_REQUEST}
+            old_queries = {query_fingerprint(item.query.tool_name, item.query.request)
+                           for item in old_compiled.signals}
+            new_queries = {
+                query_fingerprint(item.query.tool_name, item.query.request): item.query
+                for item in compiled.signals
+                if query_fingerprint(item.query.tool_name, item.query.request)
+                not in old_queries | attempted
+            }
+            query_cost = sum(
+                next(capability.query_cost for capability in self.__bootstrap.capabilities
+                     if capability.tool_name == action.tool_name)
+                for action in new_queries.values()
+            )
+            if (not new_queries or self.__budget_remaining < query_cost
+                    or self.__rounds + 2 * len(new_queries) > self.__max_rounds):
+                raise ValueError("NO_NEW_EXECUTABLE_QUERY")
+            if not set(new_refs) <= {item.capability_ref
+                                    for item in registry.capability_handles()}:
+                raise ValueError("UNKNOWN_CAPABILITY_REF")
+        except (ValueError, TypeError) as exc:
+            code = str(exc) if type(exc) is ValueError and str(exc).isupper() else (
+                _contract_error_code(str(exc))
+            )
+            self.transcript.append(EventType.VERIFICATION_PLAN_EXTENSION_REJECTED, {
+                "mechanism_id": mechanism_id, "error_code": code,
+            })
+            return {"status": "rejected", "reason": code}
+
+        new_hypothesis_id = "h-discovered-" + compiled.version[:20]
+        rebound = compiled.model_copy(update={"source_hypothesis_id": new_hypothesis_id})
+        self.__decision_provider.supersede_dynamic(old_candidate_id, rebound)
+        previous_proposal = next(item for item in self.__proposals
+                                 if item.candidate_id == old_candidate_id)
+        self.transcript.append(EventType.VERIFICATION_PLAN_EXTENDED, {
+            "mechanism_id": mechanism_id,
+            "mechanism_digest": frozen.digest,
+            "old_candidate_id": old_candidate_id,
+            "old_hypothesis_id": previous_proposal.hypothesis_id,
+            "new_hypothesis_id": new_hypothesis_id,
+            "previous_plan": previous.model_dump(mode="json"),
+            "plan": plan.model_dump(mode="json"),
+            "plan_repairs": repairs,
+            "compiled": rebound.model_dump(mode="json"),
+            "new_query_refs": tuple(new_queries),
+        })
+        self._submit_hypothesis(HypothesisProposal(
+            hypothesis_id=new_hypothesis_id,
+            candidate_id=rebound.candidate.candidate_id,
+            mechanism=frozen.mechanism,
+            causal_entity_ref=frozen.causal_entity_ref,
+            rationale=frozen.causal_explanation,
+            observation_refs=previous_proposal.observation_refs,
+            missing_evidence=previous_proposal.missing_evidence,
+        ))
+        self.__verification_queries.extend((new_hypothesis_id, action)
+                                           for action in new_queries.values())
+        self.__compiled_plans[mechanism_id] = plan
+        self.__candidate_for_mechanism[mechanism_id] = rebound.candidate.candidate_id
+        self.__dynamic_options = [item for item in self.__dynamic_options
+                                  if item["candidate_id"] != old_candidate_id]
+        self.__dynamic_options.append({
+            "candidate_id": rebound.candidate.candidate_id,
+            "fault_type": rebound.candidate.fault_type,
+            "family": rebound.candidate.family.value,
+            "required_signals": tuple(item.signal for item in rebound.signals),
+            "required_capabilities": tuple(rebound.candidate.required_capabilities),
+        })
+        return {"status": "extended", "mechanism_id": mechanism_id,
+                "new_queries": len(new_queries)}
+
+    def feedback_query_options(self) -> tuple[tuple[str, str, CallToolAction], ...]:
+        """Unattempted frozen-plan queries for Core-reported evidence gaps."""
+        available_slots = min(self.__budget_remaining,
+                              (self.__max_rounds - self.__rounds) // 2)
+        if (self.status != EpisodeStatus.ACTIVE or self.__verification_queries
+                or available_slots <= 0
+                or not isinstance(self.__decision_provider, CoreDecisionProvider)):
+            return ()
+        attempted = {
+            event.payload["query_ref"] for event in self.transcript.events
+            if event.event_type == EventType.TOOL_REQUEST
+        }
+        result = []
+        for assessment in self.preview_core_assessment().candidate_assessments:
+            compiled = self.__decision_provider.dynamic_compiled(assessment.candidate_id)
+            if compiled is None or not assessment.verification_pending:
+                continue
+            gaps = {*assessment.missing_signals, *assessment.unavailable_signals}
+            for signal in compiled.signals:
+                if signal.signal not in gaps:
+                    continue
+                fingerprint = query_fingerprint(signal.query.tool_name, signal.query.request)
+                if fingerprint in attempted:
+                    continue
+                for hypothesis_id in assessment.hypothesis_ids:
+                    result.append((hypothesis_id, signal.signal, signal.query))
+        return tuple(result[:available_slots])
+
     def verify_next_discovered_query(self) -> ToolResponse | AnswerArtifact | None:
         self._require_status(EpisodeStatus.ACTIVE)
         if not self.__verification_queries:
@@ -1013,6 +1324,7 @@ class EpisodeRunner:
                     "candidates": {key: report.model_dump(mode="json") for key, report in reports.items()},
                 })
         frozen_at = datetime.now(UTC)
+        candidate_assessments = self.preview_core_assessment().candidate_assessments
         fields = {
             "episode_id": self.episode_id,
             "termination_reason": termination_reason,
@@ -1020,6 +1332,7 @@ class EpisodeRunner:
             "authoritative_decision": decision,
             "observation_refs": used_observations,
             "missing_evidence": missing,
+            "inquiry_candidates": inquiry_outcomes(self.transcript.events, candidate_assessments),
             "transcript_digest": self.transcript.head_digest,
             "component_versions": {
                 "rca-agent": _package_version("rca-agent"),

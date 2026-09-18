@@ -245,7 +245,7 @@ def _signal_inventory(
         for signal, (entity_set, raw_metric, unit) in mappings.items():
             coverage = metric_coverage.get((entity_set, raw_metric), {})
             contract = METRIC_SIGNAL_CONTRACTS.get(signal)
-            runtime_registered = signal in RUNTIME_METRIC_RULES or contract is not None
+            runtime_registered = True  # Neutral descriptors are registered for issued entities.
             has_rule = signal in RUNTIME_METRIC_RULES or (
                 contract is not None and "comparison" in contract
             )
@@ -268,19 +268,23 @@ def _signal_inventory(
                 "raw_sample_count": coverage.get("sample_count", 0),
                 "raw_entity_count": coverage.get("entity_count", 0),
             })
-    service_mappings = PUBLIC_METRIC_MAP["apm.service"]
-    for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
-        entity_set, raw_metric, _ = service_mappings[contract["base_signal"]]
+    for entity_type, signal, contract in (
+        (entity_type, signal, contract)
+        for entity_type in ("apm.service", "apm.operation", "apm.instance")
+        for signal, contract in BASELINE_SIGNAL_CONTRACTS.items()
+        if contract["base_signal"] in PUBLIC_METRIC_MAP[entity_type]
+    ):
+        entity_set, raw_metric, _ = PUBLIC_METRIC_MAP[entity_type][contract["base_signal"]]
         coverage = metric_coverage.get((entity_set, raw_metric), {})
         signals.append({
             "signal": signal,
-            "entity_type": "apm.service",
+            "entity_type": entity_type,
             "tool": "compare_metric_windows",
             "unit": "ratio",
             "data_type": "number",
             "independent_group": contract["group"],
             "rule_ids": [signal],
-            "support_eligible": True,
+            "support_eligible": contract.get("support_eligible", True),
             "runtime_registered": True,
             "raw_metric": raw_metric,
             "raw_entity_set": entity_set,

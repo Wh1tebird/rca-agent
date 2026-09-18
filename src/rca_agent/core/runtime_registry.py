@@ -4,6 +4,10 @@ Hosts can replace this builder with their monitoring inventory. No data is queri
 """
 
 from rca_agent.core.dynamic import EvidenceRegistry, MechanismClass, RuleSpec, SignalSpec
+from rca_agent.environment.metric_catalog import (
+    EXTRA_SERVICE_METRICS,
+    metric_description,
+)
 from rca_agent.models import (
     CallToolAction,
     CompareMetricWindowsRequest,
@@ -48,6 +52,17 @@ NON_CAUSAL_SUPPORT_TRACE_RULES = frozenset({
 })
 
 METRIC_SIGNAL_CONTRACTS = {
+    **{
+        signal: {
+            "unit": spec[2], "group": "thread_aggregate_context",
+            "description": metric_description(signal),
+        }
+        for signal, spec in EXTRA_SERVICE_METRICS.items()
+    },
+    "request_count": {
+        "unit": "count", "group": "request_volume",
+        "description": metric_description("request_count"),
+    },
     "thread_pool_max": {
         "unit": None, "group": "thread_pool_capacity_reference",
         "description": "source-provided aggregate maximum-thread statistic",
@@ -96,6 +111,22 @@ METRIC_SIGNAL_CONTRACTS = {
 }
 
 BASELINE_SIGNAL_CONTRACTS = {
+    "request_count_baseline_ratio": {
+        "base_signal": "request_count", "group": "request_volume",
+        "description": "Same-entity mean request volume at least doubles over equal windows; "
+        "does not rule out short bursts or changes of request mix.",
+        "threshold": 2.0,
+    },
+    "request_latency_seconds_baseline_ratio": {
+        "base_signal": "request_latency_seconds", "group": "end_to_end_latency",
+        "description": "Mean latency at least doubles over equal windows; symptom only.",
+        "threshold": 2.0, "support_eligible": False,
+    },
+    "error_rate_baseline_ratio": {
+        "base_signal": "error_rate", "group": "request_errors",
+        "description": "Mean error ratio at least doubles over equal windows; symptom only.",
+        "threshold": 2.0, "support_eligible": False,
+    },
     "thread_pool_active_baseline_ratio": {
         "base_signal": "thread_pool_active", "group": "thread_pool_saturation",
         "description": "active thread-pool fraction increased at least twofold from baseline",
@@ -244,7 +275,9 @@ def rca100_evidence_registry(
         ):
             if isinstance(value, dict) and value.get("entity_ref") and value.get("entity_type"):
                 issued_entity_types[value["entity_ref"]] = value["entity_type"]
-        if observation.signal in METRIC_SIGNAL_CONTRACTS:
+        if observation.signal in METRIC_SIGNAL_CONTRACTS and observation.entity_ref not in (
+            issued_entity_types
+        ):
             issued_entity_types[observation.entity_ref] = "apm.service"
         if observation.signal in {"cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"}:
             issued_entity_types[observation.entity_ref] = "k8s.node"
@@ -263,7 +296,16 @@ def rca100_evidence_registry(
                     for signal in ("cpu_usage_rate", "memory_usage_rate", "disk_usage_rate")
                 }
             else:
-                continue
+                contracts = {}
+            # Public descriptors expose neutral metrics for every issued entity type.
+            # Only explicit host contracts below create causal validation rules.
+            contracts = dict(contracts)
+            for descriptor in tools["get_metric_series"].metrics:
+                if descriptor.entity_type == entity_type:
+                    contracts.setdefault(descriptor.signal, {
+                        "unit": descriptor.unit, "group": "context_only",
+                        "description": descriptor.description,
+                    })
             for signal, contract in contracts.items():
                 spec = SignalSpec(
                     signal=signal,
@@ -273,7 +315,9 @@ def rca100_evidence_registry(
                     description=contract["description"],
                     independent_group=contract["group"],
                     minimum=0,
-                    maximum=100 if entity_type == "k8s.node" else None,
+                    maximum=100 if signal in {
+                        "cpu_usage_rate", "memory_usage_rate", "disk_usage_rate"
+                    } else None,
                     query=CallToolAction(
                         tool_name="get_metric_series",
                         request=GetMetricSeriesRequest(
@@ -285,11 +329,15 @@ def rca100_evidence_registry(
                     ),
                 )
                 metric_specs[(entity_ref, signal)] = spec
-            if entity_type == "apm.service" and "compare_metric_windows" in tools:
+            if entity_type in {"apm.service", "apm.operation", "apm.instance"} and (
+                "compare_metric_windows" in tools
+            ):
                 horizon = bootstrap.observation_horizon
                 incident_start = horizon.start + (horizon.end - horizon.start) / 2
                 incident_window = TimeWindow(start=incident_start, end=horizon.end)
                 for signal, contract in BASELINE_SIGNAL_CONTRACTS.items():
+                    if contract["base_signal"] not in contracts:
+                        continue
                     spec = SignalSpec(
                         signal=signal,
                         entity_ref=entity_ref,
@@ -356,6 +404,7 @@ def rca100_evidence_registry(
                 source="configuration",
                 provenance="RCA100 equal-window baseline-change contract v1",
                 description=contract["description"],
+                support_eligible=contract.get("support_eligible", True),
                 refutes=REFUTATION_CLASSES_BY_SIGNAL.get(signal, ()),
             )
     return EvidenceRegistry(signals=tuple(specs.values()), rules=tuple(rules.values()))

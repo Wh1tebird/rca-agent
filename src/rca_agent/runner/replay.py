@@ -11,6 +11,7 @@ from rca_agent.models import (
     HypothesisProposal,
     ToolResponse,
 )
+from rca_agent.runner.inquiry_outcomes import inquiry_outcomes
 from rca_agent.runner.transcript import (
     GENESIS_DIGEST,
     EventType,
@@ -61,11 +62,18 @@ class RecordedReplay:
 
         provider = CoreDecisionProvider()
         observations = {}
+        completed_queries: dict[str, ToolResponse] = {}
         proposals = {}
         verification_report = None
         discovery_refs = ()
         discovery_queries = ()
+        inquiry_handoff_ids: tuple[str, ...] = ()
+        inquiry_rounds: list[dict] = []
         frozen_mechanisms = {}
+        compiled_plans = {}
+        extension_started = None
+        extension_count = 0
+        expected_extension_proposal = None
         planner_retry_seen = False
         for expected_sequence, event in enumerate(events, start=1):
             if event.episode_id != episode_id:
@@ -77,6 +85,9 @@ class RecordedReplay:
             if not event.verify_digest():
                 raise ReplayValidationError("event payload digest is invalid")
             previous = event.digest
+            if (expected_extension_proposal is not None
+                    and event.event_type != EventType.HYPOTHESIS_SUBMITTED):
+                raise ReplayValidationError("extended plan has no immediate candidate proposal")
 
             if expected_sequence == 1:
                 if event.event_type != EventType.EPISODE_CREATED:
@@ -91,9 +102,40 @@ class RecordedReplay:
                     raise ReplayValidationError("environment reset is out of order")
                 status = EpisodeStatus.ACTIVE
                 budget_remaining = int(event.payload["bootstrap"]["query_budget"]["remaining"])
+            elif event.event_type == EventType.INQUIRY_ROUND_RECORDED:
+                from rca_agent.langchain_acquisition import InquiryDraft
+
+                if (status != EpisodeStatus.ACTIVE or discovery_started
+                        or not isinstance(event.payload.get("round"), int)
+                        or not 1 <= event.payload["round"] <= 5
+                        or (inquiry_rounds
+                            and event.payload["round"] <= inquiry_rounds[-1]["round"])
+                        or len(inquiry_rounds) >= 5):
+                    raise ReplayValidationError("inquiry round is out of order")
+                InquiryDraft.model_validate(event.payload["draft"])
+                inquiry_rounds.append(event.payload)
             elif event.event_type == EventType.DISCOVERY_STARTED:
                 if status != EpisodeStatus.ACTIVE or discovery_started:
                     raise ReplayValidationError("discovery start is out of order")
+                if event.payload.get("inquiry_handoff") is not None:
+                    from rca_agent.langchain_acquisition import InquiryHandoff
+
+                    handoff = InquiryHandoff.model_validate(event.payload["inquiry_handoff"])
+                    if inquiry_rounds:
+                        from rca_agent.langchain_acquisition import inquiry_candidate_records
+
+                        if handoff.candidate_history != inquiry_candidate_records(inquiry_rounds):
+                            raise ReplayValidationError("inquiry handoff omitted a recorded idea")
+                    inquiry_handoff_ids = tuple(sorted(
+                        item.hypothesis_id for item in handoff.hypotheses
+                    ))
+                    for link in handoff.query_links:
+                        response = completed_queries.get(link.query_ref)
+                        if (response is None or response.status.value != link.status
+                                or set(link.observation_refs) != {
+                                    item.observation_id for item in response.observations
+                                }):
+                            raise ReplayValidationError("inquiry handoff query result mismatch")
                 discovery_started = True
                 discovery_refs = tuple(sorted(observations))
                 discovery_queries = tuple(sorted({r.query_ref for r in observations.values()}))
@@ -173,6 +215,96 @@ class RecordedReplay:
                     frozen = frozen_mechanisms[plan.mechanism_id]
                     if event.payload["mechanism_digest"] != frozen.digest:
                         raise ReplayValidationError("compiled plan changed frozen mechanism")
+                    compiled_plans[plan.mechanism_id] = plan
+            elif event.event_type == EventType.VERIFICATION_PLAN_EXTENSION_STARTED:
+                from rca_agent.core.dynamic import VerificationPlanDraft
+
+                if (status != EpisodeStatus.ACTIVE or not discovery_completed
+                        or extension_started is not None or extension_count >= 1):
+                    raise ReplayValidationError("plan extension start is out of order")
+                mechanism_id = event.payload["mechanism_id"]
+                previous_plan = VerificationPlanDraft.model_validate(
+                    event.payload["previous_plan"]
+                )
+                if (mechanism_id not in frozen_mechanisms
+                        or previous_plan != compiled_plans.get(mechanism_id)
+                        or provider.dynamic_compiled(event.payload["old_candidate_id"]) is None):
+                    raise ReplayValidationError("plan extension has no frozen candidate")
+                extension_started = (mechanism_id, event.payload["old_candidate_id"])
+                extension_count += 1
+            elif event.event_type == EventType.VERIFICATION_PLAN_EXTENSION_REJECTED:
+                if (status != EpisodeStatus.ACTIVE or extension_started is None
+                        or event.payload["mechanism_id"] != extension_started[0]):
+                    raise ReplayValidationError("plan extension rejection is out of order")
+                extension_started = None
+            elif event.event_type == EventType.VERIFICATION_PLAN_EXTENDED:
+                from rca_agent.core.dynamic import CompiledCandidate, VerificationPlanDraft
+                from rca_agent.runner.plan_extension import added_predictions
+
+                if (status != EpisodeStatus.ACTIVE or extension_started is None
+                        or (event.payload["mechanism_id"], event.payload["old_candidate_id"])
+                        != extension_started):
+                    raise ReplayValidationError("plan extension is out of order")
+                mechanism_id = event.payload["mechanism_id"]
+                previous_plan = VerificationPlanDraft.model_validate(
+                    event.payload["previous_plan"]
+                )
+                plan = VerificationPlanDraft.model_validate(event.payload["plan"])
+                compiled = CompiledCandidate.model_validate(event.payload["compiled"])
+                if (previous_plan != compiled_plans[mechanism_id]
+                        or event.payload["mechanism_digest"] != frozen_mechanisms[mechanism_id].digest
+                        or compiled.candidate.fault_type != frozen_mechanisms[mechanism_id].mechanism
+                        or compiled.candidate.causal_entity
+                        != frozen_mechanisms[mechanism_id].causal_entity_ref
+                        or compiled.source_hypothesis_id != event.payload["new_hypothesis_id"]
+                        or event.payload["new_hypothesis_id"]
+                        != "h-discovered-" + compiled.version[:20]
+                        or compiled.candidate.candidate_id != "dyn_" + compiled.version[:24]
+                        or event.payload["old_hypothesis_id"] not in proposals
+                        or proposals[event.payload["old_hypothesis_id"]].candidate_id
+                        != event.payload["old_candidate_id"]):
+                    raise ReplayValidationError("plan extension changed frozen identity")
+                try:
+                    added_predictions(previous_plan, plan)
+                    old_compiled = provider.dynamic_compiled(event.payload["old_candidate_id"])
+                    if old_compiled is None:
+                        raise ValueError("old candidate is absent")
+                    if (not {item.model_dump_json() for item in old_compiled.predictions}
+                            <= {item.model_dump_json() for item in compiled.predictions}
+                            or old_compiled.alternatives != compiled.alternatives
+                            or not {item.model_dump_json() for item in old_compiled.rules}
+                            <= {item.model_dump_json() for item in compiled.rules}
+                            or not {item.model_dump_json() for item in old_compiled.signals}
+                            <= {item.model_dump_json() for item in compiled.signals}
+                            or old_compiled.discovery_query_refs != compiled.discovery_query_refs
+                            or old_compiled.discovery_observation_refs
+                            != compiled.discovery_observation_refs
+                            or old_compiled.discovery_fact_digests
+                            != compiled.discovery_fact_digests):
+                        raise ValueError("compiled extension dropped old evidence contract")
+                    old_queries = {
+                        query_fingerprint(item.query.tool_name, item.query.request)
+                        for item in old_compiled.signals
+                    }
+                    expected_new_queries = {
+                        query_fingerprint(item.query.tool_name, item.query.request)
+                        for item in compiled.signals
+                    } - old_queries - completed_queries.keys()
+                    if set(event.payload["new_query_refs"]) != expected_new_queries:
+                        raise ValueError("extension query list differs from compiled plan")
+                    provider.supersede_dynamic(event.payload["old_candidate_id"], compiled)
+                except ValueError as exc:
+                    raise ReplayValidationError("invalid additive plan extension") from exc
+                new_query_refs = set(event.payload["new_query_refs"])
+                if not new_query_refs or new_query_refs & completed_queries.keys():
+                    raise ReplayValidationError("plan extension has no new query")
+                compiled_plans[mechanism_id] = plan
+                extension_started = None
+                expected_extension_proposal = (
+                    event.payload["new_hypothesis_id"],
+                    event.payload["old_hypothesis_id"],
+                    compiled.candidate.candidate_id,
+                )
             elif event.event_type == EventType.VERIFICATION_PLAN_REJECTED:
                 if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
                     raise ReplayValidationError("verification rejection is out of order")
@@ -193,6 +325,14 @@ class RecordedReplay:
                     raise ReplayValidationError("discovery completion is out of order")
                 if event.payload["registered"] != len(dynamic_ids):
                     raise ReplayValidationError("discovery registration count mismatch")
+                if event.payload.get("status") == "completed" and inquiry_handoff_ids:
+                    dispositions = event.payload.get("inquiry_dispositions", ())
+                    if (tuple(sorted(item["hypothesis_id"] for item in dispositions))
+                            != inquiry_handoff_ids
+                            or any(item["disposition"] not in {
+                                "kept", "revised", "discarded", "deferred", "unreported"
+                            } for item in dispositions)):
+                        raise ReplayValidationError("inquiry disposition mismatch")
                 discovery_completed = True
             elif event.event_type == EventType.CATALOG_CANDIDATE_ALIGNED:
                 if status != EpisodeStatus.ACTIVE or not discovery_started or discovery_completed:
@@ -201,6 +341,14 @@ class RecordedReplay:
                 if status != EpisodeStatus.ACTIVE:
                     raise ReplayValidationError("hypothesis submitted outside active episode")
                 proposal = HypothesisProposal.model_validate(event.payload)
+                if expected_extension_proposal is not None:
+                    new_id, old_id, candidate_id = expected_extension_proposal
+                    if (proposal.hypothesis_id != new_id
+                            or proposal.candidate_id != candidate_id
+                            or not set(proposals[old_id].observation_refs)
+                            <= set(proposal.observation_refs)):
+                        raise ReplayValidationError("extended plan proposal is not bound to old evidence")
+                    expected_extension_proposal = None
                 if proposal.hypothesis_id in proposals:
                     raise ReplayValidationError("duplicate hypothesis")
                 proposals[proposal.hypothesis_id] = proposal
@@ -267,19 +415,30 @@ class RecordedReplay:
                     )
                     # Changed issued facts are rejected by the live runner, not admitted here.
                     observations.setdefault(observation.observation_id, record)
+                completed_queries[pending_response.query_ref] = pending_response
                 pending_request = None
                 pending_response = None
             elif event.event_type == EventType.TOOL_EXCEPTION:
                 if pending_request is not None and pending_response is None:
                     pending_request = None
             elif event.event_type == EventType.ANSWER_FROZEN:
-                if status != EpisodeStatus.ACTIVE or pending_request is not None:
+                if (status != EpisodeStatus.ACTIVE or pending_request is not None
+                        or extension_started is not None
+                        or expected_extension_proposal is not None):
                     raise ReplayValidationError("answer freeze is out of order")
                 answer = AnswerArtifact.model_validate(event.payload)
                 if not answer.verify_digest():
                     raise ReplayValidationError("answer artifact digest is invalid")
                 if answer.transcript_digest != event.previous_digest:
                     raise ReplayValidationError("answer is not bound to the inference transcript")
+                if "inquiry_candidates" in event.payload:
+                    expected_outcomes = inquiry_outcomes(
+                        events[:expected_sequence - 1],
+                        provider.preview(tuple(proposals.values()), tuple(observations.values()))
+                        .candidate_assessments,
+                    )
+                    if answer.inquiry_candidates != expected_outcomes:
+                        raise ReplayValidationError("inquiry outcomes differ from transcript and Core")
                 if answer.authoritative_decision.status in {
                     DecisionStatus.DISCOVERED_VERIFIED,
                     DecisionStatus.MULTIPLE_SUPPORTED,

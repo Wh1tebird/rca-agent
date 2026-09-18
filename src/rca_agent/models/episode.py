@@ -122,6 +122,26 @@ class CandidateFrontier(BaseModel):
     unsubmitted_candidate_ids: tuple[str, ...] = ()
 
 
+class InquiryCandidateOutcome(BaseModel):
+    """Auditable investigation history; it cannot grant Core confirmation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    hypothesis_id: str
+    mechanism: str
+    alternative: str
+    first_round: int
+    last_round: int
+    mention_count: int
+    query_refs: tuple[str, ...] = ()
+    observation_refs: tuple[str, ...] = ()
+    discovery_disposition: str
+    discovery_reason: str
+    formal_mechanism_ids: tuple[str, ...] = ()
+    compiled_candidate_ids: tuple[str, ...] = ()
+    core_evidence_statuses: tuple[str, ...] = ()
+
+
 class AnswerArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -131,6 +151,7 @@ class AnswerArtifact(BaseModel):
     authoritative_decision: AuthoritativeDecision
     observation_refs: tuple[str, ...]
     missing_evidence: tuple[str, ...]
+    inquiry_candidates: tuple[InquiryCandidateOutcome, ...] = ()
     transcript_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     component_versions: dict[str, str]
     frozen_at: datetime
@@ -138,4 +159,10 @@ class AnswerArtifact(BaseModel):
 
     def verify_digest(self) -> bool:
         payload = self.model_dump(mode="json", exclude={"artifact_digest"})
-        return sha256_digest(payload) == self.artifact_digest
+        if sha256_digest(payload) == self.artifact_digest:
+            return True
+        # Earlier signed answers predate the optional inquiry projection.
+        if not self.inquiry_candidates:
+            payload.pop("inquiry_candidates", None)
+            return sha256_digest(payload) == self.artifact_digest
+        return False

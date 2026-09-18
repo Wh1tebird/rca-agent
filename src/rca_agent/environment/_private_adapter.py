@@ -20,6 +20,11 @@ from rca_agent.core.rca100_adapter import (
     WindowComparisonQuery,
 )
 from rca_agent.core.trace_analysis import extract_trace_stage_observation, rank_trace_participants
+from rca_agent.environment.metric_catalog import (
+    EXTRA_DEPLOYMENT_METRICS,
+    EXTRA_SERVICE_METRICS,
+    REMAINING_METRICS,
+)
 
 PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
     "apm.operation": {
@@ -30,6 +35,7 @@ PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
         "error_rate": ("apm.operation", "error_rate", "ratio"),
     },
     "apm.service": {
+        **EXTRA_SERVICE_METRICS,
         "request_latency_seconds": ("apm.service.legacy", "latency", "s"),
         "request_count": ("apm.service.legacy", "workload", "count"),
         "slow_count": ("apm.service.legacy", "slow", "count"),
@@ -70,11 +76,23 @@ PUBLIC_METRIC_MAP: dict[str, dict[str, tuple[str, str, str | None]]] = {
         "not_ready_status": ("k8s.node", "node_not_ready_status", "state"),
     },
     "k8s.deployment": {
+        **EXTRA_DEPLOYMENT_METRICS,
         "cpu_usage_total": ("k8s.deployment", "deployment_cpu_usage_total", None),
         "memory_usage_total": ("k8s.deployment", "deployment_memory_usage_total", None),
         "ready_replicas": ("k8s.deployment", "deployment_ready_replicas", "count"),
     },
+    "apm.instance": {
+        "request_latency_seconds": ("apm.instance", "avg_request_latency_seconds", "s"),
+        "request_count": ("apm.instance", "request_count", "count"),
+        "error_count": ("apm.instance", "error_count", "count"),
+        "error_rate": ("apm.instance", "error_rate", "ratio"),
+        "slow_count": ("apm.instance", "slow_count", "count"),
+    },
+    "k8s.pod": {"pod_restart_count": ("k8s.pod", "pod_restart_count", "count")},
 }
+
+for _entity_type, _mappings in REMAINING_METRICS.items():
+    PUBLIC_METRIC_MAP.setdefault(_entity_type, {}).update(_mappings)
 
 
 @dataclass(frozen=True, slots=True)

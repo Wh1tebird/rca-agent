@@ -7,6 +7,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from rca_agent.models.common import EntityRef, Modality, TimeWindow
 
 
+class MetricDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    entity_type: str
+    signal: str
+    unit: str | None = None
+    description: str
+
+
 class CapabilityDescriptor(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -17,6 +26,9 @@ class CapabilityDescriptor(BaseModel):
     query_cost: int = Field(ge=0)
     max_window_seconds: int = Field(gt=0)
     max_results: int = Field(gt=0)
+    metrics: tuple[MetricDescriptor, ...] = ()
+    unavailable_signals: dict[str, str] = Field(default_factory=dict)
+    unsupported_derivations: dict[str, str] = Field(default_factory=dict)
 
 
 class QueryBudgetView(BaseModel):
