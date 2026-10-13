@@ -40,8 +40,16 @@ def test_local_model_prompts_on_terminal_without_echoing_credential(monkeypatch)
 
 def test_benchmark_defaults_to_local_provider_without_key_access(monkeypatch):
     monkeypatch.delenv("RCA_LOCAL_API_KEY", raising=False)
-    assert case_parser().parse_args([]).provider == "qwen-local"
-    assert batch_parser().parse_args([]).provider == "qwen-local"
+    case_args = case_parser().parse_args([])
+    batch_args = batch_parser().parse_args([])
+    assert case_args.provider == "qwen-local"
+    assert batch_args.provider == "qwen-local"
+    assert case_args.model_timeout_seconds == 300
+    assert case_args.model_max_tokens == 65536
+    assert case_args.discovery_timeout_seconds == 300
+    assert batch_args.model_timeout_seconds == 300
+    assert batch_args.model_max_tokens == 65536
+    assert batch_args.discovery_timeout_seconds == 300
 
 
 def test_qwen_policy_and_discovery_bind_without_network(monkeypatch):

@@ -346,8 +346,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--acquisition", choices=("fixed", "ai", "inquiry"), default="fixed")
     value.add_argument("--thinking-enabled", action="store_true")
     value.add_argument("--rerun-existing", action="store_true")
-    value.add_argument("--model-timeout-seconds", type=float, default=115)
-    value.add_argument("--discovery-timeout-seconds", type=float, default=120)
+    value.add_argument("--model-timeout-seconds", type=float, default=300)
+    value.add_argument("--model-max-tokens", type=int, default=65536)
+    value.add_argument("--discovery-timeout-seconds", type=float, default=300)
     return value
 
 
@@ -377,6 +378,11 @@ def main() -> None:
                     cached.get("provider", "deepseek") == args.provider
                     and cached.get("model") == model_name
                     and cached.get("thinking_enabled") == thinking_enabled
+                    and cached.get("model_timeout_seconds") == args.model_timeout_seconds
+                    and cached.get("model_max_tokens") == (
+                        args.model_max_tokens if args.provider == "deepseek" else 16384
+                    )
+                    and cached.get("discovery_timeout_seconds") == args.discovery_timeout_seconds
                     and cached.get("holdout_candidate") == item["holdout_candidate"]
                     and cached.get("acquisition_mode", "fixed") == args.acquisition
                 ):
@@ -391,6 +397,7 @@ def main() -> None:
                     "allow_insecure_http": args.allow_insecure_http,
                     "disable_thinking": not thinking_enabled,
                     "model_timeout_seconds": args.model_timeout_seconds,
+                    "model_max_tokens": args.model_max_tokens,
                     "discovery_timeout_seconds": args.discovery_timeout_seconds,
                     "output": None,
                     "acquisition": args.acquisition,
@@ -408,6 +415,11 @@ def main() -> None:
             "provider": args.provider,
             "model": model_name,
             "thinking_enabled": thinking_enabled,
+            "model_timeout_seconds": args.model_timeout_seconds,
+            "model_max_tokens": (
+                args.model_max_tokens if args.provider == "deepseek" else 16384
+            ),
+            "discovery_timeout_seconds": args.discovery_timeout_seconds,
             "summary": summarize(scores, failures),
             "cases": scores,
         }

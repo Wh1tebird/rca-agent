@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from rca_agent.core.v3.catalog import mechanism_catalog
+from rca_agent.investigation import InvestigationWorkspaceSnapshot
 from rca_agent.langchain_policy import (
     CandidateOption,
     LangChainPolicyAdapter,
@@ -14,6 +15,7 @@ from rca_agent.langchain_policy import (
 )
 from rca_agent.models import (
     AnswerArtifact,
+    CallToolAction,
     CandidateEvidenceStatus,
     CandidateFrontier,
     CoreAssessmentPreview,
@@ -33,6 +35,7 @@ class InvestigationGraphState(TypedDict, total=False):
     action: PolicyAction
     core_assessment: CoreAssessmentPreview
     candidate_frontier: CandidateFrontier
+    investigation_workspace: InvestigationWorkspaceSnapshot
     answer: AnswerArtifact
     discovery_requested: bool
     deferred_stop: bool
@@ -47,6 +50,7 @@ class LangGraphRunReport(BaseModel):
     history: tuple[dict[str, Any], ...]
     final_preview: CoreAssessmentPreview
     final_frontier: CandidateFrontier
+    final_workspace: InvestigationWorkspaceSnapshot
 
 
 class LangGraphInvestigation:
@@ -65,6 +69,13 @@ class LangGraphInvestigation:
         self._policy = policy
         self._discovery_notes_provider = discovery_notes_provider
         self._inquiry_rounds_provider = inquiry_rounds_provider
+        if runner.inquiry_loop_mode == "batched" and inquiry_rounds_provider is not None:
+            raise ValueError("batched Inquiry records rounds through its accepted host steps")
+        if runner.inquiry_loop_mode != policy.inquiry_loop_mode:
+            raise ValueError("Inquiry loop mode differs between host and Policy")
+        if (runner.inquiry_loop_mode == "batched"
+                and runner.inquiry_query_limit != policy.inquiry_query_limit):
+            raise ValueError("Inquiry query limit differs between host and Policy")
         self._recorded_inquiry_rounds = 0
         self._enable_core_feedback = enable_core_feedback
         self._bootstrap = None
@@ -82,11 +93,13 @@ class LangGraphInvestigation:
         )
         initial_preview = self._runner.preview_core_assessment()
         initial_frontier = _candidate_frontier(initial_preview, self._candidate_options)
+        initial_workspace = self._runner.investigation_workspace_snapshot
         state = self._graph.invoke(
             {
                 "history": (),
                 "core_assessment": initial_preview,
                 "candidate_frontier": initial_frontier,
+                "investigation_workspace": initial_workspace,
             },
             {"recursion_limit": recursion_limit},
         )
@@ -99,6 +112,10 @@ class LangGraphInvestigation:
             history=state.get("history", ()),
             final_preview=state.get("core_assessment", initial_preview),
             final_frontier=state.get("candidate_frontier", initial_frontier),
+            final_workspace=(
+                answer.investigation_workspace
+                or state.get("investigation_workspace", initial_workspace)
+            ),
         )
 
     def _build_graph(self):
@@ -139,20 +156,43 @@ class LangGraphInvestigation:
         self._graph_steps += 1
         assert self._bootstrap is not None
         try:
-            action = self._policy.next_action(
-                PolicyContext(
-                    bootstrap=self._bootstrap,
-                    candidate_options=self._candidate_options,
-                    history=state.get("history", ()),
-                    core_assessment=state["core_assessment"],
-                    candidate_frontier=state["candidate_frontier"],
-                )
-            )
-            if self._inquiry_rounds_provider is not None:
-                rounds = self._inquiry_rounds_provider()
-                for record in rounds[self._recorded_inquiry_rounds:]:
-                    self._runner.record_inquiry_round(record)
-                    self._recorded_inquiry_rounds += 1
+            if self._runner.inquiry_loop_mode == "batched":
+                self._runner.select_startup_query()
+            action = None
+            for _ in range(12):
+                try:
+                    proposed = self._policy.next_action(
+                        PolicyContext(
+                            bootstrap=self._bootstrap,
+                            candidate_options=self._candidate_options,
+                            history=state.get("history", ()),
+                            core_assessment=state["core_assessment"],
+                            candidate_frontier=state["candidate_frontier"],
+                            investigation_workspace=(
+                                self._runner.investigation_workspace_snapshot.model_dump(mode="json")
+                                if self._runner.inquiry_loop_mode == "batched" else None),
+                            inquiry_state_view=(self._runner.inquiry_loop_view()
+                                if self._runner.inquiry_loop_mode == "batched" else None),
+                        )
+                    )
+                finally:
+                    for diagnostic in self._policy.drain_inquiry_diagnostics():
+                        self._runner.record_inquiry_attempt(diagnostic)
+                    for diagnostic in self._policy.drain_inquiry_loop_attempts():
+                        self._runner.record_inquiry_loop_attempt(diagnostic)
+                for step, view in self._policy.drain_inquiry_loop_steps():
+                    self._runner.record_inquiry_loop_step(step, input_view=view)
+                if self._inquiry_rounds_provider is not None:
+                    rounds = self._inquiry_rounds_provider()
+                    for record in rounds[self._recorded_inquiry_rounds:]:
+                        self._runner.record_inquiry_round(record)
+                        self._recorded_inquiry_rounds += 1
+                action = self._runner.route_active_inquiry_action(proposed)
+                self._policy.record_routed_action(proposed, action)
+                if action is not None:
+                    break
+            if action is None:
+                raise RuntimeError("active inquiry routing suppressed too many queued actions")
         except Exception as exc:  # noqa: BLE001 - only the error type crosses the trust boundary
             self._runner.reject_raw_action(
                 {"source": "langchain_policy"},
@@ -170,6 +210,8 @@ class LangGraphInvestigation:
         self._graph_steps += 1
         notes = (self._discovery_notes_provider(state.get("history", ()))
                  if self._discovery_notes_provider is not None else None)
+        if self._runner.inquiry_loop_mode == "batched":
+            notes = self._runner.inquiry_loop_handoff()
         result = self._runner.discover_candidates(inquiry_handoff=notes)
         assert self._bootstrap is not None
         self._candidate_options = (
@@ -202,7 +244,7 @@ class LangGraphInvestigation:
                                 {"kind": "core_feedback_plan", "result": planned})}
         records = []
         for hypothesis_id, signal, action in self._runner.feedback_query_options()[:2]:
-            response = self._runner.handle(action)
+            response = self._runner.verify_feedback_query(hypothesis_id, signal, action)
             if isinstance(response, AnswerArtifact):
                 return {"answer": response, "feedback_attempted": True}
             observation_refs = ()
@@ -227,7 +269,12 @@ class LangGraphInvestigation:
     def _execute_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         self._graph_steps += 1
         action = state["action"]
-        result = self._runner.handle(action)
+        if (self._runner.inquiry_loop_mode == "batched"
+                and isinstance(action, CallToolAction)
+                and self._policy.consume_startup_action(action)):
+            result = self._runner.handle_startup_query(action)
+        else:
+            result = self._runner.handle(action)
         if isinstance(result, AnswerArtifact):
             serialized_result: dict[str, Any] = {
                 "kind": "answer",
@@ -264,6 +311,7 @@ class LangGraphInvestigation:
         return {
             "core_assessment": preview,
             "candidate_frontier": _candidate_frontier(preview, self._candidate_options),
+            "investigation_workspace": self._runner.investigation_workspace_snapshot,
         }
 
     def _finalize_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
@@ -297,6 +345,9 @@ class LangGraphInvestigation:
             }
         ):
             return "finalize"
+        if (self._runner.inquiry_loop_mode == "batched"
+                and self._runner.inquiry_loop_phase in {"awaiting_results", "awaiting_assessment"}):
+            return "policy"
         if self._runner.should_discover():
             return "discover"
         if (self._enable_core_feedback and not state.get("feedback_attempted")

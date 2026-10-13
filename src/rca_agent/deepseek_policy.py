@@ -11,13 +11,16 @@ from rca_agent.langchain_policy import LangChainPolicyAdapter
 from rca_agent.langchain_verification_planner import LangChainVerificationPlannerAdapter
 
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_MAX_TOKENS = 65536
+DEFAULT_DEEPSEEK_TIMEOUT_SECONDS = 300
 
 
 def create_deepseek_chat_model(
     *,
     api_key: SecretStr | None = None,
     model: str = DEFAULT_DEEPSEEK_MODEL,
-    timeout_seconds: float = 120,
+    timeout_seconds: float = DEFAULT_DEEPSEEK_TIMEOUT_SECONDS,
+    max_tokens: int = DEFAULT_DEEPSEEK_MAX_TOKENS,
     max_retries: int = 2,
     thinking_enabled: bool = True,
 ) -> ChatDeepSeek:
@@ -36,7 +39,7 @@ def create_deepseek_chat_model(
     return ChatDeepSeek(
         model=model,
         temperature=0,
-        max_tokens=8192,
+        max_tokens=max_tokens,
         timeout=timeout_seconds,
         max_retries=max_retries,
         **reasoning,
@@ -61,7 +64,8 @@ def create_deepseek_discovery(
     *,
     api_key: SecretStr | None = None,
     model: str = DEFAULT_DEEPSEEK_MODEL,
-    timeout_seconds: float = 30,
+    timeout_seconds: float = DEFAULT_DEEPSEEK_TIMEOUT_SECONDS,
+    max_tokens: int = DEFAULT_DEEPSEEK_MAX_TOKENS,
     thinking_enabled: bool = True,
 ) -> LangChainDiscoveryAdapter:
     """Construct (without calling) the separately budgeted open-discovery model."""
@@ -70,6 +74,7 @@ def create_deepseek_discovery(
             api_key=api_key,
             model=model,
             timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
             max_retries=0,
             thinking_enabled=thinking_enabled,
         ),
@@ -81,7 +86,8 @@ def create_deepseek_discovery_pipeline(
     *,
     api_key: SecretStr | None = None,
     model: str = DEFAULT_DEEPSEEK_MODEL,
-    timeout_seconds: float = 30,
+    timeout_seconds: float = DEFAULT_DEEPSEEK_TIMEOUT_SECONDS,
+    max_tokens: int = DEFAULT_DEEPSEEK_MAX_TOKENS,
     thinking_enabled: bool = True,
 ) -> tuple[LangChainMechanismDiscoveryAdapter, LangChainVerificationPlannerAdapter]:
     """Bind two prompts to one stateless provider model configuration."""
@@ -89,6 +95,7 @@ def create_deepseek_discovery_pipeline(
         api_key=api_key,
         model=model,
         timeout_seconds=timeout_seconds,
+        max_tokens=max_tokens,
         max_retries=0,
         thinking_enabled=thinking_enabled,
     )

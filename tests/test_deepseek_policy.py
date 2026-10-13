@@ -1,7 +1,9 @@
 from pydantic import SecretStr
 
 from rca_agent.deepseek_policy import (
+    DEFAULT_DEEPSEEK_MAX_TOKENS,
     DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_DEEPSEEK_TIMEOUT_SECONDS,
     create_deepseek_chat_model,
     create_deepseek_discovery_pipeline,
     create_deepseek_policy,
@@ -17,11 +19,22 @@ def test_deepseek_model_uses_accuracy_first_agent_configuration():
     assert model.model_name == "deepseek-v4-pro"
     assert model.model_name == DEFAULT_DEEPSEEK_MODEL
     assert model.temperature == 0
-    assert model.max_tokens == 8192
+    assert model.max_tokens == 65536
+    assert model.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS
+    assert model.request_timeout == DEFAULT_DEEPSEEK_TIMEOUT_SECONDS
     assert model.max_retries == 2
     assert model.reasoning_effort == "high"
     assert model.extra_body == {"thinking": {"type": "enabled"}}
     assert "test-only-secret" not in repr(model)
+
+
+def test_deepseek_model_accepts_explicit_generation_and_wait_limits():
+    model = create_deepseek_chat_model(
+        api_key=SecretStr("test-only-secret"), timeout_seconds=420, max_tokens=131072,
+    )
+
+    assert model.request_timeout == 420
+    assert model.max_tokens == 131072
 
 
 def test_deepseek_policy_binds_to_closed_structured_output_without_network_access():

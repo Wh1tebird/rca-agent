@@ -177,6 +177,7 @@ class AlternativeDraft(BaseModel):
     alternative_id: str = Field(pattern=r"^alt-[a-z0-9-]{1,40}$")
     mechanism: str = Field(min_length=3, max_length=500)
     mechanism_class: MechanismClass
+    inquiry_provenance: dict[str, str] | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class MechanismDraft(BaseModel):
@@ -207,12 +208,42 @@ class InquiryDisposition(BaseModel):
     disposition: Literal["kept", "revised", "discarded", "deferred"]
     reason: str = Field(min_length=1, max_length=2000)
     formal_mechanism: str | None = Field(default=None, max_length=500)
+    basis_observation_refs: tuple[str, ...] | None = Field(
+        default=None, max_length=30, exclude_if=lambda value: value is None,
+    )
+    original_disposition: Literal["retained", "deferred"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
+
+
+class NewMechanismBasis(BaseModel):
+    """Explicit provenance for a cause added by semantic Discovery, not a replacement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mechanism: str = Field(min_length=3, max_length=500)
+    source_hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
+    basis_observation_refs: tuple[str, ...] = Field(min_length=1, max_length=30)
+
+
+class IdentifiedMechanismHint(BaseModel):
+    """A mechanism named in a disposition reason but omitted from the formal drafts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    inquiry_hypothesis_id: str = Field(min_length=1, max_length=40)
+    source_hypothesis_id: str = Field(pattern=r"^h-[a-z0-9-]{1,40}$")
+    mechanism: str = Field(min_length=3, max_length=500)
 
 
 class MechanismDiscoveryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     mechanisms: tuple[MechanismDraft, ...] = Field(default=(), max_length=4)
     inquiry_dispositions: tuple[InquiryDisposition, ...] = Field(default=(), max_length=20)
+    new_mechanisms: tuple[NewMechanismBasis, ...] | None = Field(
+        default=None, max_length=4, exclude_if=lambda value: value is None,
+    )
+    identified_but_unsubmitted_mechanisms: tuple[IdentifiedMechanismHint, ...] = Field(
+        default=(), max_length=4
+    )
 
 
 class FrozenMechanism(BaseModel):
@@ -348,6 +379,9 @@ class CompiledCandidate(BaseModel):
     discovery_query_refs: tuple[str, ...] = ()
     discovery_observation_refs: tuple[str, ...] = ()
     discovery_fact_digests: tuple[str, ...] = ()
+    verification_standard: Literal[
+        "generic-root-cause-v1", "generic-root-cause-v2"
+    ] = "generic-root-cause-v1"
     version: str
 
 
@@ -433,7 +467,14 @@ class EvidenceRegistry(BaseModel):
         mechanism: FrozenMechanism,
         plan: VerificationPlanDraft,
     ) -> tuple[VerificationPlanDraft, tuple[str, ...]]:
-        """Remove claims the host cannot validate while retaining safe investigation tests."""
+        """Remove claims the host cannot validate while retaining safe investigation tests.
+
+        ``RuleSpec.refutes`` names the mechanism classes that can be ruled out when the
+        advertised positive predicate is *absent*.  A matching predicate is therefore
+        positive evidence for one of those classes.  Keep that direction explicit here:
+        a class-specific predicate cannot support an unrelated primary mechanism, and it
+        cannot be used as a contradiction of the same primary mechanism.
+        """
         normalized, actions = normalize_verification_plan(plan)
         handles = {item.capability_ref: item for item in self.capability_handles()}
         alternatives = {item.alternative_id: item for item in mechanism.alternatives}
@@ -453,6 +494,22 @@ class EvidenceRegistry(BaseModel):
                 continue
             distinguishes = prediction.distinguishes
             handle = handles.get(prediction.capability_ref)
+            if (
+                handle is not None
+                and len(handle.refutes) == 1
+                and prediction.polarity == ConditionPolarity.SUPPORT
+                and mechanism.mechanism_class not in handle.refutes
+            ):
+                repairs.append("removed_cross_mechanism_support_claim")
+                continue
+            if (
+                handle is not None
+                and len(handle.refutes) == 1
+                and prediction.polarity == ConditionPolarity.CONTRADICT
+                and mechanism.mechanism_class in handle.refutes
+            ):
+                repairs.append("removed_self_refutation_claim")
+                continue
             if prediction.polarity == ConditionPolarity.SUPPORT and distinguishes:
                 distinguishes = ()
                 repairs.append("removed_support_alternative_claim")
@@ -515,8 +572,6 @@ class EvidenceRegistry(BaseModel):
                     alternatives[value].mechanism for value in item.distinguishes
                 ),
             ))
-        if not any(item.polarity == ConditionPolarity.CONTRADICT for item in plan.predictions):
-            raise ValueError("verification plan requires a refutation prediction")
         draft = DynamicHypothesis(
             source_hypothesis_id=mechanism.source_hypothesis_id,
             causal_entity_ref=mechanism.causal_entity_ref,
@@ -643,6 +698,7 @@ class EvidenceRegistry(BaseModel):
             discovery_query_refs=discovery_query_refs,
             discovery_observation_refs=discovery_observation_refs,
             discovery_fact_digests=discovery_fact_digests,
+            verification_standard="generic-root-cause-v2",
             version=version,
         )
 
@@ -657,7 +713,7 @@ class DynamicVerification(BaseModel):
     """One mechanism-independent standard, with auditable test outcomes."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-    standard: Literal["generic-root-cause-v1"] = "generic-root-cause-v1"
+    standard: Literal["generic-root-cause-v1", "generic-root-cause-v2"]
     state: DynamicVerificationState
     passed: bool
     blockers: tuple[str, ...]
@@ -694,7 +750,10 @@ def verify_dynamic(
         blockers.append("insufficient_independent_support")
     if any(a.observation is None for _, a in pairs):
         blockers.append("required_observations_unavailable")
-    if any(a.observation is not None and not a.matched for _, a in support):
+    support_not_satisfied = any(
+        a.observation is not None and not a.matched for _, a in support
+    )
+    if support_not_satisfied:
         blockers.append("support_predictions_not_satisfied")
     if not refutations:
         blockers.append("refutation_test_absent")
@@ -733,15 +792,27 @@ def verify_dynamic(
             new_queries.add(fresh_assessment.observation.query_ref)
     if not new_queries:
         blockers.append("no_new_support_verification")
-    decisive_failures = {"support_predictions_not_satisfied", "refutation_observed"}
+    # One missed supporting prediction does not disprove a mechanism when another
+    # independent observation supports it.  It remains unresolved and eligible for
+    # additive investigation.  Treat support as decisively failed only when every
+    # required support observation is present and none of them matches.
+    support_decisively_failed = (
+        support_not_satisfied
+        if compiled.verification_standard == "generic-root-cause-v1"
+        else bool(support) and all(
+            assessment.observation is not None and not assessment.matched
+            for _, assessment in support
+        )
+    )
     state = (
         DynamicVerificationState.FAILED
-        if decisive_failures.intersection(blockers)
+        if "refutation_observed" in blockers or support_decisively_failed
         else DynamicVerificationState.UNRESOLVED
         if blockers
         else DynamicVerificationState.VERIFIED
     )
     return DynamicVerification(
+        standard=compiled.verification_standard,
         state=state,
         passed=not blockers,
         blockers=tuple(blockers),

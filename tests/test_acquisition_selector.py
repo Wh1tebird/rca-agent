@@ -18,7 +18,7 @@ def test_ai_can_select_new_bounded_metric_and_runner_executes(cases_root):
     from rca_agent.models import RequestStopAction
     from rca_agent.runner import EpisodeRunner, RecordedReplay
 
-    runner = EpisodeRunner(Rca100Environment.from_case(cases_root, "t007"))
+    runner = EpisodeRunner(Rca100Environment.from_case(cases_root, "t007"), inquiry_contract_version=1)
     bootstrap = runner.start()
     context = {"bootstrap": bootstrap.model_dump(mode="json")}
     options = query_options(context, [context["bootstrap"]["alert_entity"]])
@@ -93,7 +93,7 @@ def test_inquiry_binds_query_to_need_and_replans_after_round(cases_root):
             "choices": [{"need_id": "n1", "query_ref": refs[0]}],
         }
 
-    policy = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan)))
+    policy = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1))
     first = policy._inquiry_screen(context)
     assert first.request.signal == "request_count"
     assert policy.inquiry_drafts[0]["draft"]["needs"][0]["question"] == "Did traffic rise?"
@@ -128,7 +128,7 @@ def test_inquiry_query_limit_reserves_capacity_for_verification(cases_root):
         }
 
     policy = HoldoutAcquisitionPolicy(
-        inquiry=LangChainInquiryAdapter(RunnableLambda(plan)), inquiry_query_limit=1,
+        inquiry=LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1), inquiry_query_limit=1,
     )
     assert policy._inquiry_screen(context) is not None
     assert policy._inquiry_screen(context) is None
@@ -147,7 +147,7 @@ def test_inquiry_rejects_unoffered_query(cases_root):
                    "expected_if_true": "up", "expected_if_alternative": "flat"}],
         "choices": [{"need_id": "n1", "query_ref": "invented"}],
     }
-    adapter = LangChainInquiryAdapter(RunnableLambda(lambda _: invalid))
+    adapter = LangChainInquiryAdapter(RunnableLambda(lambda _: invalid), contract_version=1)
     with pytest.raises(ValueError, match="not offered"):
         adapter.plan({}, options)
 
@@ -172,7 +172,7 @@ def test_inquiry_retries_one_invalid_binding_without_executing_it(cases_root):
             "choices": [{"need_id": "n1", "query_ref": "wrong" if calls == 1 else ref}],
         }
 
-    policy = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan)))
+    policy = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1))
     action = policy._inquiry_screen(context)
     assert action is not None
     assert calls == 2
@@ -196,6 +196,17 @@ def test_inquiry_reports_schema_failure_without_provider_payload_leak(cases_root
     assert "provider secret" not in str(raised.value.diagnostic())
 
 
+@pytest.mark.parametrize("finish,code", [("stop", "empty_response"), ("length", "output_truncated")])
+def test_inquiry_distinguishes_empty_and_truncated(finish, code):
+    adapter = LangChainInquiryAdapter(RunnableLambda(lambda _: {
+        "raw": AIMessage(content="", response_metadata={"finish_reason": finish}),
+        "parsed": None, "parsing_error": None,
+    }))
+    with pytest.raises(InquiryOutputError) as raised:
+        adapter.plan({}, {})
+    assert raised.value.code == code
+
+
 def test_inquiry_uses_first_two_queries_when_model_offers_more(cases_root):
     bootstrap = Rca100Environment.from_case(cases_root, "t007").reset()
     context = {"bootstrap": bootstrap.model_dump(mode="json")}
@@ -211,8 +222,31 @@ def test_inquiry_uses_first_two_queries_when_model_offers_more(cases_root):
             "choices": [{"need_id": "n1", "query_ref": ref} for ref in refs],
         }
 
-    draft, actions = LangChainInquiryAdapter(RunnableLambda(plan)).plan({}, options)
+    draft, actions = LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1).plan({}, options)
     assert len(draft.choices) == len(actions) == 2
+
+
+def test_inquiry_duplicate_query_preserves_hypotheses_and_needs(cases_root):
+    bootstrap = Rca100Environment.from_case(cases_root, "t007").reset()
+    context = {"bootstrap": bootstrap.model_dump(mode="json")}
+    options = query_options(context, [context["bootstrap"]["alert_entity"]])
+
+    def plan(payload):
+        ref = next(iter(json.loads(payload["context"])["queries"]))
+        return {
+            "hypotheses": [{"hypothesis_id": "h1", "mechanism": "worker saturation",
+                            "alternative": "slow dependency"}],
+            "needs": [{"need_id": name, "hypothesis_id": "h1", "question": "how occupied?",
+                       "expected_if_true": "high", "expected_if_alternative": "normal"}
+                      for name in ("n1", "n2")],
+            "choices": [{"need_id": name, "query_ref": ref} for name in ("n1", "n2")],
+        }
+
+    draft, actions = LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1).plan({}, options)
+    assert len(draft.hypotheses) == 1
+    assert len(draft.needs) == 2
+    assert len(draft.choices) == len(actions) == 1
+    assert draft.choices[0].need_id == "n1"
     assert all(choice.query_ref in options for choice in draft.choices)
 
 
@@ -247,9 +281,9 @@ def test_inquiry_handoff_reaches_discovery_and_replays(cases_root):
         }
 
     discovery = CaptureDiscovery()
-    acquisition = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan)))
+    acquisition = HoldoutAcquisitionPolicy(inquiry=LangChainInquiryAdapter(RunnableLambda(plan), contract_version=1))
     runner = EpisodeRunner(
-        Rca100Environment.from_case(cases_root, "t007"), max_rounds=30,
+        Rca100Environment.from_case(cases_root, "t007"), inquiry_contract_version=1, max_rounds=30,
         decision_provider=CoreDecisionProvider(frozenset({"threadExhaustion"})),
         discovery=discovery, verification_planner=object(),
         evidence_registry=rca100_evidence_registry,
@@ -266,10 +300,11 @@ def test_inquiry_handoff_reaches_discovery_and_replays(cases_root):
     assert handoff["query_links"][0]["hypothesis_id"] == "h1"
     completed = next(event.payload for event in runner.transcript.events
                      if event.event_type.value == "discovery_completed")
-    assert completed["inquiry_dispositions"][0]["disposition"] == "discarded"
+    # A lack of supporting data cannot justify discarding without cited observed facts.
+    assert completed["inquiry_dispositions"][0]["disposition"] == "deferred"
     assert report.answer is not None
     assert report.answer.inquiry_candidates[0].mechanism == "thread pool backlog"
-    assert report.answer.inquiry_candidates[0].discovery_disposition == "discarded"
+    assert report.answer.inquiry_candidates[0].discovery_disposition == "deferred"
     assert report.answer.inquiry_candidates[0].observation_refs
     assert sum(event.event_type.value == "inquiry_round_recorded"
                for event in runner.transcript.events) == len(acquisition.inquiry_drafts)
@@ -302,7 +337,7 @@ def test_recorded_inquiry_survives_when_discovery_never_runs(cases_root):
     from rca_agent.models import RequestStopAction
     from rca_agent.runner import EpisodeRunner, RecordedReplay
 
-    runner = EpisodeRunner(Rca100Environment.from_case(cases_root, "t007"))
+    runner = EpisodeRunner(Rca100Environment.from_case(cases_root, "t007"), inquiry_contract_version=1)
     runner.start()
     runner.record_inquiry_round({
         "round": 2,  # The first model call may have failed before producing a valid draft.

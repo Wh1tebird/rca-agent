@@ -13,10 +13,12 @@ from rca_agent.local_model import DEFAULT_LOCAL_MODEL, create_local_chat_model
 
 def create_qwen_policy(
     *, model: str = DEFAULT_LOCAL_MODEL, base_url: str | None = None,
+    timeout_seconds: float = 120,
     allow_insecure_http: bool = False,
 ) -> LangChainPolicyAdapter:
     return LangChainPolicyAdapter.from_chat_model(
         create_local_chat_model(model=model, base_url=base_url,
+                                timeout_seconds=timeout_seconds,
                                 allow_insecure_http=allow_insecure_http),
         structured_method="json_schema",
     )

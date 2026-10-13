@@ -220,7 +220,7 @@ class CoreDecisionProvider:
             winning_hypothesis_id=winning_hypothesis_id,
             supported_hypothesis_ids=supported_hypothesis_ids,
             reason=_reason(
-                "dynamic mechanism satisfies generic-root-cause-v1 and is returned as this "
+                "dynamic mechanism satisfies its recorded generic root-cause standard and is returned as this "
                 "investigation's root cause; not promoted to Catalog; alternatives are bounded "
                 "by the recorded verification plan"
                 if status == DecisionStatus.DISCOVERED_VERIFIED else decision.reason, notes,
@@ -446,10 +446,20 @@ def _candidate_previews(
                     contradicting.add(condition.signal)
         proposals = evaluation.proposals_by_candidate[candidate.candidate_id]
         state = state_by_candidate[candidate.candidate_id]
+        dynamic_verification = evaluation.dynamic_verifications.get(candidate.candidate_id)
         if evaluation.decision.winner == candidate.candidate_id:
             evidence_status = (CandidateEvidenceStatus.DISCOVERED_VERIFIED
                                if candidate.candidate_id in evaluation.dynamic_verifications
                                else CandidateEvidenceStatus.CONFIRMED)
+        elif dynamic_verification is not None:
+            if dynamic_verification.state == DynamicVerificationState.FAILED:
+                evidence_status = CandidateEvidenceStatus.CONTRADICTED
+            elif dynamic_verification.support_signals:
+                evidence_status = CandidateEvidenceStatus.SUPPORTED
+            elif not any(item.observation_refs for item in proposals):
+                evidence_status = CandidateEvidenceStatus.UNASSESSED
+            else:
+                evidence_status = CandidateEvidenceStatus.INCONCLUSIVE
         elif contradicting or state.contradict_strength > 0:
             evidence_status = CandidateEvidenceStatus.CONTRADICTED
         elif state.support_strength > 0:

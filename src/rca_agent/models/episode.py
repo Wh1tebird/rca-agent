@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rca_agent.investigation.models import InvestigationWorkspaceSnapshot
 from rca_agent.models.actions import HypothesisProposal, StopReason
 from rca_agent.tools.fingerprint import sha256_digest
 
@@ -126,6 +127,7 @@ class InquiryCandidateOutcome(BaseModel):
     """Auditable investigation history; it cannot grant Core confirmation."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+    alternative_id: str | None = Field(default=None, exclude_if=lambda v: v is None)
 
     hypothesis_id: str
     mechanism: str
@@ -152,6 +154,7 @@ class AnswerArtifact(BaseModel):
     observation_refs: tuple[str, ...]
     missing_evidence: tuple[str, ...]
     inquiry_candidates: tuple[InquiryCandidateOutcome, ...] = ()
+    investigation_workspace: InvestigationWorkspaceSnapshot | None = None
     transcript_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     component_versions: dict[str, str]
     frozen_at: datetime
@@ -159,10 +162,27 @@ class AnswerArtifact(BaseModel):
 
     def verify_digest(self) -> bool:
         payload = self.model_dump(mode="json", exclude={"artifact_digest"})
-        if sha256_digest(payload) == self.artifact_digest:
-            return True
-        # Earlier signed answers predate the optional inquiry projection.
+        variants = [payload]
+        if (
+            self.investigation_workspace is not None
+            and self.investigation_workspace.discrimination_matrix is None
+            and not self.investigation_workspace.shadow_selections
+        ):
+            legacy_workspace = dict(payload["investigation_workspace"])
+            legacy_workspace.pop("discrimination_matrix", None)
+            legacy_workspace.pop("shadow_selections", None)
+            variants.append({**payload, "investigation_workspace": legacy_workspace})
+        # Earlier signed answers predate optional non-authoritative projections.
+        if self.investigation_workspace is None:
+            variants.extend(
+                {key: value for key, value in variant.items()
+                 if key != "investigation_workspace"}
+                for variant in tuple(variants)
+            )
         if not self.inquiry_candidates:
-            payload.pop("inquiry_candidates", None)
-            return sha256_digest(payload) == self.artifact_digest
-        return False
+            variants.extend(
+                {key: value for key, value in variant.items()
+                 if key != "inquiry_candidates"}
+                for variant in tuple(variants)
+            )
+        return any(sha256_digest(variant) == self.artifact_digest for variant in variants)

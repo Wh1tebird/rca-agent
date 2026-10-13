@@ -76,9 +76,12 @@ def test_batch_score_separates_raw_semantics_contract_and_repair():
 
 
 def test_capability_audit_keeps_missing_network_and_pool_signals_explicit(
-    cases_root: Path,
+    cases_root: Path, tmp_path: Path,
 ):
-    matrix = build_matrix(cases_root.parent / "answer_key", cases_root)
+    # Capability contracts are independent of case labels; an empty synthetic
+    # answer directory proves the audit without reading real Ground Truth.
+    matrix = build_matrix(tmp_path, cases_root)
+    assert all(item["rca100_case_count"] == 0 for item in matrix["mechanisms"])
     mechanisms = {item["mechanism"]: item for item in matrix["mechanisms"]}
 
     assert mechanisms["slowSQL"]["queryability"] == "full"

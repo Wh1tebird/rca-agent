@@ -59,6 +59,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         create_deepseek_chat_model(
             model=args.model,
             timeout_seconds=args.model_timeout_seconds,
+            max_tokens=args.model_max_tokens,
             max_retries=0,
             thinking_enabled=args.thinking_enabled,
         ),
@@ -96,6 +97,8 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "provider": "deepseek",
         "model": args.model,
         "thinking_enabled": args.thinking_enabled,
+        "model_timeout_seconds": args.model_timeout_seconds,
+        "model_max_tokens": args.model_max_tokens,
         "stopped_before_discovery": stopped_before_discovery,
         "error": error,
         "inquiry_rounds": len(acquisition.inquiry_drafts),
@@ -113,7 +116,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--role")
     value.add_argument("--model", default="deepseek-flash")
     value.add_argument("--thinking-enabled", action="store_true")
-    value.add_argument("--model-timeout-seconds", type=float, default=115)
+    value.add_argument("--model-timeout-seconds", type=float, default=300)
+    value.add_argument("--model-max-tokens", type=int, default=65536)
     value.add_argument("--output", type=Path, required=True)
     return value
 

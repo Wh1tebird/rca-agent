@@ -7,9 +7,10 @@ from typing import Any, Literal
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from rca_agent.models import (
+    CallToolAction,
     CandidateFrontier,
     CoreAssessmentPreview,
     PolicyAction,
@@ -46,6 +47,8 @@ class PolicyContext(BaseModel):
     history: tuple[dict[str, Any], ...] = ()
     core_assessment: CoreAssessmentPreview
     candidate_frontier: CandidateFrontier = CandidateFrontier()
+    investigation_workspace: dict[str, Any] | None = Field(default=None, exclude_if=lambda v: v is None)
+    inquiry_state_view: dict[str, Any] | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class LangChainPolicyAdapter:
@@ -53,6 +56,35 @@ class LangChainPolicyAdapter:
 
     def __init__(self, runnable: Runnable[dict[str, Any], Any]) -> None:
         self._runnable = runnable
+
+    @property
+    def inquiry_loop_mode(self) -> str:
+        return getattr(self._runnable, "loop_mode", "legacy")
+
+    @property
+    def inquiry_query_limit(self) -> int | None:
+        return getattr(self._runnable, "query_limit", None)
+
+    def record_routed_action(self, proposed: PolicyAction, routed: PolicyAction | None) -> None:
+        feedback = getattr(self._runnable, "record_routed_action", None)
+        if callable(feedback):
+            feedback(proposed, routed)
+
+    def drain_inquiry_diagnostics(self) -> tuple[dict[str, Any], ...]:
+        drain = getattr(self._runnable, "drain_inquiry_diagnostics", None)
+        return drain() if callable(drain) else ()
+
+    def drain_inquiry_loop_attempts(self) -> tuple[dict[str, Any], ...]:
+        drain = getattr(self._runnable, "drain_inquiry_loop_attempts", None)
+        return drain() if callable(drain) else ()
+
+    def drain_inquiry_loop_steps(self) -> tuple[tuple[dict[str, Any], dict[str, Any]], ...]:
+        drain = getattr(self._runnable, "drain_inquiry_loop_steps", None)
+        return drain() if callable(drain) else ()
+
+    def consume_startup_action(self, action: CallToolAction) -> bool:
+        consume = getattr(self._runnable, "consume_startup_action", None)
+        return bool(consume(action)) if callable(consume) else False
 
     @classmethod
     def from_chat_model(

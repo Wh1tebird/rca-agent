@@ -10,6 +10,7 @@ def inquiry_outcomes(
     assessments: tuple[CandidateAssessmentPreview, ...],
 ) -> tuple[InquiryCandidateOutcome, ...]:
     handoff = None
+    handoff_version = 1
     inquiry_rounds = []
     dispositions = {}
     frozen: dict[str, str] = {}
@@ -21,6 +22,7 @@ def inquiry_outcomes(
             from rca_agent.langchain_acquisition import InquiryHandoff
 
             handoff = InquiryHandoff.model_validate(event.payload["inquiry_handoff"])
+            handoff_version = event.payload.get("handoff_contract_version", 1)
         elif event.event_type == EventType.DISCOVERY_COMPLETED:
             dispositions = {
                 item["hypothesis_id"]: item
@@ -58,7 +60,8 @@ def inquiry_outcomes(
     for hypothesis in handoff.hypotheses:
         item = dispositions.get(hypothesis.hypothesis_id, {})
         named_mechanism = item.get("formal_mechanism")
-        exact = named_mechanism or hypothesis.mechanism
+        exact = (hypothesis.mechanism if handoff_version in {2, 3, 4, 5, 6, 7}
+                 else named_mechanism or hypothesis.mechanism)
         linked = tuple(sorted(
             mechanism_id for mechanism_id, mechanism in frozen.items()
             if mechanism.strip().casefold() == exact.strip().casefold()
@@ -70,6 +73,7 @@ def inquiry_outcomes(
         links = tuple(link for link in handoff.query_links
                       if link.hypothesis_id == hypothesis.hypothesis_id)
         outcomes.append(InquiryCandidateOutcome(
+            alternative_id=hypothesis.alternative_id,
             hypothesis_id=hypothesis.hypothesis_id,
             mechanism=hypothesis.mechanism,
             alternative=hypothesis.alternative,

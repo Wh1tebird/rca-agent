@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from time import sleep
 
@@ -7,9 +8,12 @@ from pydantic import ValidationError
 
 from rca_agent.core.dynamic import (
     AlternativeDraft,
+    CompiledCandidate,
     DiscoveryPayload,
     DynamicHypothesis,
     EvidenceRegistry,
+    IdentifiedMechanismHint,
+    InquiryDisposition,
     MechanismClass,
     MechanismDiscoveryPayload,
     MechanismDraft,
@@ -51,9 +55,15 @@ from rca_agent.models import (
     ToolStatus,
     UpdateCandidateEvidenceAction,
 )
-from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, IssuedObservation, RecordedReplay
+from rca_agent.runner import (
+    CoreDecisionProvider,
+    EpisodeRunner,
+    IssuedObservation,
+    RecordedReplay,
+    ReplayValidationError,
+)
 from rca_agent.runner.plan_extension import added_predictions
-from rca_agent.runner.transcript import EventType
+from rca_agent.runner.transcript import EventType, Transcript
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
 NOW = datetime(2026, 9, 14, tzinfo=UTC)
@@ -592,6 +602,52 @@ class TwoStagePlanner:
         ),))
 
 
+class CompletionDiscoverer:
+    def __init__(self, *, drift=False):
+        self.calls = 0
+        self.drift = drift
+
+    def discover(self, context):
+        self.calls += 1
+        mechanism = "database query latency"
+        if self.calls == 1:
+            assert "completion_request" not in context
+            return MechanismDiscoveryPayload(
+                inquiry_dispositions=(InquiryDisposition(
+                    hypothesis_id="inq-sql",
+                    disposition="discarded",
+                    reason=(
+                        "Thread saturation is unsupported; database query latency is the causal "
+                        "bottleneck."
+                    ),
+                ),),
+                identified_but_unsubmitted_mechanisms=(IdentifiedMechanismHint(
+                    inquiry_hypothesis_id="inq-sql",
+                    source_hypothesis_id="h-unknown",
+                    mechanism=mechanism,
+                ),),
+            )
+        request = context["completion_request"]
+        assert request["mode"] == "mechanism_completion_only"
+        assert request["allowed_hints"][0]["mechanism"] == mechanism
+        return MechanismDiscoveryPayload(mechanisms=(MechanismDraft(
+            source_hypothesis_id="h-unknown",
+            causal_entity_ref="ent-service",
+            mechanism="network latency" if self.drift else mechanism,
+            mechanism_class=(
+                MechanismClass.NETWORK_LATENCY
+                if self.drift else MechanismClass.DATABASE_EXECUTION
+            ),
+            family=MechanismFamily.DATABASE_DEPENDENCY,
+            causal_explanation="Database work dominates the observed operation latency.",
+            alternatives=(AlternativeDraft(
+                alternative_id="alt-thread-pool",
+                mechanism="thread pool exhaustion",
+                mechanism_class=MechanismClass.THREAD_POOL_SATURATION,
+            ),),
+        ),))
+
+
 class CompetingMechanismsDiscoverer:
     def discover(self, context):
         return MechanismDiscoveryPayload(mechanisms=(
@@ -724,6 +780,217 @@ def test_two_stage_discovery_freezes_mechanism_and_compiles_capability_handles()
             "mechanism": "attempted mutation",
             "predictions": compiled["plan"]["predictions"],
         })
+
+
+def test_planner_retry_receives_specific_safe_errors_and_replay_recomputes_them():
+    class InspectingPlanner(TwoStagePlanner):
+        def plan(self, context):
+            if self.calls:
+                diagnostic = context["errors"][0]["diagnostics"]
+                assert diagnostic["prediction_errors"][0]["error_codes"] == ["UNKNOWN_CAPABILITY_REF"]
+                assert diagnostic["prediction_errors"][0]["prediction_index"] == 0
+                assert diagnostic["eligible_support_capabilities"]
+                assert all("threshold" not in h for h in diagnostic["eligible_support_capabilities"])
+            return super().plan(context)
+
+    planner = InspectingPlanner(fail_first=True)
+    runner, _, _, _ = run(TwoStageDiscoverer(), verification_planner=planner)
+    assert planner.calls == 2
+    assert runner.dynamic_candidate_options
+    assert RecordedReplay.verify(runner.transcript.events).valid
+    rebuilt = Transcript(runner.episode_id)
+    changed = False
+    for event in runner.transcript.events:
+        payload = deepcopy(event.payload)
+        if not changed and event.event_type == EventType.VERIFICATION_PLAN_REJECTED:
+            payload["diagnostics"]["retained_support_count"] += 1
+            changed = True
+        rebuilt.append(event.event_type, payload)
+    assert changed
+    with pytest.raises(ReplayValidationError, match="diagnostics"):
+        RecordedReplay.verify(rebuilt.events)
+
+
+def test_planner_feedback_explains_removed_roles_without_relaxing_compiler():
+    from rca_agent.runner.planner_feedback import plan_feedback
+
+    base = registry()
+    rules = tuple(rule.model_copy(update={"refutes": (MechanismClass.DATABASE_CONNECTION_POOL,)})
+                  if rule.rule_id in {"active_ratio", "queue_ratio"} else rule
+                  for rule in base.rules)
+    restricted = EvidenceRegistry(signals=base.signals, rules=rules)
+    mechanism = freeze_mechanism(TwoStageDiscoverer().discover({
+        "entity_graph": {"nodes": []},
+    }).mechanisms[0])
+    handles = restricted.capability_handles()
+    refs = {h.rule_id: h.capability_ref for h in handles}
+    plan = VerificationPlanDraft(mechanism_id=mechanism.mechanism_id, predictions=tuple(
+        PlannedPrediction(capability_ref=refs[signal], polarity=polarity,
+                          rationale="test role assignment")
+        for signal, polarity in (("active_ratio", "support"), ("queue_ratio", "support"),
+                                 ("downstream_wait_ratio", "contradict"))
+    ))
+    feedback = plan_feedback(mechanism, plan, handles, "CONTRACT_REJECTED")
+    assert feedback["error_code"] == "NO_VALID_SUPPORT"
+    assert feedback["retained_prediction_count"] == 1
+    assert feedback["retained_support_count"] == 0
+    assert feedback["prediction_errors"][0]["error_codes"] == ["CROSS_MECHANISM_SUPPORT"]
+    normalized, _ = restricted.normalize_plan(mechanism, plan)
+    with pytest.raises(ValueError):
+        restricted.compile_plan(mechanism, normalized)
+
+
+def test_discovery_format_formalizer_is_skipped_for_valid_mechanism():
+    class UnexpectedFormalizer:
+        def repair(self, context):
+            raise AssertionError("valid Discovery output must not call AI repair")
+
+    runner, report, _, _ = run(
+        TwoStageDiscoverer(),
+        verification_planner=TwoStagePlanner(),
+        discovery_format_formalizer=UnexpectedFormalizer(),
+    )
+    assert report.answer.authoritative_decision.status != DecisionStatus.OUT_OF_SCOPE
+    assert EventType.DISCOVERY_FORMAT_REPAIR_REQUESTED not in {
+        event.event_type for event in runner.transcript.events
+    }
+    assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+@pytest.mark.parametrize("repair_outcome", ["accepted", "drift", "unsafe_source"])
+def test_discovery_format_repair_is_bounded_and_replayable(repair_outcome):
+    class MalformedDiscovery:
+        def discover(self, context):
+            raw = {
+                "mechanisms": [{
+                    "source_hypothesis_id": "h-unknown",
+                    "causal_entity_ref": "ent-service",
+                    "mechanism": "thread pool exhaustion",
+                    "mechanism_class": "thread_pool_saturation",
+                    "family": "application",
+                    "causal_explanation": "Workers are occupied and incoming tasks wait.",
+                    "alternatives": [{"mechanism": "downstream blocking"}],
+                }],
+            }
+            if repair_outcome == "unsafe_source":
+                del raw["mechanisms"][0]["source_hypothesis_id"]
+            raise DiscoveryPayloadError(raw)
+
+    class FormatFormalizer:
+        calls = 0
+
+        def repair(self, context):
+            self.calls += 1
+            mechanism = TwoStageDiscoverer().discover({
+                "entity_graph": {"nodes": []},
+            }).mechanisms[0]
+            if repair_outcome == "drift":
+                mechanism = mechanism.model_copy(update={"mechanism": "network latency"})
+            return MechanismDiscoveryPayload(mechanisms=(mechanism,))
+
+    formalizer = FormatFormalizer()
+    runner, report, _, _ = run(
+        MalformedDiscovery(),
+        verification_planner=TwoStagePlanner(),
+        discovery_format_formalizer=formalizer,
+    )
+    events = runner.transcript.events
+    requested = sum(
+        event.event_type == EventType.DISCOVERY_FORMAT_REPAIR_REQUESTED for event in events
+    )
+    assert requested == formalizer.calls == (repair_outcome != "unsafe_source")
+    if repair_outcome == "accepted":
+        assert sum(
+            event.event_type == EventType.DISCOVERY_FORMAT_REPAIR_COMPLETED for event in events
+        ) == 1
+        assert sum(event.event_type == EventType.VERIFICATION_PLAN_COMPILED
+                   for event in events) == 1
+        rebuilt = list(events)
+        changed = False
+        for index, event in enumerate(rebuilt):
+            payload = deepcopy(event.payload)
+            if event.event_type == EventType.DISCOVERY_FORMAT_REPAIR_COMPLETED:
+                payload["payload"]["mechanisms"][0]["mechanism"] = "network latency"
+                payload["payload_digest"] = sha256_digest(payload["payload"])
+                changed = True
+            if not changed:
+                continue
+            replacement = event.model_copy(update={
+                "payload": payload,
+                "previous_digest": rebuilt[index - 1].digest,
+                "digest": "0" * 64,
+            })
+            rebuilt[index] = replacement.model_copy(update={
+                "digest": sha256_digest(replacement.digest_payload()),
+            })
+        with pytest.raises(ReplayValidationError, match="changed causal semantics"):
+            RecordedReplay.verify(rebuilt)
+    else:
+        assert report.answer.authoritative_decision.status == DecisionStatus.OUT_OF_SCOPE
+        assert EventType.DISCOVERY_FORMAT_REPAIR_COMPLETED not in {
+            event.event_type for event in events
+        }
+    assert RecordedReplay.verify(events).valid
+
+
+def test_two_stage_discovery_completes_an_explicitly_identified_omission_once():
+    discoverer = CompletionDiscoverer()
+    runner, _, _, _ = run(discoverer, verification_planner=TwoStagePlanner())
+    events = runner.transcript.events
+
+    assert discoverer.calls == 2
+    assert sum(
+        event.event_type == EventType.MECHANISM_COMPLETION_REQUESTED for event in events
+    ) == 1
+    completion = next(
+        event.payload for event in events
+        if event.event_type == EventType.MECHANISM_COMPLETION_COMPLETED
+    )
+    assert completion["accepted_mechanisms"][0]["mechanism"] == "database query latency"
+    assert sum(event.event_type == EventType.MECHANISM_DRAFT_FROZEN for event in events) == 1
+    assert sum(event.event_type == EventType.VERIFICATION_PLAN_COMPILED for event in events) == 1
+    assert RecordedReplay.verify(events).valid
+
+
+def test_two_stage_discovery_rejects_completion_semantic_drift():
+    discoverer = CompletionDiscoverer(drift=True)
+    runner, report, _, _ = run(discoverer, verification_planner=TwoStagePlanner())
+    events = runner.transcript.events
+
+    assert discoverer.calls == 2
+    completion = next(
+        event.payload for event in events
+        if event.event_type == EventType.MECHANISM_COMPLETION_COMPLETED
+    )
+    assert completion["accepted_mechanisms"] == []
+    assert completion["rejections"] == ["MECHANISM_COMPLETION_SEMANTIC_DRIFT"]
+    assert EventType.MECHANISM_DRAFT_FROZEN not in {
+        event.event_type for event in events
+    }
+    assert report.answer.authoritative_decision.status == DecisionStatus.OUT_OF_SCOPE
+    assert RecordedReplay.verify(events).valid
+
+
+def test_replay_rejects_tampered_mechanism_completion():
+    from rca_agent.runner.replay import ReplayValidationError
+    from rca_agent.runner.transcript import Transcript
+
+    runner, _, _, _ = run(
+        CompletionDiscoverer(), verification_planner=TwoStagePlanner()
+    )
+    rebuilt = Transcript(runner.episode_id)
+    for event in runner.transcript.events:
+        payload = event.payload
+        if event.event_type == EventType.MECHANISM_COMPLETION_COMPLETED:
+            changed = dict(payload["accepted_mechanisms"][0])
+            changed["mechanism"] = "network latency"
+            payload = {**payload, "accepted_mechanisms": [changed]}
+        rebuilt.append(event.event_type, payload)
+
+    with pytest.raises(
+        ReplayValidationError, match="mechanism completion introduced a new meaning"
+    ):
+        RecordedReplay.verify(rebuilt.events)
 
 
 def test_core_feedback_adds_a_distinguishing_plan_and_replays():
@@ -945,6 +1212,109 @@ def test_two_stage_refutation_scope_must_match_alternative_class():
     assert normalized.predictions[-1].distinguishes == ()
     compiled = restricted.compile_plan(frozen, normalized)
     assert compiled.alternatives == ("downstream blocking",)
+
+
+def test_two_stage_normalization_removes_cross_mechanism_support_and_self_refutation():
+    mechanism = TwoStageDiscoverer().discover({
+        "entity_graph": {"nodes": []},
+    }).mechanisms[0]
+    frozen = freeze_mechanism(mechanism)
+    base = registry()
+    classes = {
+        "active_ratio": (MechanismClass.THREAD_POOL_SATURATION,),
+        "queue_ratio": (MechanismClass.THREAD_POOL_SATURATION,),
+        "downstream_wait_ratio": (MechanismClass.DOWNSTREAM_DEPENDENCY,),
+        "traffic_growth_ratio": (MechanismClass.THREAD_POOL_SATURATION,),
+    }
+    scoped = base.model_copy(update={
+        "rules": tuple(
+            rule.model_copy(update={"refutes": classes.get(rule.rule_id, rule.refutes)})
+            for rule in base.rules
+        ),
+    })
+    handles = {item.rule_id: item.capability_ref for item in scoped.capability_handles()}
+    plan = VerificationPlanDraft(
+        mechanism_id=frozen.mechanism_id,
+        predictions=(
+            PlannedPrediction(
+                capability_ref=handles["active_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Busy workers support thread-pool saturation.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["queue_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Queued tasks support thread-pool saturation.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["downstream_wait_ratio"],
+                polarity=ConditionPolarity.SUPPORT,
+                rationale="Downstream blocking cannot support the local pool mechanism.",
+            ),
+            PlannedPrediction(
+                capability_ref=handles["traffic_growth_ratio"],
+                polarity=ConditionPolarity.CONTRADICT,
+                rationale="A positive pool predicate cannot contradict the same mechanism.",
+            ),
+        ),
+    )
+
+    normalized, repairs = scoped.normalize_plan(frozen, plan)
+
+    assert "removed_cross_mechanism_support_claim" in repairs
+    assert "removed_self_refutation_claim" in repairs
+    assert [item.capability_ref for item in normalized.predictions] == [
+        handles["active_ratio"], handles["queue_ratio"],
+    ]
+    compiled = scoped.compile_plan(frozen, normalized)
+    assert all(
+        condition.polarity == ConditionPolarity.SUPPORT
+        for condition in compiled.candidate.conditions
+    )
+
+
+def test_partial_support_is_unresolved_instead_of_decisively_failed():
+    runner, report, _, _ = run(
+        Discoverer(draft(refute=True)),
+        environment=Environment({
+            "active_ratio": 0.95,
+            "queue_ratio": 0.1,
+            "downstream_wait_ratio": 0,
+        }),
+    )
+
+    verification = verification_event(runner)
+    assert verification["state"] == "unresolved"
+    assert verification["support_signals"] == ["active_ratio"]
+    assert "support_predictions_not_satisfied" in verification["blockers"]
+    assert report.answer.authoritative_decision.status == DecisionStatus.SUPPORTED_HYPOTHESIS
+    assert not report.final_frontier.contradicted_candidate_ids
+
+
+def test_legacy_compiled_candidate_keeps_v1_failure_semantics_for_replay():
+    compiled = registry().compile(draft(refute=True), "ent-service")
+    legacy_payload = compiled.model_dump(exclude={"verification_standard"})
+    legacy = CompiledCandidate.model_validate(legacy_payload)
+    environment = Environment({
+        "active_ratio": 0.95,
+        "queue_ratio": 0.1,
+        "downstream_wait_ratio": 0,
+    })
+    records = []
+    for signal in ("active_ratio", "queue_ratio", "downstream_wait_ratio"):
+        response = environment.get_metric_series(query(signal).request)
+        records.append(IssuedObservation(
+            observation=response.observations[0],
+            query_ref=response.query_ref,
+        ))
+
+    assert legacy.verification_standard == "generic-root-cause-v1"
+    assert verify_dynamic(
+        legacy, tuple(assess_dynamic(legacy, tuple(records))), tuple(records)
+    ).state.value == "failed"
+    assert verify_dynamic(
+        compiled, tuple(assess_dynamic(compiled, tuple(records))), tuple(records)
+    ).state.value == "unresolved"
 
 
 def test_two_stage_planner_gets_one_bounded_retry_without_changing_mechanism():
@@ -1477,7 +1847,7 @@ def test_rule_definitions_and_discovery_snapshot_are_recorded_before_queries():
     assert "confirmation" not in compiled
     assert report.final_preview.overall_decision == report.answer.authoritative_decision
     proof = verification_event(runner)
-    assert proof["passed"] and proof["standard"] == "generic-root-cause-v1"
+    assert proof["passed"] and proof["standard"] == "generic-root-cause-v2"
     assert proof["distinguished_alternatives"] == ["downstream blocking"]
 
 

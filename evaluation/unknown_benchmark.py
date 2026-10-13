@@ -277,22 +277,25 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
             for attempt in range(2):
                 try:
                     draft, actions = self.inquiry.plan(incident, options)
+                    from rca_agent.langchain_acquisition import parse_inquiry_draft
+                    draft = parse_inquiry_draft(draft, live_version=self.inquiry.contract_version)
+                    if not hasattr(self, "_binding_history_offsets"):
+                        self._binding_history_offsets = {}
+                    self._binding_history_offsets[self.selection_calls] = len(context.get("history", ()))
                     remaining = self.inquiry_query_limit - len(self.selected_actions)
+                    from rca_agent.investigation.inquiry_contract import (
+                        selected_bindings,
+                        validate_bindings,
+                    )
+                    bindings = selected_bindings(draft, options, actions[:remaining], self.selection_calls)
+                    if draft.contract_version == 2:
+                        validate_bindings(draft, bindings, self.selection_calls, options)
                     self.selection_queue = list(actions[:remaining])
                     self.inquiry_drafts.append({
                         "round": self.selection_calls,
                         "attempt": attempt + 1,
                         "draft": draft.model_dump(mode="json"),
-                        "selected_actions": [
-                            {"need_id": choice.need_id,
-                             "query_ref": choice.query_ref,
-                             "signal": getattr(action.request, "signal", "related_entity"),
-                             "entity_ref": options[choice.query_ref]["entity"]["entity_ref"],
-                             "action": action.model_dump(mode="json")}
-                            for choice, action in zip(
-                                draft.choices, actions[:remaining], strict=False
-                            )
-                        ],
+                        "selected_actions": bindings,
                     })
                     break
                 except Exception as exc:  # noqa: BLE001 - bounded provider failure, no secrets
@@ -308,7 +311,8 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
                         "invalid inquiry choices",
                         "inquiry choice is not offered",
                     }
-                    code = (str(exc) if type(exc) is ValueError
+                    code = exc.code if isinstance(exc, InquiryOutputError) else (
+                            str(exc) if type(exc) is ValueError
                             and str(exc) in safe_validation_errors else type(exc).__name__)
                     self.selection_errors.append(code)
                     if getattr(exc, "status_code", None) is not None or attempt == 1:
@@ -333,11 +337,9 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
              " ".join(item.hypothesis.alternative.casefold().split())):
             item.hypothesis.hypothesis_id for item in candidates
         }
-        responses = {
-            json.dumps(record["action"], sort_keys=True): record["result"]["value"]
-            for record in history
-            if record.get("result", {}).get("kind") == "tool_response"
-        }
+        from rca_agent.investigation.contract_enforcement import history_binding_responses
+        responses = history_binding_responses(self.inquiry_drafts, history,
+                                             getattr(self, "_binding_history_offsets", {}))
         links = []
         for round_record in self.inquiry_drafts:
             questions = {need["need_id"]: need
@@ -350,11 +352,15 @@ class HoldoutAcquisitionPolicy(Runnable[dict[str, Any], PolicyEnvelope]):
                 for item in round_record["draft"]["hypotheses"]
             }
             for selected in round_record["selected_actions"]:
-                response = responses.get(json.dumps(selected["action"], sort_keys=True))
+                response = responses.get((round_record["round"], selected["need_id"], selected["query_ref"]))
                 if response is None:
                     continue
                 need = questions[selected["need_id"]]
                 links.append({
+                    **({"binding_id": selected["binding_id"], "source_round": round_record["round"],
+                        "source_need_id": selected["need_id"], "mode": selected["mode"],
+                        "measurement_target": selected["measurement_target"]}
+                       if "binding_id" in selected else {}),
                     "question": need["question"],
                     "hypothesis_id": round_candidates[need["hypothesis_id"]],
                     "signal": selected["signal"],
@@ -428,6 +434,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             )
         return create_deepseek_chat_model(
             model=model_name, timeout_seconds=args.model_timeout_seconds,
+            max_tokens=args.model_max_tokens,
             max_retries=max_retries, thinking_enabled=thinking_enabled,
         )
 
@@ -445,6 +452,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         discovery, verification_planner = create_deepseek_discovery_pipeline(
             model=model_name,
             timeout_seconds=args.model_timeout_seconds,
+            max_tokens=args.model_max_tokens,
             thinking_enabled=thinking_enabled,
         )
     runner = EpisodeRunner(
@@ -617,6 +625,9 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "provider": provider,
         "model": model_name,
         "thinking_enabled": thinking_enabled,
+        "model_timeout_seconds": args.model_timeout_seconds,
+        "model_max_tokens": (args.model_max_tokens if provider == "deepseek" else 16384),
+        "discovery_timeout_seconds": args.discovery_timeout_seconds,
         "catalog_candidate_visible": args.holdout_candidate not in runner.excluded_catalog_candidate_ids,
         "status": decision.status.value,
         "supported_hypothesis_ids": list(decision.supported_hypothesis_ids),
@@ -630,6 +641,15 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         } for item in registered],
         "raw_discovery_drafts": [*draft_evaluations, *two_stage_drafts, *invalid_drafts],
         "raw_mechanism_drafts": mechanism_generated,
+        "mechanism_completion_events": [
+            {"kind": event.event_type.value, **event.payload}
+            for event in runner.transcript.events
+            if event.event_type in {
+                EventType.MECHANISM_COMPLETION_REQUESTED,
+                EventType.MECHANISM_COMPLETION_COMPLETED,
+                EventType.MECHANISM_COMPLETION_REJECTED,
+            }
+        ],
         "verification_plan_events": {
             "generated": plan_generated,
             "rejected": plan_rejected,
@@ -706,8 +726,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--query-budget", type=int, default=20)
     value.add_argument("--max-rounds", type=int, default=30)
     value.add_argument("--recursion-limit", type=int, default=100)
-    value.add_argument("--model-timeout-seconds", type=float, default=45)
-    value.add_argument("--discovery-timeout-seconds", type=float, default=50)
+    value.add_argument("--model-timeout-seconds", type=float, default=300)
+    value.add_argument("--model-max-tokens", type=int, default=65536)
+    value.add_argument("--discovery-timeout-seconds", type=float, default=300)
     value.add_argument("--output", type=Path)
     return value
 

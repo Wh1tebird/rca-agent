@@ -23,6 +23,7 @@ class ScriptedPolicySpec(BaseModel):
     actions: tuple[dict[str, Any], ...]
     crash_after_actions: int | None = Field(default=None, ge=0)
     hang_after_actions: int | None = Field(default=None, ge=0)
+    startup_delay_seconds: float = Field(default=0, ge=0, le=2)
 
 
 class PolicyProcessReport(BaseModel):
@@ -43,7 +44,10 @@ class ScriptedPolicyProcessHost:
         policy: ScriptedPolicySpec,
         *,
         timeout_seconds: float = 5.0,
+        startup_timeout_seconds: float = 5.0,
     ) -> PolicyProcessReport:
+        if timeout_seconds <= 0 or startup_timeout_seconds <= 0:
+            raise ValueError("policy deadlines must be positive")
         if runner.status == EpisodeStatus.CREATED:
             bootstrap = runner.start()
         elif runner.status == EpisodeStatus.ACTIVE and runner.bootstrap is not None:
@@ -55,6 +59,7 @@ class ScriptedPolicyProcessHost:
             "actions": list(policy.actions),
             "crash_after_actions": policy.crash_after_actions,
             "hang_after_actions": policy.hang_after_actions,
+            "startup_delay_seconds": policy.startup_delay_seconds,
         }
         visible_context: dict[str, Any] = {}
         actions_received = 0
@@ -71,10 +76,12 @@ class ScriptedPolicyProcessHost:
                 bufsize=1,
             )
             assert process.stdin is not None
-            process.stdin.write(json.dumps(initialization, ensure_ascii=False) + "\n")
-            process.stdin.flush()
             try:
-                ready = _read_message(process, timeout_seconds)
+                process.stdin.write(json.dumps(initialization, ensure_ascii=False) + "\n")
+                process.stdin.flush()
+                # Execution starts only after the worker's ready/ack handshake.
+                # Interpreter/import/isolation startup has a separate bounded deadline.
+                ready = _read_message(process, startup_timeout_seconds)
                 if ready.get("kind") != "ready":
                     raise RuntimeError("policy worker did not send ready message")
                 visible_context = ready["visible_context"]
@@ -117,7 +124,7 @@ class ScriptedPolicyProcessHost:
                     try:
                         process.wait(timeout=1)
                     except subprocess.TimeoutExpired:
-                        process.terminate()
+                        process.kill()
                         process.wait(timeout=1)
             except TimeoutError:
                 exit_kind = "timeout"
@@ -125,13 +132,20 @@ class ScriptedPolicyProcessHost:
                 process.wait(timeout=1)
                 if runner.status == EpisodeStatus.ACTIVE:
                     runner.terminate_policy_failure(StopReason.POLICY_TIMEOUT, "policy_timeout")
-            except (EOFError, RuntimeError):
+            except (EOFError, RuntimeError, BrokenPipeError, json.JSONDecodeError):
                 exit_kind = "crash"
                 if process.poll() is None:
                     process.kill()
                     process.wait(timeout=1)
                 if runner.status == EpisodeStatus.ACTIVE:
                     runner.terminate_policy_failure(StopReason.POLICY_CRASH, "policy_process_exit")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
         runner.record_policy_process_exited(exit_kind)
         if runner.answer is None:
             raise RuntimeError("policy process ended without a frozen answer")
@@ -155,16 +169,23 @@ def _read_message(process: subprocess.Popen[str], timeout_seconds: float) -> dic
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout_seconds
+    buffered = getattr(process, "_rca_pending_stdout", b"")
     try:
         while True:
+            if b"\n" in buffered:
+                line, _, tail = buffered.partition(b"\n")
+                process._rca_pending_stdout = tail
+                return json.loads(line)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("policy process response timed out")
             if selector.select(remaining):
-                line = process.stdout.readline()
-                if not line:
+                # readline() could wait indefinitely for a newline after select
+                # reports a partial frame. Read available bytes under one deadline.
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
                     raise EOFError("policy process closed its output")
-                return json.loads(line)
+                buffered += chunk
     finally:
         selector.close()
 

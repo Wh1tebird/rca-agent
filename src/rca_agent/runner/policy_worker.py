@@ -15,6 +15,7 @@ def _send(payload: dict[str, Any]) -> None:
 
 def main() -> int:
     initialization = json.loads(sys.stdin.readline())
+    time.sleep(initialization.get("startup_delay_seconds", 0))
     bootstrap = initialization["bootstrap"]
     actions = initialization["actions"]
     crash_after = initialization.get("crash_after_actions")
