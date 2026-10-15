@@ -81,7 +81,13 @@ class LangChainBatchedInquiryAdapter:
             ("human", "Host state and current menu:\n{state_json}\nRepair feedback for this attempt (empty on first attempt):\n{repair_feedback_json}"),
         ]).partial(step_schema=json.dumps(provider_loop_schema(), ensure_ascii=False),
                    batch_limit=batch_limit)
-        structured = model.with_structured_output(LoopStep, method=structured_method)
+        # Keep the provider message alongside the parsed value.  Some DeepSeek
+        # responses contain a usable tool-call or JSON body even when the
+        # LangChain parser raises; `step()` already applies the bounded raw
+        # fallback and host admission remains authoritative.
+        structured = model.with_structured_output(
+            LoopStep, method=structured_method, include_raw=True,
+        )
         return cls(prompt | structured, batch_limit=batch_limit)
 
     def step(self, incident: dict[str, Any], view: dict[str, Any],
@@ -255,6 +261,11 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                     fields = (stage,)
                 if not root_errors:
                     safe_details = getattr(exc, "safe_details", None)
+                    if safe_details is None and stage == "adapter":
+                        # Provider/framework adapter failures are safe to
+                        # diagnose by type and bounded message.  Do not expose
+                        # raw prompts or credentials across the transcript.
+                        safe_details = f"{type(exc).__name__}: {str(exc)[:500]}"
                 issue_list = list(getattr(exc, "issues", ()))
                 if issue_list:
                     # Preserve all independently-checkable admission failures so the

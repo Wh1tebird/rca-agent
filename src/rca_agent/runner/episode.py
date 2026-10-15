@@ -1860,6 +1860,7 @@ class EpisodeRunner:
                 )
                 record = {"binding": binding, "attempt": attempt, "response": None,
                           "reason_code": response["error_type"] if not ok else "INVALID_TYPED_DETAILS"}
+                typed = None
                 if ok:
                     try:
                         schema = BoundCandidateResponseV7 if version == 7 else BoundCandidateResponse
@@ -1867,8 +1868,14 @@ class EpisodeRunner:
                         bind_candidate(binding, typed, self.__issued_entities, check_class=True)
                         record.update(response=typed.model_dump(mode="json"), reason_code=typed.reason_code)
                     except ValueError as exc:
-                        if str(exc) in {"SELF_ALTERNATIVE", "ALTERNATIVE_ID_CONFLICT"}:
-                            record["reason_code"] = str(exc)
+                        # Keep the rejected provider shape only as diagnostics;
+                        # `response` stays null so Replay cannot treat an
+                        # unbound candidate as admitted.  Feed the exact host
+                        # rejection code into the bounded retry instead of the
+                        # previous generic INVALID_TYPED_DETAILS message.
+                        if "typed" in locals():
+                            record["rejected_response"] = typed.model_dump(mode="json")
+                        record["reason_code"] = str(exc) or "INVALID_TYPED_DETAILS"
                 records[candidate["hypothesis_id"]] = record
                 self.transcript.append(EventType.BOUND_CANDIDATE_FORMALIZATION_RECORDED, record)
                 if record["response"] is not None:

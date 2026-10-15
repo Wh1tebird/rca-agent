@@ -94,8 +94,8 @@ class LangChainDiscoveryAdapter:
 class DiscoveryPayloadError(ValueError):
     """A provider returned content that failed the advertised Discovery schema."""
 
-    def __init__(self, raw_payload: Any) -> None:
-        super().__init__("invalid structured discovery payload")
+    def __init__(self, raw_payload: Any, message: str = "invalid structured discovery payload") -> None:
+        super().__init__(message)
         self.raw_payload = raw_payload
 
 
@@ -238,7 +238,14 @@ class LangChainMechanismDiscoveryAdapter:
         })
         if isinstance(response, dict) and "parsed" in response and "raw" in response:
             if response.get("parsed") is None:
-                raise ValueError("candidate structured output failed")
+                # Preserve the provider payload across the Runner boundary.  The
+                # host must still reject the candidate, but dropping the raw
+                # structured-output error made a real Discovery failure
+                # indistinguishable from a local ValueError.
+                raise DiscoveryPayloadError(
+                    _raw_message_payload(response.get("raw")),
+                    message="candidate structured output failed",
+                )
             response = response["parsed"]
         return schema.model_validate(response)
 
