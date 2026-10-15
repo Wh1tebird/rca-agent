@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rca_agent.investigation.inquiry_contract import (
+    action_fingerprint,
     original_alternative_id,
     selected_bindings,
     validate_bindings,
@@ -117,7 +118,10 @@ class LoopStep(BaseModel):
     need_updates: tuple[LoopNeedUpdate, ...] = Field(default=(), max_length=40)
     pending_decisions: tuple[LoopPendingDecision, ...] = Field(default=(), max_length=8)
     draft: LoopDraftV2 | None = None
-    next_batch: tuple[str, ...] = Field(default=(), max_length=2)
+    next_batch: tuple[str, ...] = Field(
+        default=(), max_length=2,
+        description="Non-empty when decision=continue; use handoff with stop_reason when no query remains.",
+    )
     batch_reason: str | None = Field(default=None, max_length=1000)
     decision: Literal["continue", "handoff"]
     stop_reason: str | None = Field(default=None, max_length=1000)
@@ -408,7 +412,8 @@ def provider_loop_schema() -> dict[str, Any]:
     return schema
 
 
-def normalize_loop_step(raw: dict[str, Any], menu: dict[str, dict[str, Any]]) -> LoopStep:
+def normalize_loop_step(raw: dict[str, Any], menu: dict[str, dict[str, Any]], *,
+                        menu_aliases: dict[str, Any] | None = None) -> LoopStep:
     """Map only aliases from this exact menu and run the real Inquiry-v2 parser."""
     data = dict(raw)
     if data.get("contract_version") is None:
@@ -416,7 +421,19 @@ def normalize_loop_step(raw: dict[str, Any], menu: dict[str, dict[str, Any]]) ->
     if data.get("draft") is not None:
         source = dict(data["draft"])
         LoopDraftV2.model_validate(source)
-        aliases = {f"q{index}": ref for index, ref in enumerate(menu, start=1)}
+        if menu_aliases is None:
+            aliases = {f"q{index}": ref for index, ref in enumerate(menu, start=1)}
+        else:
+            aliases = {}
+            for alias, value in menu_aliases.items():
+                ref = value.get("menu_ref") if isinstance(value, dict) else value
+                if ref not in menu:
+                    raise ValueError("menu alias does not resolve to the current host menu")
+                if isinstance(value, dict) and value.get("action_fingerprint"):
+                    action = CallToolAction.model_validate(menu[ref]["action"])
+                    if value["action_fingerprint"] != action_fingerprint(action):
+                        raise ValueError("menu alias fingerprint changed")
+                aliases[alias] = ref
         source["choices"] = [
             {**choice, "query_ref": aliases.get(choice.get("query_ref"), choice.get("query_ref"))}
             for choice in source.get("choices", ())
@@ -452,7 +469,7 @@ def normalize_loop_step(raw: dict[str, Any], menu: dict[str, dict[str, Any]]) ->
 def accept_loop_step(
     state: LoopState, step: LoopStep, *, menu: dict[str, dict[str, Any]],
     batch_limit: int, query_limit: int, visible_refs: set[str] | None = None,
-    budget_remaining: int | None = None,
+    budget_remaining: int | None = None, offered_refs: set[str] | None = None,
 ) -> tuple[LoopState, dict[str, Any] | None]:
     """Validate the entire decision before returning an immutable new state and round."""
     if not state.verify_digest() or step.based_on_revision != state.revision or step.based_on_digest != state.digest:
@@ -529,22 +546,17 @@ def accept_loop_step(
     elif step.batch_assessments:
         raise ValueError("no batch is available for assessment")
 
+    from rca_agent.investigation.loop_admission_diagnostics import admit_independent_issues
+
+    admit_independent_issues(state, step, menu)
+    if offered_refs is not None and step.draft is not None:
+        hidden = {choice.query_ref for choice in step.draft.choices} - offered_refs
+        if hidden:
+            raise ValueError("query is not in the current projected Inquiry menu")
     pending = {p.pending_id: p for p in state.pending}
     offered_actions = {query_fingerprint(CallToolAction.model_validate(option["action"]).tool_name,
                          CallToolAction.model_validate(option["action"]).request): option["action"]
                        for option in menu.values()}
-    eligible = actionable_pending_ids(state)
-    submitted_ids = tuple(d.pending_id for d in step.pending_decisions)
-    duplicate = {item for item in submitted_ids if submitted_ids.count(item) > 1}
-    known = {item.pending_id: item for item in state.pending}
-    invalid_states = {item: known[item].status for item in set(submitted_ids)
-                      if item in known and item not in eligible}
-    missing = eligible - set(submitted_ids)
-    unexpected = set(submitted_ids) - eligible
-    if missing or unexpected or duplicate:
-        raise PendingDecisionError(expected=eligible, submitted=submitted_ids,
-                                   missing=missing, unexpected=unexpected,
-                                   duplicate=duplicate, invalid_states=invalid_states)
     issued_refs = {ref for batch in state.batches for result in batch.results
                    for ref in result.observation_refs}
     for decision in step.pending_decisions:
@@ -570,22 +582,10 @@ def accept_loop_step(
         need_by_id = {item.need_id: item.model_dump(mode="json") for item in parsed.needs}
         for item in parsed.hypotheses:
             raw = hypo_by_id[item.hypothesis_id]
-            before = candidates.get(item.hypothesis_id)
-            if before is not None and before.hypothesis != raw:
-                raise ValueError("candidate identity was reused with changed content")
             candidates.setdefault(item.hypothesis_id, LoopCandidate(
                 hypothesis=raw, priority=1, disposition="active", source_step=state.planning_steps + 1))
         for item in parsed.needs:
             raw = need_by_id[item.need_id]
-            before = needs.get(item.need_id)
-            if before is not None and before.need != raw:
-                raise LoopIdentityError(
-                    code="NEED_IDENTITY_CHANGED", field="draft.needs[].need_id",
-                    identifier=item.need_id,
-                    instruction=("Need IDs are immutable. Keep the existing Need exactly, or create a "
-                                 "new need_id and add need_updates entry for that new ID with "
-                                 f"supersedes_need_id={item.need_id}."),
-                )
             needs.setdefault(item.need_id, LoopNeed(
                 need=raw, disposition="open", source_step=state.planning_steps + 1))
         for choice in parsed.choices:
@@ -593,23 +593,6 @@ def accept_loop_step(
         for ref, choices in new_by_ref.items():
             action = CallToolAction.model_validate(menu[ref]["action"])
             fingerprint = query_fingerprint(action.tool_name, action.request)
-            conflict = next((p for p in pending.values()
-                             if p.query_fingerprint == fingerprint and p.status != "cancelled"), None)
-            if conflict is not None:
-                if conflict.status in {"pending", "deferred", "unavailable"}:
-                    instruction = ("Do not recreate this physical query in draft.choices. "
-                                   f"Dispose actionable {conflict.pending_id} in pending_decisions "
-                                   "with retain/defer/cancel; select its pending_id in next_batch "
-                                   "only when it is retained and available.")
-                else:
-                    instruction = ("This query has already been scheduled or executed. "
-                                   "Do not recreate it or submit a pending_decision for a terminal result; "
-                                   "choose a different physical query or hand off.")
-                raise LoopIdentityError(
-                    code="DUPLICATE_PHYSICAL_QUERY", field="draft.choices[].query_ref",
-                    identifier=conflict.pending_id, status=conflict.status,
-                    fingerprint=fingerprint, instruction=instruction,
-                )
             identifier = "pending-" + _digest({"episode": state.episode_id,
                         "step": state.planning_steps + 1, "query": fingerprint})[:20]
             bindings = selected_bindings(parsed, typed_menu, [action], state.planning_steps + 1)
@@ -792,7 +775,11 @@ def make_loop_view(state: LoopState, events: tuple[Any, ...], bootstrap: Any, *,
     """Build the deterministic input and current typed menu from issued episode facts."""
     import json
 
-    from rca_agent.investigation.inquiry_contract import public_query
+    from rca_agent.investigation.inquiry_contract import (
+        action_fingerprint,
+        project_inquiry_menu,
+        public_query,
+    )
     from rca_agent.investigation.query_strategy import issued_entities
     from rca_agent.langchain_acquisition import query_options
 
@@ -809,6 +796,14 @@ def make_loop_view(state: LoopState, events: tuple[Any, ...], bootstrap: Any, *,
                   "query_cost": costs[item["action"].tool_name.value]}
             for ref, item in options.items()
             if query_fingerprint(item["action"].tool_name, item["action"].request) not in used}
+    existing = used | {item.query_fingerprint for item in state.pending
+                       if item.status != "cancelled"}
+    projection = project_inquiry_menu(
+        menu,
+        [item.need for item in state.needs if item.disposition == "open"],
+        existing_query_fingerprints=existing,
+        budget_remaining=budget_remaining,
+    )
     latest = state.batches[-1] if state.batches else None
     last_results = [] if latest is None else [
         {"pending_id": result.pending_id, "query_fingerprint": result.query_fingerprint,
@@ -841,10 +836,56 @@ def make_loop_view(state: LoopState, events: tuple[Any, ...], bootstrap: Any, *,
         "menu": {f"q{i}": {**public_query({**item,
                  "action": CallToolAction.model_validate(item["action"])}),
                  "query_cost": item["query_cost"]}
-                 for i, item in enumerate(menu.values(), 1)},
+                 for i, (ref, item) in enumerate(menu.items(), 1)},
     }
     if host_loop_version >= HOST_LOOP_VERSION:
+        full_aliases = {ref: f"q{i}" for i, ref in enumerate(menu, 1)}
+
+        def public_menu(items):
+            return {
+                full_aliases[ref]: {**public_query({**item,
+                    "action": CallToolAction.model_validate(item["action"])}),
+                    "menu_ref": ref,
+                    "action_fingerprint": action_fingerprint(
+                        CallToolAction.model_validate(item["action"])),
+                    "query_cost": item["query_cost"]}
+                for ref, item in items.items()
+            }
+
+        focused_public = public_menu(projection["focused"])
+        exploration_public = (public_menu(projection["exploration"])
+                              if projection["mode"] != "focused" else {})
+        exposed_public = public_menu(projection["exposed"])
+        aliases = {
+            alias: {"menu_ref": item["menu_ref"],
+                    "action_fingerprint": item["action_fingerprint"]}
+            for alias, item in {**focused_public, **exploration_public}.items()
+        }
         view["inquiry_loop_version"] = host_loop_version
+        view["menu"] = exposed_public
+        view["focused_menu"] = focused_public
+        view["exploration_menu"] = exploration_public
+        view["menu_mode"] = projection["mode"]
+        view["menu_aliases"] = aliases
+        view["offered_menu_refs"] = sorted(
+            {item["menu_ref"] for item in aliases.values()})
+        view["menu_projection"] = {
+            "mode": projection["mode"],
+            "eligible_count": projection["eligible_count"],
+            "focused_count": projection["focused_count"],
+            "exposed_count": len(exposed_public),
+            "exploration_count": len(exploration_public),
+            "min_focused": projection["min_focused"],
+            "max_focused": projection["max_focused"],
+        }
+        view["menu_projection_digest"] = sha256_digest({
+            "state_digest": state.digest,
+            "existing_query_fingerprints": sorted(existing),
+            "focused_refs": list(projection["focused"]),
+            "exploration_refs": list(projection["exploration"]),
+            "exposed_refs": list(projection["exposed"]),
+            "menu_aliases": aliases,
+        })
         view["actionable_pending"] = actionable_pending
         view["pending_history"] = pending_history
         view["expected_actionable_ids"] = [item["pending_id"] for item in actionable_pending]
@@ -853,9 +894,16 @@ def make_loop_view(state: LoopState, events: tuple[Any, ...], bootstrap: Any, *,
             {"pending_id": item.pending_id, "query_fingerprint": item.query_fingerprint,
              "status": item.status} for item in state.pending
         ]
-    # Menu is independently bounded by typed capabilities; it is excluded from the
-    # 128 KiB result/state projection budget but still part of the recorded view.
+    # The public menu projection is independently bounded by host rules; it is
+    # excluded from the 128 KiB result/state projection budget and still recorded.
     menu_public = view.pop("menu")
+    focused_public = view.pop("focused_menu", None)
+    exploration_public = view.pop("exploration_menu", None)
+    menu_mode = view.pop("menu_mode", None)
+    menu_aliases = view.pop("menu_aliases", None)
+    offered_menu_refs = view.pop("offered_menu_refs", None)
+    menu_projection = view.pop("menu_projection", None)
+    menu_projection_digest = view.pop("menu_projection_digest", None)
     def byte_size() -> int:
         return len(json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode())
 
@@ -880,6 +928,14 @@ def make_loop_view(state: LoopState, events: tuple[Any, ...], bootstrap: Any, *,
     if byte_size() > VIEW_LIMIT:
         raise ValueError("Inquiry view omission metadata exceeds its bound")
     view["menu"] = menu_public
+    if host_loop_version >= HOST_LOOP_VERSION:
+        view["focused_menu"] = focused_public
+        view["exploration_menu"] = exploration_public
+        view["menu_mode"] = menu_mode
+        view["menu_aliases"] = menu_aliases
+        view["offered_menu_refs"] = offered_menu_refs
+        view["menu_projection"] = menu_projection
+        view["menu_projection_digest"] = menu_projection_digest
     return json.loads(json.dumps(view, ensure_ascii=False)), json.loads(
         json.dumps(menu, ensure_ascii=False))
 

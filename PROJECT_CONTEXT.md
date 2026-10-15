@@ -1,5 +1,20 @@
 # RCA Agent project context
 
+## Deterministic batched Inquiry menu projection — 2026-10-15
+
+The batched Inquiry host now keeps its complete typed menu private while projecting a bounded
+v4 model menu. `project_inquiry_menu()` uses only issued entity/signal/measurement/window fields,
+existing query fingerprints, capability availability and remaining budget. Focused entries satisfy
+all non-empty fields of an open Need; when there are too few or no matches, the view exposes a
+small explicitly labeled exploration layer. No Action is created or repriced. v1/v3 menu behavior,
+Runner admission, pending transitions, Observation visibility and Replay semantics remain unchanged.
+
+v4 records stable `qN -> aq-... -> act-...` mappings for every exposed entry, a projection digest
+bound to the LoopState digest, and the existing attempt digest binds the full host view. Runner and
+Workspace Replay reject a draft choice outside the current projected references before state or
+budget mutation. Deterministic projection, alias, hidden-action, budget, digest and replay tests
+pass; no model, Benchmark, Ground Truth or evaluator was used.
+
 ## Legacy query menu compatibility repair — 2026-10-09
 
 Status: **全量确定性测试失败已修复，待独立复验**. The independent recheck's

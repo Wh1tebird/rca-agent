@@ -22,6 +22,7 @@ from rca_agent.investigation.inquiry_loop import (
     normalize_loop_step,
     provider_loop_schema,
 )
+from rca_agent.investigation.loop_admission_diagnostics import LoopContractIssues
 from rca_agent.models import CallToolAction, RequestStopAction
 from rca_agent.runner import EpisodeRunner, RecordedReplay
 
@@ -119,6 +120,20 @@ def test_identity_errors_are_structured_and_actionable(code, field):
     assert error.fields == (field,)
     assert error.conflict_id == "pending-x"
     assert error.instruction.startswith("use")
+
+
+def test_independent_admission_errors_are_preserved_for_one_retry():
+    pending = PendingDecisionError(expected={"pending-open"}, submitted=(),
+                                   missing={"pending-open"}, unexpected=set(), duplicate=set())
+    identity = LoopIdentityError(code="NEED_IDENTITY_CHANGED", field="draft.needs[].need_id",
+                                 identifier="n1", instruction="create a new need_id")
+    error = LoopContractIssues([pending, identity])
+    assert error.code == "LOOP_CONTRACT_ISSUES"
+    assert error.fields == ("pending_decisions", "draft.needs[].need_id")
+    assert [item["code"] for item in error.issues] == [
+        "PENDING_DECISION_SET_MISMATCH", "NEED_IDENTITY_CHANGED"]
+    assert error.issues[0]["missing"] == ["pending-open"]
+    assert error.issues[1]["instruction"] == "create a new need_id"
 
 
 def _completed_batch():
@@ -224,6 +239,39 @@ def test_retry_feedback_names_assessment_field_format_and_available_results():
     assert feedback["expected_format"].startswith("qry-")
     assert feedback["available_result_ids"] == [result["query_fingerprint"]]
     assert env.calls and len(env.calls) == 1
+
+
+def test_retry_feedback_names_empty_continue_batch_root_error():
+    env, runner, current, result, binding = _completed_batch()
+    calls = []
+
+    def invoke(payload):
+        calls.append(payload)
+        handoff = len(calls) == 2
+        return {"contract_version": 1,
+                "based_on_revision": payload["state"]["based_on_revision"],
+                "based_on_digest": payload["state"]["based_on_digest"],
+                "batch_assessments": [{"binding_id": binding["binding_id"],
+                    "query_ref": result["query_fingerprint"],
+                    "observation_refs": result["observation_refs"],
+                    "status": "ambiguous", "candidate_effect": "unclear",
+                    "alternative_effect": "unclear", "remaining_gap": "test", "reason": "test"}],
+                "candidate_updates": [], "need_updates": [], "pending_decisions": [],
+                "draft": None, "next_batch": [], "batch_reason": "still looking" if not handoff else None,
+                "decision": "continue" if not handoff else "handoff",
+                "stop_reason": None if not handoff else "no valid query remains"}
+
+    policy = BatchedInquiryInvestigationPolicy(
+        LangChainBatchedInquiryAdapter(RunnableLambda(invoke)), query_limit=3
+    )
+    context = {"inquiry_state_view": current,
+               "investigation_workspace": runner.investigation_workspace_snapshot.model_dump(mode="json")}
+    assert policy._inquiry_screen(context) is None
+    feedback = calls[1]["repair_feedback"]
+    assert feedback["code"] == "LOOP_STEP_CONTINUE_EMPTY_BATCH"
+    assert feedback["fields"] == ["decision", "next_batch"]
+    assert "handoff" in feedback["repair_instruction"]
+    assert len(env.calls) == 1
 
 
 def test_retry_feedback_explains_invalid_answered_status():

@@ -1,10 +1,15 @@
 """Versioned, pure measurement contracts shared by admission, Runner and Replay."""
 from rca_agent.models import CallToolAction, TimeWindow
-from rca_agent.tools.fingerprint import sha256_digest
+from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
 
 def normalized(text):
     return " ".join(text.casefold().split())
+
+
+def action_fingerprint(action):
+    """Stable Action identity, distinct from a completed ``qry-*`` result."""
+    return "act-" + sha256_digest(action.model_dump(mode="json"))[:20]
 
 
 def original_alternative_id(candidate):
@@ -58,9 +63,115 @@ def public_query(item):
                              "entity_exploration": "related entities"}[target["measurement_kind"]]}
 
 
-def fail(code, field):
+def _window_contains(target_windows, required_windows):
+    """Return whether every required window is covered by a menu target."""
+    for name, required in (required_windows or {}).items():
+        target = target_windows.get(name)
+        if target is None:
+            return False
+        target = TimeWindow.model_validate(target)
+        required = TimeWindow.model_validate(required)
+        if target.start < required.start or target.end > required.end:
+            return False
+    return True
+
+
+def _matches_need(item, need):
+    """Strictly match only host-owned Need fields; no text similarity is used."""
+    target = measurement_target(CallToolAction.model_validate(item["action"]))
+    if need.get("entity_ref") is not None and need["entity_ref"] != target["entity_ref"]:
+        return False
+    signals = need.get("observable_signals")
+    if signals and target["signal"] not in signals:
+        return False
+    if (need.get("measurement_kind") is not None
+            and need["measurement_kind"] != target["measurement_kind"]):
+        return False
+    return _window_contains(target["windows"], need.get("windows"))
+
+
+def _exploration_rank(item, needs):
+    """Stable partial-match rank for the bounded exploration layer."""
+    action = CallToolAction.model_validate(item["action"])
+    target = measurement_target(action)
+    entity_refs = {need.get("entity_ref") for need in needs if need.get("entity_ref")}
+    signals = {signal for need in needs for signal in (need.get("observable_signals") or ())}
+    kinds = {need.get("measurement_kind") for need in needs if need.get("measurement_kind")}
+    tool_rank = {"list_related_entities": 0, "compare_metric_windows": 1,
+                 "get_metric_series": 2}.get(action.tool_name.value, 9)
+    return (
+        0 if target["entity_ref"] in entity_refs else 1,
+        0 if target["signal"] in signals else 1,
+        0 if target["measurement_kind"] in kinds else 1,
+        tool_rank,
+        query_fingerprint(action.tool_name, action.request),
+    )
+
+
+def project_inquiry_menu(
+    full_menu: dict[str, dict],
+    needs=(),
+    *,
+    existing_query_fingerprints=(),
+    budget_remaining: int | None = None,
+    min_focused: int = 8,
+    max_focused: int = 20,
+    exploration_limit: int = 8,
+) -> dict[str, object]:
+    """Project a deterministic, host-owned menu without creating any Action.
+
+    ``focused`` contains only candidates that satisfy every non-empty Need field.
+    ``exploration`` is a small fallback layer ranked by exact host fields.  The
+    returned items are references to entries in ``full_menu`` and preserve their
+    original actions and fingerprints byte-for-byte.
+    """
+    if not 1 <= min_focused <= max_focused or not 1 <= exploration_limit <= max_focused:
+        raise ValueError("invalid Inquiry menu projection bounds")
+    existing = set(existing_query_fingerprints)
+    eligible: list[tuple[str, dict]] = []
+    for ref, item in full_menu.items():
+        action = CallToolAction.model_validate(item["action"])
+        fingerprint = query_fingerprint(action.tool_name, action.request)
+        if fingerprint in existing:
+            continue
+        if budget_remaining is not None and item.get("query_cost", 0) > budget_remaining:
+            continue
+        eligible.append((ref, item))
+
+    open_needs = tuple(need for need in needs if need.get("disposition", "open") == "open")
+    focused = [(ref, item) for ref, item in eligible
+               if open_needs and any(_matches_need(item, need) for need in open_needs)]
+    focused.sort(key=lambda pair: (
+        _exploration_rank(pair[1], open_needs),
+        pair[0],
+    ))
+    exploration = sorted(eligible, key=lambda pair: (_exploration_rank(pair[1], open_needs), pair[0]))
+
+    focused_items = dict(focused[:max_focused])
+    exploration_items = dict(exploration[:exploration_limit])
+    if focused_items:
+        exposed = focused_items
+        mode = "focused" if len(focused_items) >= min_focused else "focused_with_exploration"
+    else:
+        exposed = exploration_items
+        mode = "exploration"
+    return {
+        "focused": focused_items,
+        "exploration": exploration_items,
+        "exposed": exposed,
+        "mode": mode,
+        "eligible_count": len(eligible),
+        "focused_count": len(focused),
+        "exploration_count": len(exploration_items),
+        "min_focused": min_focused,
+        "max_focused": max_focused,
+    }
+
+
+def fail(code, field, *, supplied=None, expected_format=None, details=None):
     from rca_agent.langchain_acquisition import InquiryOutputError
-    raise InquiryOutputError(code, fields=(field,))
+    raise InquiryOutputError(code, fields=(field,), supplied=supplied,
+                             expected_format=expected_format, details=details)
 
 
 def validate_choice(need, choice, action):
@@ -78,7 +189,10 @@ def validate_choice(need, choice, action):
     if not need.observable_signals or target["signal"] not in need.observable_signals:
         fail("DIRECT_SIGNAL_MISMATCH", "needs.observable_signals")
     if need.measurement_kind and need.measurement_kind != target["measurement_kind"]:
-        fail("DIRECT_MEASUREMENT_MISMATCH", "needs.measurement_kind")
+        fail("DIRECT_MEASUREMENT_MISMATCH", "needs.measurement_kind",
+             supplied=need.measurement_kind, expected_format=target["measurement_kind"],
+             details=("Need measurement_kind must exactly match the selected direct query's "
+                      f"measurement_kind={target['measurement_kind']}"))
     if need.windows is not None:
         for name, required in need.windows.items():
             window = target["windows"].get(name)

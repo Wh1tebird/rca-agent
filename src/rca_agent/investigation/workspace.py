@@ -826,7 +826,10 @@ class InvestigationWorkspaceReducer:
             if self._loop_config is None or self._loop_view is None:
                 raise WorkspaceValidationError("Inquiry step has no recorded state view")
             menu = self._loop_view["menu"]
-            step = normalize_loop_step(payload["step"], menu)
+            step = normalize_loop_step(
+                payload["step"], menu,
+                menu_aliases=self._loop_view["view"].get("menu_aliases"),
+            )
             if step.model_dump(mode="json") != payload["step"]:
                 raise WorkspaceValidationError("Inquiry step is not canonical")
             visible = {item["observation_id"] for item in self._loop_view["view"]["observations"]}
@@ -834,7 +837,8 @@ class InvestigationWorkspaceReducer:
                 self.workspace._inquiry_loop_state, step, menu=menu,
                 batch_limit=self._loop_config["inquiry_batch_limit"],
                 query_limit=self._loop_config["inquiry_query_limit"], visible_refs=visible,
-                budget_remaining=self._loop_view["view"]["budget_remaining"])
+                budget_remaining=self._loop_view["view"]["budget_remaining"],
+                offered_refs=set(self._loop_view["view"].get("offered_menu_refs", ())) or None)
             if (payload.get("view_digest") != sha256_digest(self._loop_view)
                     or payload.get("round_record") != round_record
                     or payload.get("state") != state.model_dump(mode="json")

@@ -230,7 +230,9 @@ class InquiryHandoff(BaseModel):
 class InquiryOutputError(ValueError):
     """Bounded diagnostic for a model response that cannot become an inquiry draft."""
 
-    def __init__(self, code: str, raw_text: str = "", fields: tuple[str, ...] = ()) -> None:
+    def __init__(self, code: str, raw_text: str = "", fields: tuple[str, ...] = (),
+                 *, supplied: Any = None, expected_format: str | None = None,
+                 details: str | None = None) -> None:
         super().__init__(code)
         self.code = code
         self.raw_digest = sha256_digest(raw_text) if raw_text else None
@@ -239,6 +241,9 @@ class InquiryOutputError(ValueError):
         excerpt = re.sub(r"/Users/[^\s\"']+", "[redacted-path]", excerpt)
         self.raw_excerpt = excerpt
         self.fields = fields[:8]
+        self.supplied = supplied
+        self.expected_format = expected_format
+        self.safe_details = details
 
     def diagnostic(self) -> dict[str, Any]:
         return {"code": self.code, "raw_digest": self.raw_digest,

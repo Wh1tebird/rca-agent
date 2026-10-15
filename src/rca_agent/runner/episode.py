@@ -402,12 +402,16 @@ class EpisodeRunner:
         if self.__inquiry_loop_mode != "batched" or input_view != self.inquiry_loop_view():
             raise ValueError("Inquiry step did not use the current host view")
         state = LoopState.model_validate(self.investigation_workspace_snapshot.inquiry_loop)
-        step = normalize_loop_step(raw, input_view["menu"])
+        step = normalize_loop_step(
+            raw, input_view["menu"],
+            menu_aliases=input_view["view"].get("menu_aliases"),
+        )
         visible = {item["observation_id"] for item in input_view["view"]["observations"]}
         next_state, round_record = accept_loop_step(state, step,
             menu=input_view["menu"], batch_limit=self.__inquiry_batch_limit,
             query_limit=self.__inquiry_query_limit, visible_refs=visible,
-            budget_remaining=input_view["view"]["budget_remaining"])
+            budget_remaining=input_view["view"]["budget_remaining"],
+            offered_refs=set(input_view["view"].get("offered_menu_refs", ())) or None)
         if round_record is not None:
             # The normal Runner binding gate must pass before even the view is recorded.
             parsed = parse_inquiry_draft(round_record["draft"], live_version=2, strict=True)

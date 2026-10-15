@@ -28,13 +28,17 @@ class LangChainBatchedInquiryAdapter:
 
     contract_version = 2
 
-    def __init__(self, runnable: Runnable[dict[str, Any], Any]) -> None:
+    def __init__(self, runnable: Runnable[dict[str, Any], Any], *, batch_limit: int = 2) -> None:
+        if type(batch_limit) is not int or batch_limit not in {1, 2}:
+            raise ValueError("batched Inquiry batch limit must be one or two")
         self.runnable = runnable
+        self.batch_limit = batch_limit
 
     @classmethod
     def from_chat_model(
         cls, model: Any, *,
         structured_method: Literal["function_calling", "json_mode", "json_schema"] = "json_schema",
+        batch_limit: int = 2,
     ) -> LangChainBatchedInquiryAdapter:
         prompt = ChatPromptTemplate.from_messages([
             ("system", ("You are the same non-authoritative Inquiry role. Assess the last fully "
@@ -54,13 +58,29 @@ class LangChainBatchedInquiryAdapter:
              "Existing Need IDs and their contents are immutable. Reuse an old need_id only with exactly "
              "the same content; for a changed Need create a new need_id and set "
              "need_updates[].supersedes_need_id to the old ID. "
-             "Then choose at most two physical queries from this menu "
-             "or hand off. Model assessments cannot claim Core verification. Follow this schema: "
+             "Hypothesis IDs and mechanism text are immutable too. If new evidence changes a mechanism or its "
+             "alternative, create a new hypothesis_id in draft.hypotheses and add a candidate_updates entry for "
+             "that new ID with supersedes_hypothesis_id set to the old ID; never rewrite the old hypothesis in place. "
+             "When repair_feedback.retry_state is present, it is authoritative for the current revision, result IDs, "
+             "and Observation refs; never reuse refs from an earlier attempt or invent a ref. "
+             "If no valid new query remains, set decision=handoff, leave next_batch empty, and provide stop_reason. "
+             "Never set decision=continue with an empty next_batch. "
+             "For a direct choice, copy measurement_target.measurement_kind exactly from the chosen menu item "
+             "and ensure the Need's measurement_kind matches it; do not substitute series, window_comparison, "
+             "or entity_exploration. "
+             "The menu is a deterministic host projection: focused_menu contains only candidates matching an "
+             "open Need's entity_ref, observable_signals, measurement_kind and time window. Use it for direct "
+             "bindings. If menu_mode is exploration or focused_with_exploration, exploration_menu is a small "
+             "host-labeled fallback; use mode=exploratory for those entries. Prefer the stable menu_ref (aq-...) "
+             "recorded in each item; qN aliases are only aliases recorded in menu_aliases. "
+             "Then choose at most {batch_limit} physical query from the exposed menu layers "
+             "or hand off. Model assessments cannot claim Core verification. Return JSON only and follow this schema: "
              "{step_schema}")),
             ("human", "Host state and current menu:\n{state_json}\nRepair feedback for this attempt (empty on first attempt):\n{repair_feedback_json}"),
-        ]).partial(step_schema=json.dumps(provider_loop_schema(), ensure_ascii=False))
+        ]).partial(step_schema=json.dumps(provider_loop_schema(), ensure_ascii=False),
+                   batch_limit=batch_limit)
         structured = model.with_structured_output(LoopStep, method=structured_method)
-        return cls(prompt | structured)
+        return cls(prompt | structured, batch_limit=batch_limit)
 
     def step(self, incident: dict[str, Any], view: dict[str, Any],
              repair_feedback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -154,13 +174,17 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
             try:
                 raw = self.inquiry.step(context, bundle, repair_feedback=repair_feedback)
                 stage = "normalize"
-                step = normalize_loop_step(raw, bundle["menu"])
+                step = normalize_loop_step(
+                    raw, bundle["menu"],
+                    menu_aliases=bundle["view"].get("menu_aliases"),
+                )
                 visible = {item["observation_id"] for item in bundle["view"]["observations"]}
                 stage = "accept"
                 next_state, round_record = accept_loop_step(state, step,
                     menu=bundle["menu"], batch_limit=bundle["view"]["batch_limit"],
                     query_limit=self.query_limit, visible_refs=visible,
-                    budget_remaining=bundle["view"]["budget_remaining"])
+                    budget_remaining=bundle["view"]["budget_remaining"],
+                    offered_refs=set(bundle["view"].get("offered_menu_refs", ())) or None)
                 self._loop_steps.append((step.model_dump(mode="json"), bundle))
                 self._loop_attempts.append({"step": state.planning_steps + 1,
                     "attempt": attempt, "status": "parsed", "code": "parsed",
@@ -200,11 +224,48 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                                 for error in exc.errors()[:20])
                           if isinstance(exc, ValidationError) else
                           ("pending_decisions",) if getattr(exc, "code", None) == "PENDING_DECISION_SET_MISMATCH" else ())
+                root_errors = (isinstance(exc, ValidationError)
+                               and any(not error.get("loc") for error in exc.errors()))
+                if root_errors and "continuing Inquiry requires a justified nonempty batch" in str(exc):
+                    code = "LOOP_STEP_CONTINUE_EMPTY_BATCH"
+                    fields = ("decision", "next_batch")
+                    safe_details = "decision=continue requires a non-empty next_batch"
+                    repair_instruction = (
+                        "Choose at least one valid next_batch item when decision=continue, or use "
+                        "decision=handoff with a non-empty stop_reason if no valid query remains."
+                    )
+                else:
+                    repair_instruction = getattr(exc, "instruction", None)
+                if getattr(exc, "code", None) == "CANDIDATE_IDENTITY_CHANGED":
+                    repair_instruction = (
+                        "The existing hypothesis ID is immutable. Do not repeat it with changed mechanism or "
+                        "alternative text. Create a new hypothesis_id in draft.hypotheses and add a "
+                        "candidate_updates entry for that new ID with supersedes_hypothesis_id set to the old ID."
+                    )
+                elif getattr(exc, "code", None) == "NEED_IDENTITY_CHANGED":
+                    repair_instruction = (
+                        "The existing Need ID is immutable. Do not repeat it with changed content. Create a new "
+                        "need_id and add need_updates.supersedes_need_id pointing to the old Need ID."
+                    )
                 if not fields and getattr(exc, "fields", ()):
                     fields = tuple(str(field) for field in exc.fields)
                 if not fields:
                     fields = (stage,)
-                safe_details = getattr(exc, "safe_details", None)
+                if not root_errors:
+                    safe_details = getattr(exc, "safe_details", None)
+                issue_list = list(getattr(exc, "issues", ()))
+                if issue_list:
+                    # Preserve all independently-checkable admission failures so the
+                    # existing single retry can repair them together.  The host still
+                    # rejects the whole step atomically; this is diagnostics only.
+                    fields = tuple(dict.fromkeys(
+                        [field for issue in issue_list for field in issue.get("fields", [])]
+                        or fields
+                    ))
+                    repair_instruction = (
+                        "Repair every listed independent contract issue against the same host state; "
+                        "do not infer or rewrite IDs."
+                    )
                 if (safe_details is None and stage == "accept" and isinstance(exc, ValueError)
                         and getattr(exc, "code", None) is None):
                     # Keep the host strict, but make otherwise opaque admission failures
@@ -212,6 +273,21 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                     safe_details = str(exc)[:500]
                     code = "LOOP_ADMISSION_REJECTED"
                 self.selection_errors.append(code)
+                last_batch = bundle["view"].get("last_batch") or {}
+                available_result_ids = tuple(
+                    item.get("query_fingerprint") for item in last_batch.get("results", ())
+                    if item.get("query_fingerprint")
+                )
+                available_observation_refs = tuple(
+                    ref for item in last_batch.get("results", ())
+                    for ref in item.get("observation_refs", ())
+                )
+                retry_state = {
+                    "revision": state.revision,
+                    "digest": state.digest,
+                    "result_ids": list(available_result_ids),
+                    "observation_refs": list(available_observation_refs),
+                }
                 safe_keys = set(LoopStep.model_fields)
                 self._loop_attempts.append({"step": state.planning_steps + 1,
                     "attempt": attempt, "status": "failed", "code": code,
@@ -220,6 +296,7 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                     "raw_digest": sha256_digest(raw) if isinstance(raw, dict) else None,
                     "repair_feedback": repair_feedback,
                     "pending_diagnostics": {
+                        "issues": issue_list,
                         "expected": list(getattr(exc, "expected", ())),
                         "missing": list(getattr(exc, "missing", ())),
                         "unexpected": list(getattr(exc, "unexpected", ())),
@@ -233,7 +310,8 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                         "conflict_id": getattr(exc, "conflict_id", None),
                         "conflict_status": getattr(exc, "conflict_status", None),
                         "query_fingerprint": getattr(exc, "query_fingerprint", None),
-                        "repair_instruction": getattr(exc, "instruction", None),
+                        "repair_instruction": repair_instruction,
+                        "retry_state": retry_state,
                     },
                     "fields": fields,
                     "raw_shape": {key: type(value).__name__ for key, value in raw.items()
@@ -246,6 +324,7 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                     raise InquiryUnavailableError("batched Inquiry attempts exhausted") from exc
                 context["batched_repair_feedback"] = {
                     "code": code,
+                    "issues": issue_list,
                     "fields": list(fields),
                     "missing": list(getattr(exc, "missing", ())),
                     "unexpected": list(getattr(exc, "unexpected", ())),
@@ -259,13 +338,16 @@ class BatchedInquiryInvestigationPolicy(InquiryInvestigationPolicy):
                     "conflict_id": getattr(exc, "conflict_id", None),
                     "conflict_status": getattr(exc, "conflict_status", None),
                     "query_fingerprint": getattr(exc, "query_fingerprint", None),
-                    "repair_instruction": getattr(exc, "instruction", None),
+                    "repair_instruction": repair_instruction,
+                    "retry_state": retry_state,
                     "instruction": (
                         "Repair only the declared fields against the same host state. "
                         "For batch_assessments[].query_ref copy an available result ID "
                         "exactly; menu refs are valid only in draft.choices. "
                         "For exploratory results use status partial, ambiguous, or unavailable; "
-                        "answered requires a complete direct result matching the Need."
+                        "answered requires a complete direct result matching the Need. "
+                        "Use only retry_state.result_ids and retry_state.observation_refs from the current view; "
+                        "if they are empty, submit no assessment or basis refs."
                     ),
                 }
         return None

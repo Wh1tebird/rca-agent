@@ -1,5 +1,20 @@
 # RCA Agent handoff
 
+## Batched Inquiry menu projection — 2026-10-15
+
+Status: **确定性投影实现完成，待只读代码审查和单 Case 低预算复验授权**. The v4 host keeps
+the complete menu for internal resolution and Replay, but the model receives only a deterministic
+focused projection (8–20 target) or a small exploration layer when the open Need has insufficient
+matches. Filtering uses host fields only; no embedding, LLM filtering, prefix truncation, or new
+Action is involved. Stable alias records bind exposed `qN` aliases to `aq-...` menu refs and
+`act-...` action fingerprints; completed results retain separate `qry-...` refs. Hidden actions fail
+the projected-reference admission gate before state, budget or execution changes.
+
+Full deterministic pytest passes, targeted source/test Ruff passes, and old v3 Replay plus current
+v4 Transcript paths remain covered. Repository-wide Ruff still reports the pre-existing and newly
+present evidence-script findings; no claim of a clean repository-wide Ruff run is made. No real
+DeepSeek call, Benchmark, GT/evaluator read or Core/Runner admission relaxation was performed.
+
 ## Legacy query menu repair handoff — 2026-10-09
 
 Status: **全量确定性测试失败已修复，待独立复验**. Review the unchanged
