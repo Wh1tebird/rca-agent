@@ -1,4 +1,6 @@
 """Versioned, pure measurement contracts shared by admission, Runner and Replay."""
+import re
+
 from rca_agent.models import CallToolAction, TimeWindow
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
 
@@ -10,6 +12,34 @@ def normalized(text):
 def action_fingerprint(action):
     """Stable Action identity, distinct from a completed ``qry-*`` result."""
     return "act-" + sha256_digest(action.model_dump(mode="json"))[:20]
+
+
+def canonicalize_need_signals(needs, advertised_signals):
+    """Canonicalize one exact advertised signal embedded in explanatory text.
+
+    This is intentionally narrower than text similarity: a value is changed only
+    when exactly one host-advertised signal identifier appears as a token. Unknown
+    or ambiguous prose remains unchanged and is rejected by the normal contract.
+    """
+    signals = tuple(dict.fromkeys(str(signal) for signal in advertised_signals if signal))
+    canonical = []
+    for raw_need in needs:
+        need = dict(raw_need)
+        values = need.get("observable_signals")
+        if values:
+            normalized = []
+            for value in values:
+                if value in signals:
+                    normalized.append(value)
+                    continue
+                matches = [signal for signal in signals if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(signal)}(?![A-Za-z0-9_])",
+                    str(value),
+                )]
+                normalized.append(matches[0] if len(matches) == 1 else value)
+            need["observable_signals"] = normalized
+        canonical.append(need)
+    return canonical
 
 
 def original_alternative_id(candidate):

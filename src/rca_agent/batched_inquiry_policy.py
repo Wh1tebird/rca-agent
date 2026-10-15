@@ -68,6 +68,8 @@ class LangChainBatchedInquiryAdapter:
              "For a direct choice, copy measurement_target.measurement_kind exactly from the chosen menu item "
              "and ensure the Need's measurement_kind matches it; do not substitute series, window_comparison, "
              "or entity_exploration. "
+             "In Need.observable_signals, copy the exact signal identifier from the menu item without adding "
+             "units, prose, or a comparison description; explanatory text belongs only in question or purpose. "
              "The menu is a deterministic host projection: focused_menu contains only candidates matching an "
              "open Need's entity_ref, observable_signals, measurement_kind and time window. Use it for direct "
              "bindings. If menu_mode is exploration or focused_with_exploration, exploration_menu is a small "

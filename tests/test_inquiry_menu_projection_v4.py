@@ -9,6 +9,7 @@ from test_engineering_independent_regressions import EmptyPlanner, PublicEnviron
 
 from rca_agent.investigation.inquiry_contract import (
     action_fingerprint,
+    canonicalize_need_signals,
     measurement_target,
     project_inquiry_menu,
     public_query,
@@ -106,6 +107,44 @@ def test_projection_honors_existing_fingerprints_and_budget_without_repricing():
     assert ref not in projection["focused"]
     assert ref not in projection["exploration"]
     assert all(entry.get("query_cost") == 1 for entry in projection["exposed"].values())
+
+
+def test_signal_explanation_is_canonicalized_only_to_one_advertised_id():
+    needs = [{"observable_signals": (
+        "thread_pool_rejected_tasks incident vs baseline window statistics and ratio",
+    )}]
+    normalized = canonicalize_need_signals(needs, {"thread_pool_rejected_tasks", "queue_ratio"})
+    assert normalized[0]["observable_signals"] == ["thread_pool_rejected_tasks"]
+    assert needs[0]["observable_signals"][0].startswith("thread_pool_")
+
+
+@pytest.mark.parametrize("value", [
+    "ratio incident vs baseline",
+    "thread_pool_rejected_tasks and queue_ratio",
+])
+def test_unknown_or_ambiguous_signal_explanation_stays_rejected(value):
+    normalized = canonicalize_need_signals(
+        [{"observable_signals": (value,)}],
+        {"thread_pool_rejected_tasks", "queue_ratio"},
+    )
+    assert normalized[0]["observable_signals"] == [value]
+
+
+def test_loop_normalization_accepts_exact_signal_id_with_explanation():
+    menu = _menu()
+    public = {
+        f"q{index}": public_query({**item,
+            "action": CallToolAction.model_validate(item["action"])})
+        for index, item in enumerate(menu.values(), 1)
+    }
+    draft = output({"context": json.dumps({"queries": public})}, (("n1", "q1"),))
+    draft["needs"][0]["observable_signals"] = [
+        f"{public['q1']['signal']} incident vs baseline window statistics and ratio"
+    ]
+    state = LoopState.initial("ep-" + "b" * 32)
+    step = normalize_loop_step(planning_step(state, draft, "q1"), menu)
+    assert step.draft is not None
+    assert step.draft.needs[0].observable_signals == (public["q1"]["signal"],)
 
 
 def test_v4_aliases_are_stable_and_hidden_action_cannot_bypass_admission():

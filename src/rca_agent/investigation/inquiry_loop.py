@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rca_agent.investigation.inquiry_contract import (
     action_fingerprint,
+    canonicalize_need_signals,
+    measurement_target,
     original_alternative_id,
     selected_bindings,
     validate_bindings,
@@ -409,6 +411,11 @@ def provider_loop_schema() -> dict[str, Any]:
         nested.setdefault("properties", {})["contract_version"] = {"const": 2}
         nested["required"] = [key for key in nested.get("required", ())
                                if key != "contract_version"] + ["contract_version"]
+    strict_need = schema.get("$defs", {}).get("StrictInquiryNeed")
+    if isinstance(strict_need, dict):
+        strict_need.setdefault("properties", {}).setdefault("observable_signals", {})[
+            "description"
+        ] = "Exact signal identifiers copied from the host menu; do not append prose or units."
     return schema
 
 
@@ -420,6 +427,12 @@ def normalize_loop_step(raw: dict[str, Any], menu: dict[str, dict[str, Any]], *,
         data["contract_version"] = LOOP_VERSION
     if data.get("draft") is not None:
         source = dict(data["draft"])
+        advertised_signals = {
+            measurement_target(CallToolAction.model_validate(item["action"]))["signal"]
+            for item in menu.values()
+        }
+        source["needs"] = canonicalize_need_signals(
+            source.get("needs", ()), advertised_signals)
         LoopDraftV2.model_validate(source)
         if menu_aliases is None:
             aliases = {f"q{index}": ref for index, ref in enumerate(menu, start=1)}
