@@ -4,9 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rca-agent"
-version = "0.2.0"
+version = "0.5.0"
 description = "Controlled, interactive RCA100 investigation environment."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.4,<2",
@@ -28,10 +29,29 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/rca_agent"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/analysis",
+    "/.codex-build",
+    "/.codex-finalizer",
+    "/.codefree",
+    "/.codefree-mem",
+    "/frontend/node_modules",
+    "/frontend/dist",
+    "/backend/var",
+    "/evaluation/unknown_holdout_manifest.json",
+    "/evaluation/jvm_capability_probe_manifest.json",
+    "/evaluation/jvm_diagnostic_manifest.json",
+    "*.log",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "requires_rca100: tests that require the private external RCA100 observation directory",
+]
 
 [tool.ruff]
 line-length = 100

@@ -68,12 +68,12 @@ def test_local_model_rejects_public_http_before_reading_credential(monkeypatch):
     monkeypatch.setattr("rca_agent.local_model.sys.stdin.isatty", lambda: False)
 
     with pytest.raises(ValueError, match="HTTPS or a loopback-only tunnel"):
-        create_local_chat_model(base_url="https://provider.example/v1")
+        create_local_chat_model(base_url="http://provider.example/v1")
 
 
 def test_public_http_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("RCA_LOCAL_API_KEY", "test-only-local-secret")
     model = create_local_chat_model(
-        base_url="https://provider.example/v1", allow_insecure_http=True,
+        base_url="http://provider.example/v1", allow_insecure_http=True,
     )
-    assert str(model.openai_api_base) == "https://provider.example/v1"
+    assert str(model.openai_api_base) == "http://provider.example/v1"

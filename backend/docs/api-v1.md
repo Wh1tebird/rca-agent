@@ -1,9 +1,10 @@
 # RCA Agent Investigation API v1
 
 This is a GT-free API for the RCA investigation console. The API is a
-presentation host plus a bounded local job runner: it does not write a Case,
-score a Case, or make a Core decision. The first live profile is deterministic
-and does not invoke a model.
+presentation host plus a bounded local job runner: it does not write a Case or
+score a Case. The `scripted-trace-demo` profile is deterministic and does not
+invoke a model; `qwen-investigation` is an optional host-configured provider
+profile.
 
 ## Safety contract
 

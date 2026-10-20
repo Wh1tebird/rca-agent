@@ -44,7 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="RCA Agent Investigation API",
-        version="0.1.0",
+        version="0.5.0",
         description=(
             "GT-free API for recorded and server-approved RCA100 investigations. "
             "It never exposes evaluator data or changes Core decisions."

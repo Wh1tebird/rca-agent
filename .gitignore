@@ -10,3 +10,25 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Private research and Codex workspace artifacts
+analysis/
+.codex-build/
+.codex-finalizer/
+.codefree/
+.codefree-mem/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local backend runs and transient logs
+backend/var/
+*.log
+*.tmp
+
+# Private benchmark manifests kept locally for evaluation only
+evaluation/unknown_holdout_manifest.json
+evaluation/jvm_capability_probe_manifest.json
+evaluation/jvm_diagnostic_manifest.json

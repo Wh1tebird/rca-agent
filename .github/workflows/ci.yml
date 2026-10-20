@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync --extra dev
+      - run: uv run ruff check src backend tests
+      - run: uv run pytest -q -m 'not requires_rca100'
+      - run: uv build
+      - name: Check source distribution boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find dist -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          if tar -tzf "$archive" | grep -E '(^|/)(analysis|\.codex-build|\.codex-finalizer|frontend/node_modules|backend/var)(/|$)'; then
+            echo 'private or generated files found in source distribution' >&2
+            exit 1
+          fi
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build

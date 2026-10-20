@@ -13,8 +13,7 @@ policy receives a small event bootstrap payload and can acquire additional facts
 bounded, typed, read-only tools. Candidate interpretation and final evidence decisions belong to
 the internal Agent domain core.
 
-This repository currently implements the trusted runtime through the Fake/Scripted LangGraph
-integration stage:
+This repository contains the trusted RCA runtime and a GT-free local console:
 
 - repository and trust-boundary skeleton;
 - the minimal RCA Environment Contract;
@@ -40,16 +39,29 @@ integration stage:
 - a Core-derived Graph candidate frontier for active, inconclusive, supported, contradicted, and
   confirmed candidates;
 - a deterministic `slowSQL` versus `dbNetworkLatency` multi-candidate integration test.
+- bounded Inquiry and result-driven investigation loops;
+- dynamic Discovery and Verification Planner contracts;
+- a FastAPI presentation host and Vue investigation console.
 
-Live model invocation, evaluator scoring, backend verification replay, deterministic diagnosis
-strategy, and blind accuracy experiments remain deferred.
+RCA100 remains an external, private observation directory. It is never bundled with this
+repository. The public test and CI path uses synthetic environments; private RCA100 integration and
+benchmark runs are separate and are not release-quality or accuracy claims.
 
 ## Setup and verification
 
 ```bash
 uv sync --extra dev
-uv run ruff check .
-uv run pytest -q
+uv run ruff check src backend tests
+uv run pytest -q -m 'not requires_rca100'
+
+# Optional local RCA100 integration tests
+RCA100_CASES_ROOT=/path/to/RCA100/cases uv run pytest -q -m requires_rca100
+
+# Frontend
+cd frontend
+npm ci
+npm run lint
+npm run build
 ```
 
 The package has no runtime dependency on the frozen sibling `rca-core` repository. The previously
@@ -59,6 +71,9 @@ discovery, evidence assessment, candidate-state aggregation, and safe decisions.
 remain outside Agent Runtime. RCA100 data is not copied into this repository. A host process
 supplies the existing `cases` directory when it constructs an environment; that path is never
 included in Agent-visible responses.
+
+Private research runs, generated evidence, provider transcripts, and local workspace artifacts are
+excluded from the public source distribution. See `.env.example` for host-only configuration.
 
 ## Trust states
 
