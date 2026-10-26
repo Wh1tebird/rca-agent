@@ -2311,7 +2311,7 @@ class EpisodeRunner:
         try:
             return True, getattr(component, method)(*args)
         except Exception as exc:  # noqa: BLE001 - sanitized at the Runner boundary
-            failure = {"error_type": type(exc).__name__}
+            failure = {"error_type": getattr(exc, "error_type", type(exc).__name__)}
             from rca_agent.langchain_formalizer import FormalizerBoundaryError
 
             if isinstance(exc, FormalizerBoundaryError):
@@ -2351,7 +2351,7 @@ class EpisodeRunner:
             try:
                 return True, getattr(planner, operation)(deepcopy(context))
             except Exception as exc:  # noqa: BLE001 - sanitized at the Runner boundary
-                return False, {"error_type": type(exc).__name__}
+                return False, {"error_type": getattr(exc, "error_type", type(exc).__name__)}
         return self._invoke_discovery_component(
             lambda: getattr(planner, operation)(deepcopy(context))
         )

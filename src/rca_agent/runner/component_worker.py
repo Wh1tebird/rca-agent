@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024
 FAKE_FACTORY_ID = "test.fake"
+PRODUCTION_FACTORY_ID = "langchain.production"
 _FAKE_COMPONENT_FACTORIES = {
     "test.fake.discovery": "discovery",
     "test.fake.formalizer": "formalizer",
@@ -444,10 +445,154 @@ def _ensure_json_object(value: dict[str, Any]) -> None:
 
 
 def _sanitized_environment() -> dict[str, str]:
-    allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH"}
+    allowed = {
+        "PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH",
+        "DEEPSEEK_API_KEY", "RCA_LOCAL_API_KEY", "RCA_LOCAL_BASE_URL",
+    }
     environment = {key: value for key, value in os.environ.items() if key in allowed}
     environment["PYTHONHASHSEED"] = "0"
     return environment
+
+
+class _OfflineStructuredModel:
+    """Child-side LangChain model double used without network or credentials."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self._response = config.get("response", {})
+
+    def with_structured_output(self, schema: Any, **_: Any):
+        from langchain_core.runnables import RunnableLambda
+
+        response = self._response
+        return RunnableLambda(lambda _messages: {"parsed": response, "raw": None})
+
+
+def _build_production_adapter(factory: dict[str, Any]) -> Any:
+    component = factory.get("component")
+    provider = factory.get("provider")
+    model_name = factory.get("model")
+    options = factory.get("config", {})
+    if component not in {"discovery", "formalizer", "planner"}:
+        raise ValueError("unsupported production component")
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("production model identifier is required")
+    if not isinstance(options, dict):
+        raise TypeError("production factory config must be an object")
+    structured_method = options.get("structured_method", "function_calling")
+    if provider == "offline_stub":
+        model = _OfflineStructuredModel(options)
+    elif provider == "qwen_openai_compatible":
+        from rca_agent.local_model import create_local_chat_model
+
+        model = create_local_chat_model(
+            model=model_name,
+            base_url=options.get("base_url"),
+            timeout_seconds=float(options.get("timeout_seconds", 120)),
+            max_retries=int(options.get("max_retries", 0)),
+            max_completion_tokens=int(options.get("max_completion_tokens", 8192)),
+            allow_insecure_http=bool(options.get("allow_insecure_http", False)),
+        )
+    elif provider == "deepseek":
+        from rca_agent.deepseek_policy import create_deepseek_chat_model
+
+        model = create_deepseek_chat_model(
+            model=model_name,
+            timeout_seconds=float(options.get("timeout_seconds", 300)),
+            max_tokens=int(options.get("max_tokens", 65536)),
+            max_retries=int(options.get("max_retries", 0)),
+            thinking_enabled=bool(options.get("thinking_enabled", True)),
+        )
+    else:
+        raise ValueError("unsupported production provider")
+
+    if component == "discovery":
+        from rca_agent.langchain_discovery import (
+            LangChainDiscoveryAdapter,
+            LangChainMechanismDiscoveryAdapter,
+        )
+
+        discovery_kind = options.get("discovery_kind", "mechanism")
+        if discovery_kind == "open":
+            return LangChainDiscoveryAdapter.from_chat_model(
+                model,
+                structured_method=structured_method,
+            )
+        if discovery_kind != "mechanism":
+            raise ValueError("unsupported discovery adapter kind")
+        return LangChainMechanismDiscoveryAdapter.from_chat_model(
+            model,
+            structured_method=structured_method,
+            bound_handoff_version=int(options.get("bound_handoff_version", 7)),
+        )
+    if component == "formalizer":
+        from rca_agent.langchain_formalizer import (
+            LangChainDiscoveryFormatFormalizerAdapter,
+            LangChainMechanismFormalizerAdapter,
+        )
+
+        if options.get("formalizer_kind", "mechanism") == "discovery_format":
+            return LangChainDiscoveryFormatFormalizerAdapter.from_chat_model(
+                model,
+                structured_method=structured_method,
+            )
+        if options.get("formalizer_kind", "mechanism") != "mechanism":
+            raise ValueError("unsupported formalizer adapter kind")
+        return LangChainMechanismFormalizerAdapter.from_chat_model(
+            model,
+            structured_method=structured_method,
+        )
+    from rca_agent.langchain_verification_planner import LangChainVerificationPlannerAdapter
+
+    return LangChainVerificationPlannerAdapter.from_chat_model(
+        model,
+        structured_method=structured_method,
+    )
+
+
+def _invoke_production_adapter(adapter: Any, call: ComponentCallContext) -> dict[str, Any]:
+    component_context = call.context
+    if call.component == "formalizer":
+        from rca_agent.investigation.discovery_format import DiscoveryFormatRepairContext
+        from rca_agent.investigation.formalizer import MechanismFormalizationContext
+
+        if call.operation == "formalize":
+            component_context = MechanismFormalizationContext.model_validate(component_context)
+        elif call.operation == "retry_formalize":
+            component_context = {
+                "context": MechanismFormalizationContext.model_validate(
+                    component_context["context"]
+                ),
+                "previous": component_context["previous"],
+            }
+        elif call.operation == "repair":
+            component_context = DiscoveryFormatRepairContext.model_validate(component_context)
+    if call.operation == "retry_formalize":
+        result = adapter.retry_formalize(
+            component_context["context"],
+            _formalization_payload(component_context["previous"]),
+        )
+    else:
+        result = getattr(adapter, call.operation)(component_context)
+    if isinstance(result, BaseModel):
+        return result.model_dump(mode="json")
+    if not isinstance(result, dict):
+        raise TypeError("production adapter returned a non-object")
+    return result
+
+
+def _formalization_payload(value: Any) -> Any:
+    from rca_agent.investigation.formalizer import MechanismFormalizationPayload
+
+    return MechanismFormalizationPayload.model_validate(value)
+
+
+def _production_error_payload(exc: Exception) -> dict[str, Any]:
+    payload = {"error_type": type(exc).__name__, "message": str(exc)[:500]}
+    for key in ("reason_code", "field_paths"):
+        value = getattr(exc, key, None)
+        if isinstance(value, (str, list, tuple)):
+            payload[key] = list(value) if isinstance(value, tuple) else value
+    return payload
 
 
 def _worker_main() -> int:
@@ -458,18 +603,30 @@ def _worker_main() -> int:
         if start.protocol_version != PROTOCOL_VERSION or start.message_type != "start":
             return 2
         spec = ComponentWorkerSpec.model_validate(start.payload.get("spec"))
-        if spec.worker_type not in {"fake", "component"} or not (
+        if spec.worker_type not in {"fake", "component", "production_component"} or not (
             spec.factory_id == FAKE_FACTORY_ID
             or spec.factory_id.startswith("test.fake.")
+            or spec.factory_id == PRODUCTION_FACTORY_ID
         ):
             return 6
         config = spec.config
-        if config.get("ignore_sigterm"):
+        production_adapter = None
+        production_factory = config.get("factory")
+        if spec.worker_type == "production_component":
+            if not isinstance(production_factory, dict):
+                return 7
+            production_adapter = _build_production_adapter(production_factory)
+        runtime_config = (
+            production_factory.get("config", {})
+            if isinstance(production_factory, dict)
+            else config
+        )
+        if runtime_config.get("ignore_sigterm"):
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        startup_delay = float(config.get("startup_delay_ms", 0)) / 1000
+        startup_delay = float(runtime_config.get("startup_delay_ms", 0)) / 1000
         if startup_delay:
             time.sleep(startup_delay)
-        ready_version = int(config.get("ready_protocol_version", PROTOCOL_VERSION))
+        ready_version = int(runtime_config.get("ready_protocol_version", PROTOCOL_VERSION))
         write_frame(
             output,
             _message(
@@ -490,12 +647,12 @@ def _worker_main() -> int:
                 return 0
             if message.message_type != "request" or message.request_id is None:
                 return 4
-            if config.get("crash_on_request"):
+            if runtime_config.get("crash_on_request"):
                 os._exit(17)
-            sleep_ms = float(config.get("sleep_ms", 0))
+            sleep_ms = float(runtime_config.get("sleep_ms", 0))
             if sleep_ms:
                 time.sleep(sleep_ms / 1000)
-            if config.get("controlled_exception"):
+            if runtime_config.get("controlled_exception"):
                 write_frame(
                     output,
                     _message(
@@ -505,10 +662,10 @@ def _worker_main() -> int:
                     ),
                 )
                 continue
-            if config.get("malformed_response"):
+            if runtime_config.get("malformed_response"):
                 _write_raw_frame(output, b"not-json")
                 continue
-            if config.get("oversized_response"):
+            if runtime_config.get("oversized_response"):
                 os.write(output.fileno(), _HEADER.pack(DEFAULT_MAX_FRAME_SIZE + 1))
                 continue
             call = message.payload.get("call")
@@ -542,14 +699,14 @@ def _worker_main() -> int:
                         ),
                     )
                     continue
-                responses = config.get("responses", {})
+                responses = runtime_config.get("responses", {})
                 response_payload = (
                     responses.get(typed_call.operation)
                     if isinstance(responses, dict)
                     else None
                 )
                 if response_payload is None:
-                    response_payload = config.get("response", {"echo": typed_call.context})
+                    response_payload = runtime_config.get("response", {"echo": typed_call.context})
             else:
                 response_payload = {"echo": message.payload}
             if not isinstance(response_payload, dict):
@@ -565,14 +722,31 @@ def _worker_main() -> int:
                     ),
                 )
                 continue
-            response_id = "wrong-request-id" if config.get("wrong_request_id") else message.request_id
+            if production_adapter is not None:
+                try:
+                    response_payload = _invoke_production_adapter(
+                        production_adapter, typed_call
+                    )
+                except Exception as exc:  # noqa: BLE001 - serialized child failure
+                    write_frame(
+                        output,
+                        _message(
+                            "error",
+                            request_id=message.request_id,
+                            payload=_production_error_payload(exc),
+                        ),
+                    )
+                    continue
+            response_id = (
+                "wrong-request-id" if runtime_config.get("wrong_request_id") else message.request_id
+            )
             write_frame(
                 output,
                 _message("response", request_id=response_id, payload=response_payload),
-                chunk_size=1 if config.get("partial_response") else None,
-                chunk_delay_seconds=float(config.get("partial_delay_ms", 0)) / 1000,
+                chunk_size=1 if runtime_config.get("partial_response") else None,
+                chunk_delay_seconds=float(runtime_config.get("partial_delay_ms", 0)) / 1000,
             )
-            if config.get("exit_after_response"):
+            if runtime_config.get("exit_after_response"):
                 return 0
     except (EOFError, BrokenPipeError, WorkerProtocolError, ValueError, TypeError):
         return 5

@@ -32,6 +32,12 @@ from rca_agent.runner.component_worker import (
 )
 
 ComponentName = Literal["discovery", "formalizer", "planner"]
+ProductionProvider = Literal["offline_stub", "qwen_openai_compatible", "deepseek"]
+PRODUCTION_FACTORY_ID = "langchain.production"
+_FORBIDDEN_CONFIG_KEYS = frozenset({
+    "adapter", "callable", "closure", "environment", "file", "file_handle",
+    "model_object", "runnable", "runner", "transcript", "workspace",
+})
 
 
 class ComponentAdapterSpec(BaseModel):
@@ -64,6 +70,40 @@ class ComponentAdapterSpec(BaseModel):
         )
 
 
+class ProductionComponentFactorySpec(BaseModel):
+    """JSON-only provider/model identity for child-side LangChain construction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component: ComponentName
+    provider: ProductionProvider
+    model: str = Field(min_length=1, max_length=200)
+    config: dict[str, Any] = Field(default_factory=dict)
+    protocol_version: int = Field(default=1, ge=1)
+
+    @field_validator("config")
+    @classmethod
+    def _json_config_without_live_objects(cls, value: dict[str, Any]) -> dict[str, Any]:
+        import json
+
+        forbidden = _FORBIDDEN_CONFIG_KEYS & set(value)
+        if forbidden:
+            raise ValueError(f"factory config contains forbidden keys: {sorted(forbidden)}")
+        try:
+            json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("factory config must be JSON serializable") from exc
+        return value
+
+    def worker_spec(self) -> ComponentWorkerSpec:
+        return ComponentWorkerSpec(
+            worker_type="production_component",
+            factory_id=PRODUCTION_FACTORY_ID,
+            config={"factory": self.model_dump(mode="json")},
+            protocol_version=self.protocol_version,
+        )
+
+
 class ComponentAdapterCallError(RuntimeError):
     """Failure raised by a worker-backed adapter before Runner admission."""
 
@@ -73,12 +113,20 @@ class ComponentAdapterCallError(RuntimeError):
         self.details = details or {}
 
 
+class ComponentAdapterFailure(RuntimeError):
+    """Parent-visible failure retaining the child adapter's stable type name."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
+
+
 class ComponentAdapterHost:
     """Run exactly one typed component call in a fresh, reaped worker."""
 
     def __init__(
         self,
-        spec: ComponentAdapterSpec,
+        spec: ComponentAdapterSpec | ProductionComponentFactorySpec,
         *,
         timeout_seconds: float = 1.0,
         terminate_grace_seconds: float = 0.2,
@@ -121,7 +169,12 @@ class WorkerBackedPlannerAdapter:
 
     worker_backed = True
 
-    def __init__(self, spec: ComponentAdapterSpec, *, timeout_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        spec: ComponentAdapterSpec | ProductionComponentFactorySpec,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> None:
         if spec.component != "planner":
             raise ValueError("planner adapter requires planner spec")
         self._host = ComponentAdapterHost(spec, timeout_seconds=timeout_seconds)
@@ -147,7 +200,12 @@ class WorkerBackedDiscoveryAdapter:
 
     worker_backed = True
 
-    def __init__(self, spec: ComponentAdapterSpec, *, timeout_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        spec: ComponentAdapterSpec | ProductionComponentFactorySpec,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> None:
         if spec.component != "discovery":
             raise ValueError("discovery adapter requires discovery spec")
         self._host = ComponentAdapterHost(spec, timeout_seconds=timeout_seconds)
@@ -176,7 +234,12 @@ class WorkerBackedMechanismFormalizerAdapter:
     supports_candidate_accounting = True
     worker_backed = True
 
-    def __init__(self, spec: ComponentAdapterSpec, *, timeout_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        spec: ComponentAdapterSpec | ProductionComponentFactorySpec,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> None:
         if spec.component != "formalizer":
             raise ValueError("formalizer adapter requires formalizer spec")
         self._host = ComponentAdapterHost(spec, timeout_seconds=timeout_seconds)
@@ -211,7 +274,12 @@ class WorkerBackedMechanismFormalizerAdapter:
 class WorkerBackedDiscoveryFormatFormalizerAdapter:
     worker_backed = True
 
-    def __init__(self, spec: ComponentAdapterSpec, *, timeout_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        spec: ComponentAdapterSpec | ProductionComponentFactorySpec,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> None:
         if spec.component != "formalizer":
             raise ValueError("format formalizer requires formalizer spec")
         self._host = ComponentAdapterHost(spec, timeout_seconds=timeout_seconds)
@@ -228,4 +296,4 @@ class WorkerBackedDiscoveryFormatFormalizerAdapter:
 def _runner_error(error: ComponentAdapterCallError) -> RuntimeError:
     if error.error_type == "TimeoutError":
         return TimeoutError("component worker request timed out")
-    return RuntimeError(error.error_type)
+    return ComponentAdapterFailure(error.error_type)

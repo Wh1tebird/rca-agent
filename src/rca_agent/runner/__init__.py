@@ -2,6 +2,7 @@
 
 from rca_agent.runner.component_adapter import (
     ComponentAdapterSpec,
+    ProductionComponentFactorySpec,
     WorkerBackedDiscoveryAdapter,
     WorkerBackedDiscoveryFormatFormalizerAdapter,
     WorkerBackedMechanismFormalizerAdapter,
@@ -26,6 +27,7 @@ __all__ = [
     "EventType",
     "IssuedObservation",
     "PolicyProcessReport",
+    "ProductionComponentFactorySpec",
     "RecordedReplay",
     "ReplayReport",
     "ReplayValidationError",
