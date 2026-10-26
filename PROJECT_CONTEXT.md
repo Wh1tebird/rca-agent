@@ -1,5 +1,21 @@
 # RCA Agent project context
 
+## P1-1 cancellation boundary assessment — 2026-10-26
+
+P1-1 is **not implemented**. The existing Discovery and shared Formalizer/Planner calls still
+use daemon threads with a waiting deadline; expiry does not cancel the underlying invocation.
+Component protocols currently accept live Python adapter objects, and internal invocations use
+closures. There is no serialized component-construction contract equivalent to ScriptedPolicySpec.
+The scripted Policy subprocess is a lifecycle reference, not a drop-in executor for those adapters.
+
+A fork-based draft was withdrawn before commit. Forking a multithreaded host can inherit locked
+provider/native state; polling a Pipe before recv does not bound a partial-frame read; inherited
+Transcript paths and handles are not isolated by copy-on-write; copying arbitrary adapter state
+back is not a safe episode-admission contract. Passing deterministic tests did not establish the
+requested guarantees. A safe replacement needs child-side adapter construction, bounded framed
+messages and explicit worker cleanup, with Runner remaining the sole state writer. Keep this
+execution-boundary work separate from any P1-2 Runtime reducer change.
+
 ## Deterministic batched Inquiry menu projection — 2026-10-15
 
 The batched Inquiry host now keeps its complete typed menu private while projecting a bounded

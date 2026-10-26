@@ -1,5 +1,51 @@
 # RCA Agent handoff
 
+## P1-1 stopped at execution-boundary blocker — 2026-10-26
+
+Status: **未完成；按本次任务 E 条停止编码，试验 runtime/test 改动已撤回**. The original
+daemon-thread timeout defect remains. Do not interpret earlier passing tests or progress messages
+as P1-1 acceptance. No incomplete runtime fix has been committed or pushed to GitHub.
+
+Current chain: LangGraph routes a stop/unknown-candidate investigation to
+EpisodeRunner.discover_candidates(). The one-stage Discovery uses its own Thread/Queue; two-stage
+Discovery, bound typing, completion/repair, MechanismFormalizer, Planner retry and plan extension
+use _invoke_discovery_component(). Returned payloads are admitted by Runner before compilation,
+Workspace events and Answer freeze. Timeouts currently preserve stage-specific diagnostics and
+bounded retries; Discovery timeout does not itself introduce a new Answer StopReason. Preserve
+that behavior explicitly when replacing execution, rather than silently changing it to POLICY_TIMEOUT.
+
+The attempted minimal fork executor was rejected during final review:
+
+- The real host can be multithreaded; Python emitted a fork/deadlock warning in the fake suite.
+  Existing adapters contain live LangChain/provider runnables, and closures can capture Runner;
+  switching to spawn requires a reconstruction/serialization contract that does not exist yet.
+- Pipe.poll followed by recv is not a deadline-safe partial-frame protocol. A complete response
+  must also be size-bounded and received under the same monotonic deadline.
+- Fork copies memory but inherits file descriptors and accessible Transcript paths. That alone
+  cannot establish the requested sole-writer boundary. Generic adapter __dict__ synchronization
+  also cannot be used as an accepted-state protocol merely to preserve fake call counters.
+- Tests that only check a delayed marker remains absent do not prove PID reaping, partial-frame
+  cancellation, SIGTERM escalation or every Formalizer/Planner integration path.
+
+Minimum follow-up split, still P1-1 and independent of P1-2:
+
+1. Define a host-only worker spec/factory for existing supported Discovery/Formalizer/Planner
+   adapters and deterministic fixtures. Construct provider clients inside a fresh interpreter;
+   send only typed call contexts, never Runner, Workspace, Environment, Transcript paths or handles.
+   Define fake state/call accounting explicitly instead of reflecting arbitrary object attributes.
+2. Add one controlled worker host with bounded startup/task deadlines, bounded framed responses,
+   terminate/kill escalation, reaping and pipe closure on success, failure, timeout and cancellation.
+   Keep parent-side schema/semantic admission, failure codes, retry counts and freeze semantics.
+3. Route every existing component operation through it. Add handshake-driven PID/reaping tests,
+   partial output, late output, exception/normal results, and actual Runner Formalizer/Planner
+   timeout-to-freeze/Replay tests before claiming completion. No real model call is needed.
+
+The withdrawn draft's full fake suite and repository Ruff passed, but are not evidence for a
+delivered fix. Rerun required checks after rollback; their result is recorded in the chat. Do not
+start P1-2 to compensate for this blocker. No RCA100, evaluator/ground-truth, sibling rca-core or
+frontend change belongs to this work. A later user message authorized Git submission after
+completion; that condition is not met, so the blocked assessment remains local.
+
 ## Batched Inquiry menu projection — 2026-10-15
 
 Status: **确定性投影实现完成，待只读代码审查和单 Case 低预算复验授权**. The v4 host keeps
