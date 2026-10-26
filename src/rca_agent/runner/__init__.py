@@ -1,5 +1,12 @@
 """Typed episode lifecycle, transcript, replay, and local policy isolation."""
 
+from rca_agent.runner.component_adapter import (
+    ComponentAdapterSpec,
+    WorkerBackedDiscoveryAdapter,
+    WorkerBackedDiscoveryFormatFormalizerAdapter,
+    WorkerBackedMechanismFormalizerAdapter,
+    WorkerBackedPlannerAdapter,
+)
 from rca_agent.runner.core_decision import CoreDecisionProvider, IssuedObservation
 from rca_agent.runner.episode import ActionRejectedError, EpisodeRunner, EpisodeStateError
 from rca_agent.runner.policy_process import (
@@ -12,6 +19,7 @@ from rca_agent.runner.transcript import EventType, Transcript, TranscriptEvent
 
 __all__ = [
     "ActionRejectedError",
+    "ComponentAdapterSpec",
     "CoreDecisionProvider",
     "EpisodeRunner",
     "EpisodeStateError",
@@ -25,4 +33,8 @@ __all__ = [
     "ScriptedPolicySpec",
     "Transcript",
     "TranscriptEvent",
+    "WorkerBackedDiscoveryAdapter",
+    "WorkerBackedDiscoveryFormatFormalizerAdapter",
+    "WorkerBackedMechanismFormalizerAdapter",
+    "WorkerBackedPlannerAdapter",
 ]

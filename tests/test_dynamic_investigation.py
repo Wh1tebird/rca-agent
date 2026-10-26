@@ -62,6 +62,11 @@ from rca_agent.runner import (
     RecordedReplay,
     ReplayValidationError,
 )
+from rca_agent.runner.component_adapter import (
+    ComponentAdapterSpec,
+    WorkerBackedDiscoveryAdapter,
+    WorkerBackedPlannerAdapter,
+)
 from rca_agent.runner.plan_extension import added_predictions
 from rca_agent.runner.transcript import EventType, Transcript
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
@@ -268,6 +273,36 @@ def test_unknown_candidate_full_runner_query_loop_and_replay():
     assert "threshold" not in str(discoverer.context)
     assert "comparison" not in str(discoverer.context)
     assert len(runner.dynamic_candidate_options) == 1
+
+
+def test_worker_backed_planner_keeps_runner_admission_and_replay_semantics():
+    planner = WorkerBackedPlannerAdapter(ComponentAdapterSpec(
+        component="planner",
+        factory_id="test.fake.planner",
+        config={"response": {"plans": []}},
+    ))
+    runner, report, _, _ = run(verification_planner=planner)
+    assert report.answer is not None
+    assert RecordedReplay.verify(runner.transcript.events).valid
+    assert any(
+        event.event_type == EventType.ANSWER_FROZEN
+        for event in runner.transcript.events
+    )
+
+
+def test_worker_backed_discovery_keeps_parent_admission_and_replay():
+    discoverer = WorkerBackedDiscoveryAdapter(ComponentAdapterSpec(
+        component="discovery",
+        factory_id="test.fake.discovery",
+        config={"response": {"hypotheses": [draft(refute=True).model_dump(mode="json")]}},
+    ))
+    runner, report, _, _ = run(discoverer=discoverer)
+    assert report.answer is not None
+    assert RecordedReplay.verify(runner.transcript.events).valid
+    assert any(
+        event.event_type == EventType.DYNAMIC_CANDIDATE_REGISTERED
+        for event in runner.transcript.events
+    )
 
 
 def test_post_freeze_coverage_respects_candidate_bindings_and_completeness():

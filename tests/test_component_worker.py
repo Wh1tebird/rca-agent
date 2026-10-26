@@ -46,6 +46,8 @@ def test_ready_handshake_and_normal_response(component: str) -> None:
     worker = host(spec())
     worker.start()
     assert worker.state is WorkerLifecycle.READY
+    assert worker._child_directory is not None
+    assert os.path.isdir(worker._child_directory.name)
     assert worker.request({"component": component}, request_id="r-1") == {
         "echo": {"component": component}
     }
@@ -53,6 +55,7 @@ def test_ready_handshake_and_normal_response(component: str) -> None:
     worker.terminate()
     assert worker.state is WorkerLifecycle.EXITED
     assert not worker.is_alive
+    assert worker._child_directory is None
 
 
 def test_partial_framed_response_does_not_block() -> None:

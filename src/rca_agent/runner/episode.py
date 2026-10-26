@@ -1610,8 +1610,8 @@ class EpisodeRunner:
             ok, raw = self._invoke_formalizer(mechanism_context, proposals)
         else:
             assert self.__discovery is not None
-            ok, raw = self._invoke_discovery_component(
-                lambda: self.__discovery.discover(mechanism_context)
+            ok, raw = self._invoke_component_method(
+                self.__discovery, "discover", mechanism_context
             )
         if not ok and raw.get("error_type") == "DiscoveryPayloadError":
             repaired = self._repair_discovery_format(raw.get("raw_payload"), proposals)
@@ -1855,8 +1855,8 @@ class EpisodeRunner:
                     "type_compatibility_hints": compatible_classes(binding["mechanism"]),
                     "entity_graph": context["entity_graph"], "feedback": feedback,
                 }
-                ok, response = self._invoke_discovery_component(
-                    lambda call_context=call_context: self.__discovery.formalize_candidate(call_context)
+                ok, response = self._invoke_component_method(
+                    self.__discovery, "formalize_candidate", call_context
                 )
                 record = {"binding": binding, "attempt": attempt, "response": None,
                           "reason_code": response["error_type"] if not ok else "INVALID_TYPED_DETAILS"}
@@ -1892,7 +1892,9 @@ class EpisodeRunner:
                            "already_formalized": [m.model_dump(mode="json") for m in base.mechanisms]}
             new_context.pop("inquiry_handoff", None)
             new_context.pop("handoff_contract", None)
-            ok, raw = self._invoke_discovery_component(lambda: self.__discovery.discover(new_context))
+            ok, raw = self._invoke_component_method(
+                self.__discovery, "discover", new_context
+            )
             if ok:
                 try:
                     novel = MechanismDiscoveryPayload.model_validate(raw)
@@ -1952,8 +1954,8 @@ class EpisodeRunner:
                     "Do not relabel or remove a safe original mechanism."
                 ),
             }
-            ok, raw = self._invoke_discovery_component(
-                lambda: self.__discovery.discover(repair_context)
+            ok, raw = self._invoke_component_method(
+                self.__discovery, "discover", repair_context
             )
             if ok:
                 try:
@@ -2042,8 +2044,8 @@ class EpisodeRunner:
                 "add no new causal direction",
             ],
         }
-        ok, raw = self._invoke_discovery_component(
-            lambda: self.__discovery.discover(completion_context)
+        ok, raw = self._invoke_component_method(
+            self.__discovery, "discover", completion_context
         )
         if not ok:
             self.transcript.append(EventType.MECHANISM_COMPLETION_REJECTED, {
@@ -2104,8 +2106,8 @@ class EpisodeRunner:
             "context": context.model_dump(mode="json"),
             "context_digest": sha256_digest(context.model_dump(mode="json")),
         })
-        ok, response = self._invoke_discovery_component(
-            lambda: self.__discovery_format_formalizer.repair(context)
+        ok, response = self._invoke_component_method(
+            self.__discovery_format_formalizer, "repair", context
         )
         if not ok:
             self.transcript.append(EventType.DISCOVERY_FORMAT_REPAIR_REJECTED, {
@@ -2168,8 +2170,8 @@ class EpisodeRunner:
             "candidate_tracks": [item.candidate_track_id for item in candidates],
             "semantic_digests": [item.semantic_digest for item in candidates],
         })
-        ok, raw = self._invoke_discovery_component(
-            lambda: self.__mechanism_formalizer.formalize(formalization_context)
+        ok, raw = self._invoke_component_method(
+            self.__mechanism_formalizer, "formalize", formalization_context
         )
         if not ok:
             self.transcript.append(EventType.MECHANISM_FORMALIZATION_REJECTED, raw)
@@ -2202,9 +2204,17 @@ class EpisodeRunner:
                     retry = getattr(self.__mechanism_formalizer, "retry_formalize", None)
                     if not callable(retry):
                         raise FormalizationSemanticError("RETRY_NOT_AVAILABLE")
-                    retry_ok, retry_raw = self._invoke_discovery_component(
-                        lambda: retry(formalization_context, initial)
-                    )
+                    if getattr(self.__mechanism_formalizer, "worker_backed", False):
+                        retry_ok, retry_raw = self._invoke_component_method(
+                            self.__mechanism_formalizer,
+                            "retry_formalize",
+                            formalization_context,
+                            initial,
+                        )
+                    else:
+                        retry_ok, retry_raw = self._invoke_discovery_component(
+                            lambda: retry(formalization_context, initial)
+                        )
                     if not retry_ok:
                         self.transcript.append(
                             EventType.MECHANISM_FORMALIZATION_REJECTED, retry_raw
@@ -2285,12 +2295,40 @@ class EpisodeRunner:
         except Empty:
             return False, {"error_type": "TimeoutError"}
 
+    def _invoke_component_method(
+        self, component: Any, method: str, *args: Any
+    ) -> tuple[bool, Any]:
+        """Use direct worker lifecycle for worker-backed adapters.
+
+        Legacy live adapters retain the existing bounded thread wrapper until
+        their own factory is migrated. A worker-backed adapter already owns a
+        killable child and must not be wrapped in another daemon thread.
+        """
+        if not getattr(component, "worker_backed", False):
+            return self._invoke_discovery_component(
+                lambda: getattr(component, method)(*args)
+            )
+        try:
+            return True, getattr(component, method)(*args)
+        except Exception as exc:  # noqa: BLE001 - sanitized at the Runner boundary
+            failure = {"error_type": type(exc).__name__}
+            from rca_agent.langchain_formalizer import FormalizerBoundaryError
+
+            if isinstance(exc, FormalizerBoundaryError):
+                failure.update({
+                    "failure_stage": "structured_output",
+                    "reason_code": exc.reason_code,
+                    "field_paths": list(exc.field_paths),
+                })
+            raw_payload = getattr(exc, "raw_payload", None)
+            if isinstance(raw_payload, (dict, list)):
+                failure["raw_payload"] = raw_payload
+            return False, failure
+
     def _invoke_planner(
         self, context: dict[str, Any]
     ) -> tuple[VerificationPlanPayload | None, str | None]:
-        ok, raw = self._invoke_discovery_component(
-            lambda: self.__verification_planner.plan(deepcopy(context))
-        )
+        ok, raw = self._invoke_planner_operation("plan", context)
         if not ok:
             self.transcript.append(EventType.DISCOVERY_PAYLOAD_REJECTED, {
                 "stage": "verification_planner", **raw,
@@ -2303,6 +2341,20 @@ class EpisodeRunner:
                 "stage": "verification_planner", "error_type": type(exc).__name__,
             })
             return None, "PLANNER_INVALID_PAYLOAD"
+
+    def _invoke_planner_operation(
+        self, operation: str, context: dict[str, Any]
+    ) -> tuple[bool, Any]:
+        planner = self.__verification_planner
+        assert planner is not None
+        if getattr(planner, "worker_backed", False):
+            try:
+                return True, getattr(planner, operation)(deepcopy(context))
+            except Exception as exc:  # noqa: BLE001 - sanitized at the Runner boundary
+                return False, {"error_type": type(exc).__name__}
+        return self._invoke_discovery_component(
+            lambda: getattr(planner, operation)(deepcopy(context))
+        )
 
     def _compile_plans(
         self,
@@ -2636,10 +2688,8 @@ class EpisodeRunner:
         structured_extension = getattr(
             self.__verification_planner, "supports_plan_extension", False
         )
-        ok, raw = self._invoke_discovery_component(
-            (lambda: self.__verification_planner.plan_extension(deepcopy(context)))
-            if structured_extension else
-            (lambda: self.__verification_planner.plan(deepcopy(context)))
+        ok, raw = self._invoke_planner_operation(
+            "plan_extension" if structured_extension else "plan", context
         )
         try:
             if not ok:

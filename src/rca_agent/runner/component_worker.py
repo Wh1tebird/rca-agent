@@ -24,6 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024
 FAKE_FACTORY_ID = "test.fake"
+_FAKE_COMPONENT_FACTORIES = {
+    "test.fake.discovery": "discovery",
+    "test.fake.formalizer": "formalizer",
+    "test.fake.planner": "planner",
+}
 _HEADER = struct.Struct("!I")
 
 
@@ -44,6 +49,25 @@ class ComponentWorkerSpec(BaseModel):
             json.dumps(value, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("worker config must be JSON serializable") from exc
+        return value
+
+
+class ComponentCallContext(BaseModel):
+    """Typed JSON-only call envelope used by component adapter factories."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component: str = Field(min_length=1, max_length=40)
+    operation: str = Field(min_length=1, max_length=80)
+    context: dict[str, Any]
+
+    @field_validator("context")
+    @classmethod
+    def _json_context(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("component context must be JSON serializable") from exc
         return value
 
 
@@ -99,7 +123,9 @@ class WorkerCrashedError(RuntimeError):
 
 
 class WorkerExecutionError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 class FrameReader:
@@ -223,6 +249,7 @@ class ComponentWorkerHost:
         self.state = WorkerLifecycle.STARTING
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: FrameReader | None = None
+        self._child_directory: tempfile.TemporaryDirectory[str] | None = None
 
     @property
     def pid(self) -> int | None:
@@ -239,16 +266,21 @@ class ComponentWorkerHost:
         if self.spec.protocol_version != PROTOCOL_VERSION:
             self.state = WorkerLifecycle.FAILED
             raise WorkerProtocolVersionError("worker protocol version mismatch")
-        with tempfile.TemporaryDirectory(prefix="rca-component-") as child_directory:
+        self._child_directory = tempfile.TemporaryDirectory(prefix="rca-component-")
+        try:
             self._process = subprocess.Popen(
                 [sys.executable, "-I", "-m", "rca_agent.runner.component_worker"],
-                cwd=child_directory,
+                cwd=self._child_directory.name,
                 env=_sanitized_environment(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+        except BaseException:
+            self._child_directory.cleanup()
+            self._child_directory = None
+            raise
         assert self._process.stdin is not None
         assert self._process.stdout is not None
         self._reader = FrameReader(self._process.stdout, max_frame_size=self.max_frame_size)
@@ -296,7 +328,8 @@ class ComponentWorkerHost:
             if message_type == "error":
                 self.state = WorkerLifecycle.FAILED
                 self._terminate_and_reap()
-                raise WorkerExecutionError(response.get("payload", {}).get("message", "worker error"))
+                details = response.get("payload", {})
+                raise WorkerExecutionError(details.get("message", "worker error"), details=details)
             if message_type != "response":
                 raise WorkerProtocolError("worker sent an unsupported response")
             self.state = WorkerLifecycle.RESPONDED
@@ -396,6 +429,9 @@ class ComponentWorkerHost:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+        if self._child_directory is not None:
+            self._child_directory.cleanup()
+            self._child_directory = None
 
 
 def _ensure_json_object(value: dict[str, Any]) -> None:
@@ -422,7 +458,10 @@ def _worker_main() -> int:
         if start.protocol_version != PROTOCOL_VERSION or start.message_type != "start":
             return 2
         spec = ComponentWorkerSpec.model_validate(start.payload.get("spec"))
-        if spec.worker_type != "fake" or spec.factory_id != FAKE_FACTORY_ID:
+        if spec.worker_type not in {"fake", "component"} or not (
+            spec.factory_id == FAKE_FACTORY_ID
+            or spec.factory_id.startswith("test.fake.")
+        ):
             return 6
         config = spec.config
         if config.get("ignore_sigterm"):
@@ -472,10 +511,64 @@ def _worker_main() -> int:
             if config.get("oversized_response"):
                 os.write(output.fileno(), _HEADER.pack(DEFAULT_MAX_FRAME_SIZE + 1))
                 continue
+            call = message.payload.get("call")
+            if isinstance(call, dict):
+                try:
+                    typed_call = ComponentCallContext.model_validate(call)
+                except ValueError:
+                    write_frame(
+                        output,
+                        _message(
+                            "error",
+                            request_id=message.request_id,
+                            payload={
+                                "error_type": "ValueError",
+                                "message": "invalid component call context",
+                            },
+                        ),
+                    )
+                    continue
+                expected_component = _FAKE_COMPONENT_FACTORIES.get(spec.factory_id)
+                if expected_component is not None and typed_call.component != expected_component:
+                    write_frame(
+                        output,
+                        _message(
+                            "error",
+                            request_id=message.request_id,
+                            payload={
+                                "error_type": "ValueError",
+                                "message": "component does not match factory",
+                            },
+                        ),
+                    )
+                    continue
+                responses = config.get("responses", {})
+                response_payload = (
+                    responses.get(typed_call.operation)
+                    if isinstance(responses, dict)
+                    else None
+                )
+                if response_payload is None:
+                    response_payload = config.get("response", {"echo": typed_call.context})
+            else:
+                response_payload = {"echo": message.payload}
+            if not isinstance(response_payload, dict):
+                write_frame(
+                    output,
+                    _message(
+                        "error",
+                        request_id=message.request_id,
+                        payload={
+                            "error_type": "ValueError",
+                            "message": "fake factory response must be a JSON object",
+                        },
+                    ),
+                )
+                continue
             response_id = "wrong-request-id" if config.get("wrong_request_id") else message.request_id
             write_frame(
                 output,
-                _message("response", request_id=response_id, payload={"echo": message.payload}),
+                _message("response", request_id=response_id, payload=response_payload),
                 chunk_size=1 if config.get("partial_response") else None,
                 chunk_delay_seconds=float(config.get("partial_delay_ms", 0)) / 1000,
             )
