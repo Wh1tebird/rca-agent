@@ -117,9 +117,10 @@ def test_production_factory_rejects_live_objects_and_schema_violations() -> None
         adapter.plan({"context": "schema violation"})
 
 
-def test_production_worker_lifecycle_timeout_partial_cancel_and_reap() -> None:
+@pytest.mark.parametrize("component", ["discovery", "formalizer", "planner"])
+def test_production_worker_lifecycle_timeout_partial_cancel_and_reap(component: str) -> None:
     timeout_spec = production_spec(
-        "planner", sleep_ms=250, response={"plans": []}, partial_response=True
+        component, sleep_ms=250, response={"plans": []}, partial_response=True
     )
     host = ComponentWorkerHost(
         timeout_spec.worker_spec(),
@@ -130,8 +131,10 @@ def test_production_worker_lifecycle_timeout_partial_cancel_and_reap() -> None:
     host.start()
     with pytest.raises(TimeoutError):
         host.request({"call": {
-            "component": "planner",
-            "operation": "plan",
+            "component": component,
+            "operation": "discover" if component == "discovery" else (
+                "formalize" if component == "formalizer" else "plan"
+            ),
             "context": {"late": True},
         }})
     assert host.state is WorkerLifecycle.TIMED_OUT
@@ -145,7 +148,7 @@ def test_production_worker_lifecycle_timeout_partial_cancel_and_reap() -> None:
     assert not cancel_host.is_alive
 
     startup_host = ComponentWorkerHost(
-        production_spec("planner", startup_delay_ms=250, response={"plans": []}).worker_spec(),
+        production_spec(component, startup_delay_ms=250, response={"plans": []}).worker_spec(),
         ready_timeout_seconds=0.03,
     )
     with pytest.raises(TimeoutError):
