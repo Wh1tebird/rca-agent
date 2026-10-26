@@ -1240,3 +1240,77 @@ def test_formalizer_empty_result_has_one_audited_retry(cases_root, outcome):
             })
         with pytest.raises(ReplayValidationError, match="accounting is incomplete"):
             RecordedReplay.verify(rebuilt)
+
+
+def test_worker_backed_formalizer_failure_freezes_and_replays(cases_root):
+    from rca_agent.core.dynamic import VerificationPlanPayload
+    from rca_agent.core.runtime_registry import rca100_evidence_registry
+    from rca_agent.models import (
+        CallToolAction,
+        GetServiceTraceSummaryRequest,
+        HypothesisProposal,
+        RequestStopAction,
+        SubmitHypothesisAction,
+    )
+    from rca_agent.runner.component_adapter import (
+        ProductionComponentFactorySpec,
+        WorkerBackedMechanismFormalizerAdapter,
+    )
+
+    class EmptyPlanner:
+        def plan(self, context):
+            return VerificationPlanPayload()
+
+    formalizer = WorkerBackedMechanismFormalizerAdapter(ProductionComponentFactorySpec(
+        component="formalizer",
+        provider="offline_stub",
+        model="offline-deterministic",
+        config={"response": {"mechanisms": []}},
+    ))
+    runner = EpisodeRunner(
+        Rca100Environment.from_case(cases_root, "t007"),
+        inquiry_contract_version=1,
+        mechanism_formalizer=formalizer,
+        verification_planner=EmptyPlanner(),
+        evidence_registry=rca100_evidence_registry,
+    )
+    bootstrap = runner.start()
+    runner.handle(CallToolAction(
+        tool_name="get_service_trace_summary",
+        request=GetServiceTraceSummaryRequest(
+            entity_ref=bootstrap.alert_entity.entity_ref,
+            window=bootstrap.observation_horizon,
+            min_duration_ms=100,
+            max_traces=2,
+        ),
+    ))
+    runner.record_inquiry_round({
+        "round": 1,
+        "draft": {
+            "hypotheses": [{
+                "hypothesis_id": "h1",
+                "mechanism": "inventory thread pool exhaustion",
+                "alternative": "slow downstream service",
+            }],
+            "needs": [{
+                "need_id": "n1",
+                "hypothesis_id": "h1",
+                "question": "Did inventory threads saturate?",
+                "expected_if_true": "thread demand rises",
+                "expected_if_alternative": "downstream time rises",
+            }],
+            "choices": [{"need_id": "n1", "query_ref": "aq-unused"}],
+        },
+    })
+    runner.handle(SubmitHypothesisAction(proposal=HypothesisProposal(
+        hypothesis_id="h-runtime-discovery",
+        candidate_id="runtimeUnknown",
+        mechanism="unexplained operation latency",
+        causal_entity_ref=bootstrap.alert_entity.entity_ref,
+        rationale="Formalize the retained Inquiry candidate.",
+    )))
+    result = runner.discover_candidates()
+    assert result["status"] != "completed"
+    answer = runner.handle(RequestStopAction(summary="worker formalizer failure"))
+    assert answer is not None
+    assert RecordedReplay.verify(runner.transcript.events).valid
