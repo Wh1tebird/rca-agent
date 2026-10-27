@@ -179,6 +179,17 @@ def test_candidate_scoped_evidence_does_not_leak_between_proposals():
     assert connection_gap.issued_observation_refs == ("obs-0000000000000001",)
 
 
+def test_core_rejects_observations_from_another_episode_after_binding():
+    provider = CoreDecisionProvider()
+    provider.bind_episode("ep-" + "a" * 32)
+    proposal = _proposal("slowSQL")
+    record = _record("obs-0000000000000001", "sql_duration_share", 0.8)
+    foreign = IssuedObservation(record.observation, record.query_ref, True, "ep-" + "b" * 32)
+    decision = provider.decide((proposal,), (foreign,), StopReason.POLICY_REQUEST)
+    assert decision.status == DecisionStatus.OUT_OF_SCOPE
+    assert decision.winning_hypothesis_id is None
+
+
 def test_episode_runner_uses_issued_observation_ledger_for_core_decision():
     now = datetime.now(UTC)
 

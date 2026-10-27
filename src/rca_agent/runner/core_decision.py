@@ -72,6 +72,7 @@ class IssuedObservation:
     observation: Observation
     query_ref: str
     complete: bool = True
+    episode_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,12 @@ class CoreDecisionProvider:
     def __init__(self, excluded_catalog_candidate_ids: frozenset[str] = frozenset()) -> None:
         self._dynamic: dict[str, CompiledCandidate] = {}
         self._excluded_catalog_candidate_ids = frozenset(excluded_catalog_candidate_ids)
+        self._episode_id: str | None = None
+
+    def bind_episode(self, episode_id: str) -> None:
+        if self._episode_id is not None and self._episode_id != episode_id:
+            raise ValueError("CoreDecisionProvider cannot be rebound to another episode")
+        self._episode_id = episode_id
 
     @property
     def excluded_catalog_candidate_ids(self) -> frozenset[str]:
@@ -134,6 +141,7 @@ class CoreDecisionProvider:
     def verification_reports(self, proposals, observations) -> dict[str, DynamicVerification]:
         evaluation = _evaluate(
             proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+            episode_id=self._episode_id,
         )
         return evaluation.dynamic_verifications if evaluation else {}
 
@@ -150,6 +158,7 @@ class CoreDecisionProvider:
             return CoreAssessmentPreview(overall_decision=overall)
         evaluation = _evaluate(
             proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+            episode_id=self._episode_id,
         )
         if evaluation is None:
             return CoreAssessmentPreview(overall_decision=overall)
@@ -186,6 +195,7 @@ class CoreDecisionProvider:
 
         evaluation = _evaluate(
             proposals, observations, self._dynamic, self._excluded_catalog_candidate_ids,
+            episode_id=self._episode_id,
         )
         if evaluation is None:
             _, _, unresolved = _resolve_candidates(
@@ -273,7 +283,12 @@ def _evaluate(
     observations: tuple[IssuedObservation, ...],
     dynamic: dict[str, CompiledCandidate] | None = None,
     excluded_catalog_candidate_ids: frozenset[str] = frozenset(),
+    episode_id: str | None = None,
 ) -> _CoreEvaluation | None:
+    if episode_id is not None and any(
+        record.episode_id != episode_id for record in observations if record.episode_id is not None
+    ):
+        return None
     dynamic = dynamic or {}
     candidates, proposal_groups, unresolved = _resolve_candidates(
         proposals, dynamic, excluded_catalog_candidate_ids,

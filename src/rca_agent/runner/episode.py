@@ -232,6 +232,8 @@ class EpisodeRunner:
         self.__decision_provider = (deepcopy(decision_provider)
                                    if isinstance(decision_provider, CoreDecisionProvider)
                                    else decision_provider or CoreDecisionProvider())
+        if isinstance(self.__decision_provider, CoreDecisionProvider):
+            self.__decision_provider.bind_episode(self.episode_id)
         self.__discovery = discovery
         self.__mechanism_formalizer = mechanism_formalizer
         self.__discovery_format_formalizer = discovery_format_formalizer
@@ -3340,7 +3342,9 @@ class EpisodeRunner:
         if any(
             item.observation_id in self.__observation_ledger
             and self.__observation_ledger[item.observation_id] != IssuedObservation(
-                item, response.query_ref, not response.truncated and response.status == ToolStatus.SUCCESS
+                item, response.query_ref,
+                not response.truncated and response.status == ToolStatus.SUCCESS,
+                self.episode_id,
             )
             for item in response.observations
         ):
@@ -3354,6 +3358,7 @@ class EpisodeRunner:
                 item.observation_id: IssuedObservation(
                     item, response.query_ref,
                     not response.truncated and response.status == ToolStatus.SUCCESS,
+                    self.episode_id,
                 )
                 for item in response.observations
             }

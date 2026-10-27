@@ -1131,6 +1131,7 @@ class RecordedReplay:
                     record = IssuedObservation(
                         observation, pending_response.query_ref,
                         not pending_response.truncated and pending_response.status.value == "success",
+                        episode_id,
                     )
                     # Changed issued facts are rejected by the live runner, not admitted here.
                     observations.setdefault(observation.observation_id, record)
