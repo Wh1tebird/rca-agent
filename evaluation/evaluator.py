@@ -7,9 +7,10 @@ from typing import Any
 from pydantic import TypeAdapter
 
 from evaluation.ground_truth import FlatGroundTruthRepository
-from evaluation.models import EvaluationArtifact
+from evaluation.models import EvaluationArtifact, EvaluationOutcome
+from evaluation.report import build_evaluation_report
 from rca_agent.models import EpisodeStatus
-from rca_agent.runner import EpisodeRunner, EpisodeStateError
+from rca_agent.runner import EpisodeRunner, EpisodeStateError, RecordedReplay
 from rca_agent.tools.fingerprint import sha256_digest
 
 
@@ -33,8 +34,28 @@ class EvaluatorHost:
             raise EpisodeStateError("evaluation data cannot be loaded before answer freeze")
         if not runner.answer.verify_digest():
             raise EpisodeStateError("frozen answer artifact failed digest validation")
-        runner.begin_evaluation()
         record = FlatGroundTruthRepository(self.__evaluator_data_root).load(case_selector)
+        replay = RecordedReplay.verify(runner.transcript.events)
+        outcome = EvaluationOutcome.INCONCLUSIVE
+        outcome_detail = "answer_not_verified"
+        if runner.answer.authoritative_decision.status.value in {
+            "supported_hypothesis", "discovered_verified", "confirmed_root_cause",
+        }:
+            matched = any(
+                proposal.candidate_id == record.expected_fault_id
+                for proposal in runner.answer.policy_proposals
+            )
+            outcome = EvaluationOutcome.CORRECT if matched else EvaluationOutcome.INCORRECT
+            outcome_detail = "candidate_id_match" if matched else "candidate_id_mismatch"
+        report = build_evaluation_report(
+            runner,
+            replay,
+            evaluator_version=self.__evaluator_version,
+            evaluator_record_digest=sha256_digest(record.model_dump(mode="json")),
+            outcome=outcome,
+            outcome_detail=outcome_detail,
+        )
+        runner.begin_evaluation()
         evaluated_at = datetime.now(UTC)
         fields = {
             "episode_id": runner.episode_id,
@@ -43,6 +64,7 @@ class EvaluatorHost:
             "evaluated_at": evaluated_at,
             "evaluation_status": "post_freeze_record_loaded",
             "evaluator_record_digest": sha256_digest(record.model_dump(mode="json")),
+            "report": report,
         }
         artifact = EvaluationArtifact(
             **fields,
