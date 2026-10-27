@@ -3278,6 +3278,13 @@ class EpisodeRunner:
     def _call_tool(self, action: CallToolAction) -> ToolResponse | AnswerArtifact:
         source = self._admit_tool_action(action)
         query_ref = query_fingerprint(action.tool_name, action.request)
+        evidence_query = evidence_query_from_action(action)
+        capability = next((item for item in self.__evidence_provider.capabilities()
+                           if item.operation == evidence_query.operation), None)
+        scope_digest = sha256_digest({
+            "entity_ref": evidence_query.entity_ref,
+            "trace_ref": evidence_query.trace_ref,
+        })
         self.transcript.append(
             EventType.TOOL_REQUEST,
             {
@@ -3285,13 +3292,20 @@ class EpisodeRunner:
                 "request": action.request.model_dump(mode="json"),
                 "query_ref": query_ref,
                 "budget_before": self.__budget_remaining,
+                "evidence_capability": capability.capability_ref if capability else None,
+                "evidence_provider": getattr(self.__evidence_provider, "provider_name", "unknown"),
+                "evidence_scope_digest": scope_digest,
+                "evidence_time_range": (
+                    evidence_query.window.model_dump(mode="json")
+                    if evidence_query.window is not None else None
+                ),
+                "evidence_cost_units": capability.cost_units if capability else evidence_query.cost_units,
                 **({"execution_source": source} if source is not None else {}),
             },
         )
         if source == "startup":
             self.__startup_selection = None
         try:
-            evidence_query = evidence_query_from_action(action)
             evidence_result = self.__evidence_provider.execute(
                 evidence_query, budget_remaining=self.__budget_remaining
             )

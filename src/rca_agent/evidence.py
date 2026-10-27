@@ -179,6 +179,10 @@ class EvidenceCapability(BaseModel):
     max_window_seconds: int = Field(default=86_400, ge=1)
     max_results: int = Field(default=100, ge=1, le=100)
     cost_units: int = Field(default=1, ge=0, le=10)
+    required_permission: str | None = Field(default=None, max_length=120)
+    supported_query_fields: tuple[str, ...] = ()
+    output_schema: str = "Observation-v1"
+    entity_scope: Literal["episode_issued", "opaque_reference"] = "episode_issued"
     available: bool = True
     unavailable_reason: str | None = None
 
@@ -202,6 +206,8 @@ class EvidenceResult(BaseModel):
 
 
 class EvidenceProvider(Protocol):
+    provider_name: str
+
     def capabilities(self) -> tuple[EvidenceCapability, ...]: ...
 
     def execute(self, query: EvidenceQuery, *, budget_remaining: int) -> EvidenceResult: ...
@@ -210,8 +216,10 @@ class EvidenceProvider(Protocol):
 class EnvironmentEvidenceProvider:
     """Compatibility adapter over the existing typed RcaEnvironment API."""
 
-    def __init__(self, environment: Any) -> None:
+    def __init__(self, environment: Any, *, granted_permissions: frozenset[str] = frozenset()) -> None:
         self._environment = environment
+        self.provider_name = "environment"
+        self._granted_permissions = granted_permissions
 
     def capabilities(self) -> tuple[EvidenceCapability, ...]:
         return tuple(_capability(operation, modality) for operation, modality in (
@@ -226,6 +234,14 @@ class EnvironmentEvidenceProvider:
 
     def execute(self, query: EvidenceQuery, *, budget_remaining: int) -> EvidenceResult:
         capability = next(item for item in self.capabilities() if item.operation == query.operation)
+        window_seconds = query.window.seconds if query.window is not None else 0
+        if query.limit > capability.max_results or window_seconds > capability.max_window_seconds:
+            return _empty_result(query, ToolStatus.REJECTED, budget_remaining, 0,
+                                 "evidence query exceeds capability bounds")
+        if (capability.required_permission is not None
+                and capability.required_permission not in self._granted_permissions):
+            return _empty_result(query, ToolStatus.REJECTED, budget_remaining, 0,
+                                 "evidence permission is unavailable")
         if not capability.available or budget_remaining < capability.cost_units:
             return _empty_result(query, ToolStatus.BUDGET_EXHAUSTED if budget_remaining < capability.cost_units
                                  else ToolStatus.CAPABILITY_UNAVAILABLE,
@@ -247,9 +263,17 @@ class EnvironmentEvidenceProvider:
 class FixtureEvidenceProvider:
     """Deterministic provider for offline contract tests and local development."""
 
-    def __init__(self, capability: EvidenceCapability, observations: Iterable[Observation] = ()) -> None:
+    def __init__(
+        self,
+        capability: EvidenceCapability,
+        observations: Iterable[Observation] = (),
+        *,
+        granted_permissions: frozenset[str] = frozenset(),
+    ) -> None:
         self._capability = capability
         self._observations = tuple(observations)
+        self.provider_name = "deterministic_fixture"
+        self._granted_permissions = granted_permissions
 
     def capabilities(self) -> tuple[EvidenceCapability, ...]:
         return (self._capability,)
@@ -258,6 +282,14 @@ class FixtureEvidenceProvider:
         if query.operation != self._capability.operation or query.modality != self._capability.modality:
             return _empty_result(query, ToolStatus.CAPABILITY_UNAVAILABLE, budget_remaining, 0,
                                  "provider capability does not match query")
+        if (self._capability.required_permission is not None
+                and self._capability.required_permission not in self._granted_permissions):
+            return _empty_result(query, ToolStatus.REJECTED, budget_remaining, 0,
+                                 "evidence permission is unavailable")
+        window_seconds = query.window.seconds if query.window is not None else 0
+        if query.limit > self._capability.max_results or window_seconds > self._capability.max_window_seconds:
+            return _empty_result(query, ToolStatus.REJECTED, budget_remaining, 0,
+                                 "evidence query exceeds capability bounds")
         if budget_remaining < self._capability.cost_units:
             return _empty_result(query, ToolStatus.BUDGET_EXHAUSTED, budget_remaining, 0,
                                  "query budget exhausted")
@@ -304,6 +336,7 @@ class UnavailableEvidenceProvider:
 
     def __init__(self, operation: Literal["cmdb", "database"]) -> None:
         self._capability = _capability(operation, _OPERATION_MODALITY[operation])
+        self.provider_name = "unavailable_stub"
 
     def capabilities(self) -> tuple[EvidenceCapability, ...]:
         return (self._capability,)
@@ -318,6 +351,7 @@ class UnavailableEvidenceProvider:
 class CompositeEvidenceProvider:
     def __init__(self, providers: Iterable[EvidenceProvider]) -> None:
         self._providers = tuple(providers)
+        self.provider_name = "composite"
 
     def capabilities(self) -> tuple[EvidenceCapability, ...]:
         return tuple(capability for provider in self._providers for capability in provider.capabilities())

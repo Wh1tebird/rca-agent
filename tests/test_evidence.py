@@ -5,7 +5,9 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from rca_agent.environment.rca100 import Rca100Environment
 from rca_agent.evidence import (
+    EvidenceCapability,
     EvidenceQuery,
     EvidenceResult,
     LogEvidenceProvider,
@@ -15,13 +17,17 @@ from rca_agent.evidence import (
     UnavailableEvidenceProvider,
 )
 from rca_agent.models import (
+    CallToolAction,
     DataStatus,
+    GetMetricSeriesRequest,
     Modality,
     Observation,
     QueryCost,
     TimeWindow,
+    ToolName,
     ToolStatus,
 )
+from rca_agent.runner import EpisodeRunner
 
 WINDOW = TimeWindow(
     start=datetime(2026, 1, 1, tzinfo=UTC),
@@ -133,3 +139,49 @@ def test_cmdb_and_database_are_explicit_unavailable_extensions() -> None:
     result = provider.execute(query, budget_remaining=3)
     assert result.status is ToolStatus.CAPABILITY_UNAVAILABLE
     assert result.observations == ()
+
+
+def test_capability_permission_and_bounds_are_host_enforced() -> None:
+    capability = EvidenceCapability(
+        capability_ref="evcap-" + "d" * 16,
+        modality=Modality.METRIC,
+        operation="metric_series",
+        max_results=1,
+        required_permission="metrics.read",
+    )
+    query = EvidenceQuery(
+        operation="metric_series", modality=Modality.METRIC,
+        entity_ref="ent-service", signal="request_count", window=WINDOW, limit=2,
+    )
+    denied = MetricEvidenceProvider([observation(Modality.METRIC)])
+    denied._capability = capability  # deterministic host fixture setup
+    assert denied.execute(query, budget_remaining=2).status is ToolStatus.REJECTED
+    allowed = type(denied)([observation(Modality.METRIC)])
+    allowed._capability = capability
+    allowed._granted_permissions = frozenset({"metrics.read"})
+    assert allowed.execute(query, budget_remaining=2).status is ToolStatus.REJECTED
+    bounded = query.model_copy(update={"limit": 1})
+    assert allowed.execute(bounded, budget_remaining=2).status is ToolStatus.SUCCESS
+
+
+def test_runner_records_host_owned_capability_metadata(cases_root) -> None:
+    runner = EpisodeRunner(Rca100Environment.from_case(cases_root, "t025"))
+    bootstrap = runner.start()
+    action = CallToolAction(
+        tool_name=ToolName.GET_METRIC_SERIES,
+        request=GetMetricSeriesRequest(
+            entity_ref=bootstrap.alert_entity.entity_ref,
+            signal="request_count",
+            window=bootstrap.observation_horizon,
+            max_points=1,
+        ),
+    )
+    runner.handle(action)
+    request = next(event for event in runner.transcript.events
+                   if event.event_type.value == "tool_request")
+    assert request.payload["evidence_capability"].startswith("evcap-")
+    assert request.payload["evidence_provider"] == "environment"
+    assert len(request.payload["evidence_scope_digest"]) == 64
+    assert bootstrap.alert_entity.entity_ref not in request.payload["evidence_scope_digest"]
+    assert request.payload["evidence_time_range"] is not None
+    assert request.payload["evidence_cost_units"] == 1
