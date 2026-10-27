@@ -24,6 +24,11 @@ from rca_agent.core.dynamic import (
     repair_mechanical_contract,
 )
 from rca_agent.environment.contract import RcaEnvironment
+from rca_agent.evidence import (
+    EnvironmentEvidenceProvider,
+    EvidenceProvider,
+    evidence_query_from_action,
+)
 from rca_agent.investigation import (
     AttemptOutcome,
     CandidateDisposition,
@@ -178,6 +183,7 @@ class EpisodeRunner:
         discovery_timeout_seconds: float = 30,
         investigation_workspace_mode: Literal["off", "shadow", "active"] = "shadow",
         mechanism_coverage_mode: Literal["off", "shadow"] = "off",
+        evidence_provider: EvidenceProvider | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
@@ -220,6 +226,7 @@ class EpisodeRunner:
         self.transcript = Transcript(self.episode_id, store)
         self.status = EpisodeStatus.CREATED
         self.__environment = environment
+        self.__evidence_provider = evidence_provider or EnvironmentEvidenceProvider(environment)
         self.__max_rounds = max_rounds
         self.__rounds = 0
         self.__decision_provider = (deepcopy(decision_provider)
@@ -3283,9 +3290,20 @@ class EpisodeRunner:
         )
         if source == "startup":
             self.__startup_selection = None
-        tool = getattr(self.__environment, action.tool_name.value)
         try:
-            response: ToolResponse = tool(action.request)
+            evidence_query = evidence_query_from_action(action)
+            evidence_result = self.__evidence_provider.execute(
+                evidence_query, budget_remaining=self.__budget_remaining
+            )
+            response = ToolResponse(
+                tool_name=action.tool_name.value,
+                query_ref=evidence_result.query_ref,
+                status=evidence_result.status,
+                observations=evidence_result.observations,
+                cost=evidence_result.cost,
+                message=evidence_result.message,
+                truncated=evidence_result.truncated,
+            )
         except Exception as exc:  # noqa: BLE001 - exception type only crosses the transcript
             self.transcript.append(
                 EventType.TOOL_EXCEPTION,
