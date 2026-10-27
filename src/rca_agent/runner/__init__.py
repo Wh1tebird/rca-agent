@@ -16,7 +16,7 @@ from rca_agent.runner.policy_process import (
     ScriptedPolicySpec,
 )
 from rca_agent.runner.replay import RecordedReplay, ReplayReport, ReplayValidationError
-from rca_agent.runner.transcript import EventType, Transcript, TranscriptEvent
+from rca_agent.runner.transcript import EventRecord, EventType, Transcript, TranscriptEvent
 
 __all__ = [
     "ActionRejectedError",
@@ -24,6 +24,7 @@ __all__ = [
     "CoreDecisionProvider",
     "EpisodeRunner",
     "EpisodeStateError",
+    "EventRecord",
     "EventType",
     "IssuedObservation",
     "PolicyProcessReport",

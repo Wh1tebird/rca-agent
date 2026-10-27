@@ -18,6 +18,7 @@ from rca_agent.models import (
     EpisodeStatus,
     HypothesisProposal,
     ResetResponse,
+    StopReason,
     ToolResponse,
 )
 from rca_agent.runner.inquiry_outcomes import inquiry_outcomes
@@ -43,6 +44,11 @@ class ReplayReport(BaseModel):
     final_status: EpisodeStatus
     head_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     tool_calls: int = Field(ge=0)
+    stop_reason: StopReason | None = None
+    budget_remaining: int | None = Field(default=None, ge=0)
+    candidate_assessment_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    workspace_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    answer_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class RecordedReplay:
@@ -88,6 +94,7 @@ class RecordedReplay:
         handoff_initial = None
         handoff_validation = None
         handoff_expected_drafts = None
+        frozen_answer: AnswerArtifact | None = None
         handoff_generated = []
         bound_records = {}
         frozen_mechanisms = {}
@@ -1264,6 +1271,7 @@ class RecordedReplay:
                         "coverage shadow mode froze an answer without a coverage record"
                     )
                 answer = AnswerArtifact.model_validate(event.payload)
+                frozen_answer = answer
                 if not answer.verify_digest():
                     raise ReplayValidationError("answer artifact digest is invalid")
                 if answer.transcript_digest != event.previous_digest:
@@ -1380,6 +1388,14 @@ class RecordedReplay:
             raise ReplayValidationError("transcript ends with incomplete discovery")
         if status is None:
             raise ReplayValidationError("transcript has no lifecycle state")
+        candidate_assessment_digest = None
+        if frozen_answer is not None:
+            preview = provider.preview(
+                tuple(proposals.values()), tuple(observations.values())
+            )
+            candidate_assessment_digest = sha256_digest(
+                [item.model_dump(mode="json") for item in preview.candidate_assessments]
+            )
         return ReplayReport(
             valid=True,
             episode_id=episode_id,
@@ -1387,4 +1403,13 @@ class RecordedReplay:
             final_status=status,
             head_digest=events[-1].digest,
             tool_calls=tool_calls,
+            stop_reason=(frozen_answer.termination_reason if frozen_answer is not None else None),
+            budget_remaining=budget_remaining,
+            candidate_assessment_digest=candidate_assessment_digest,
+            workspace_digest=(
+                frozen_answer.investigation_workspace.snapshot_digest
+                if frozen_answer is not None and frozen_answer.investigation_workspace is not None
+                else None
+            ),
+            answer_digest=(frozen_answer.artifact_digest if frozen_answer is not None else None),
         )

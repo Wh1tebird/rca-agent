@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from rca_agent.tools.fingerprint import sha256_digest
 
 GENESIS_DIGEST = "0" * 64
+EVENT_SCHEMA_VERSION = 1
 
 
 class EventType(StrEnum):
@@ -97,11 +98,53 @@ class TranscriptEvent(BaseModel):
     previous_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     digest: str = Field(pattern=r"^[a-f0-9]{64}$")
 
+    @property
+    def event_id(self) -> str:
+        """Stable identity derived from the signed event position and digest."""
+        return sha256_digest({
+            "episode_id": self.episode_id,
+            "sequence": self.sequence,
+            "digest": self.digest,
+        })
+
+    @property
+    def schema_version(self) -> int:
+        return EVENT_SCHEMA_VERSION
+
+    @property
+    def provenance(self) -> str:
+        return "episode_runner"
+
+    def as_event_record(self) -> EventRecord:
+        return EventRecord(
+            event_id=self.event_id,
+            episode_id=self.episode_id,
+            sequence=self.sequence,
+            event_type=self.event_type,
+            payload=self.payload,
+            schema_version=self.schema_version,
+            provenance=self.provenance,
+        )
+
     def digest_payload(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude={"digest"})
 
     def verify_digest(self) -> bool:
         return sha256_digest(self.digest_payload()) == self.digest
+
+
+class EventRecord(BaseModel):
+    """Typed, projection-facing event envelope without changing JSONL format."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    episode_id: str = Field(pattern=r"^ep-[a-f0-9]{32}$")
+    sequence: int = Field(ge=1)
+    event_type: EventType
+    payload: dict[str, Any]
+    schema_version: int = Field(default=EVENT_SCHEMA_VERSION, ge=1)
+    provenance: str = Field(default="episode_runner", min_length=1, max_length=80)
 
 
 class JsonlTranscriptStore:

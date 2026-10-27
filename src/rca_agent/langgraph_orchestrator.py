@@ -28,6 +28,7 @@ from rca_agent.models import (
     UpdateCandidateEvidenceAction,
 )
 from rca_agent.runner import EpisodeRunner
+from rca_agent.tools.fingerprint import sha256_digest
 
 
 class InvestigationGraphState(TypedDict, total=False):
@@ -40,6 +41,20 @@ class InvestigationGraphState(TypedDict, total=False):
     discovery_requested: bool
     deferred_stop: bool
     feedback_attempted: bool
+    routing_projection: RoutingProjection
+
+
+class RoutingProjection(BaseModel):
+    """Non-authoritative graph cache derived from the EpisodeRunner."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: str
+    needs_continue: bool
+    next_action_ref: str | None = None
+    candidate_frontier: CandidateFrontier
+    stop_signal: str | None = None
+    core_assessment: CoreAssessmentPreview
 
 
 class LangGraphRunReport(BaseModel):
@@ -51,6 +66,7 @@ class LangGraphRunReport(BaseModel):
     final_preview: CoreAssessmentPreview
     final_frontier: CandidateFrontier
     final_workspace: InvestigationWorkspaceSnapshot
+    routing_projection: RoutingProjection | None = None
 
 
 class LangGraphInvestigation:
@@ -106,6 +122,15 @@ class LangGraphInvestigation:
         answer = state.get("answer")
         if answer is None:
             raise RuntimeError("LangGraph completed without a frozen answer")
+        projection = state.get("routing_projection")
+        if answer is not None:
+            projection = RoutingProjection(
+                stage=self._runner.status.value,
+                needs_continue=False,
+                candidate_frontier=state.get("candidate_frontier", initial_frontier),
+                core_assessment=state.get("core_assessment", initial_preview),
+                stop_signal=self._runner.status.value,
+            )
         return LangGraphRunReport(
             answer=answer,
             graph_steps=self._graph_steps,
@@ -116,6 +141,7 @@ class LangGraphInvestigation:
                 answer.investigation_workspace
                 or state.get("investigation_workspace", initial_workspace)
             ),
+            routing_projection=projection,
         )
 
     def _build_graph(self):
@@ -203,8 +229,18 @@ class LangGraphInvestigation:
                 type(exc).__name__,
             )
             return {"answer": answer}
-        return {"action": action, "discovery_requested": isinstance(action, RequestStopAction)
-                and self._runner.should_discover(stopping=True)}
+        return {
+            "action": action,
+            "discovery_requested": isinstance(action, RequestStopAction)
+            and self._runner.should_discover(stopping=True),
+            "routing_projection": RoutingProjection(
+                stage=self._runner.status.value,
+                needs_continue=self._runner.status == EpisodeStatus.ACTIVE,
+                next_action_ref="action-" + sha256_digest(action.model_dump(mode="json"))[:20],
+                candidate_frontier=state["candidate_frontier"],
+                core_assessment=state["core_assessment"],
+            ),
+        }
 
     def _discovery_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         self._graph_steps += 1
@@ -312,6 +348,14 @@ class LangGraphInvestigation:
             "core_assessment": preview,
             "candidate_frontier": _candidate_frontier(preview, self._candidate_options),
             "investigation_workspace": self._runner.investigation_workspace_snapshot,
+            "routing_projection": RoutingProjection(
+                stage=self._runner.status.value,
+                needs_continue=self._runner.status == EpisodeStatus.ACTIVE,
+                candidate_frontier=_candidate_frontier(preview, self._candidate_options),
+                core_assessment=preview,
+                stop_signal=(None if self._runner.status == EpisodeStatus.ACTIVE
+                             else self._runner.status.value),
+            ),
         }
 
     def _finalize_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
