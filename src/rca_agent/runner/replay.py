@@ -47,6 +47,7 @@ class ReplayReport(BaseModel):
     stop_reason: StopReason | None = None
     budget_remaining: int | None = Field(default=None, ge=0)
     candidate_assessment_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    candidate_frontier_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     workspace_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     answer_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
@@ -1406,6 +1407,7 @@ class RecordedReplay:
             stop_reason=(frozen_answer.termination_reason if frozen_answer is not None else None),
             budget_remaining=budget_remaining,
             candidate_assessment_digest=candidate_assessment_digest,
+            candidate_frontier_digest=candidate_assessment_digest,
             workspace_digest=(
                 frozen_answer.investigation_workspace.snapshot_digest
                 if frozen_answer is not None and frozen_answer.investigation_workspace is not None

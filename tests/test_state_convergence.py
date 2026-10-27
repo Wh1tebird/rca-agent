@@ -51,6 +51,7 @@ def test_replay_reconstructs_stop_budget_frontier_and_answer_digest(cases_root: 
     assert report.answer_digest == answer.artifact_digest
     assert report.budget_remaining == 1
     assert report.candidate_assessment_digest is not None
+    assert report.candidate_frontier_digest == report.candidate_assessment_digest
     assert report.head_digest == runner.transcript.head_digest
 
 
