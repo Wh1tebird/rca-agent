@@ -1,6 +1,23 @@
 # RCA Agent handoff
 
-## P1-1 stopped at execution-boundary blocker — 2026-10-26
+## Current handoff — RCA Agent 1.0 documentation hardening — 2026-10-28
+
+P1-1 through P2-5 are complete and pushed at `721a28221e76801bd07077b6495d097b7f6de2e5`.
+The documentation/comment hardening pass is complete without runtime, public API, event schema,
+Replay digest, EvaluationReport, timeout, cancel, Recovery or Answer Freeze changes. The canonical
+architecture is the stable host-owned layer (`EpisodeRunner`, `EvidenceProvider`,
+`CoreDecisionProvider`, `Transcript`, `Replay`, `EpisodeRecovery`, `AuditRecord` and `Answer Freeze`)
+plus the replaceable `ReasoningAdapter`/legacy compatibility layer. See
+`docs/architecture/overview.md` and `docs/architecture/glossary.md`.
+
+Future work is limited to final acceptance and documentation maintenance. Do not start another
+structural phase. Cross-process restart still requires the host to reconstruct live Environment and
+adapter dependencies for a `RETRYABLE` operation; it is not automatic recovery. Real provider
+smoke tests remain outside the offline deterministic test boundary.
+
+## Historical P1-1 stopped at execution-boundary blocker — 2026-10-26
+
+This section predates the delivered worker protocol and is retained as historical audit context.
 
 Status: **未完成；按本次任务 E 条停止编码，试验 runtime/test 改动已撤回**. The original
 daemon-thread timeout defect remains. Do not interpret earlier passing tests or progress messages

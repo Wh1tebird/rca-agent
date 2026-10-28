@@ -186,6 +186,8 @@ class JsonlTranscriptStore:
 
 
 class Transcript:
+    """Append-only hash-chained event source owned by EpisodeRunner."""
+
     def __init__(
         self,
         episode_id: str,
@@ -204,6 +206,8 @@ class Transcript:
         return self.__events[-1].digest if self.__events else GENESIS_DIGEST
 
     def append(self, event_type: EventType, payload: BaseModel | dict[str, Any]) -> TranscriptEvent:
+        # The sequence and previous digest are assigned here, never by a
+        # model-facing adapter. This keeps provenance and Replay deterministic.
         raw = payload.model_dump(mode="json") if isinstance(payload, BaseModel) else payload
         normalized = json.loads(json.dumps(raw, ensure_ascii=False, sort_keys=True))
         base = {

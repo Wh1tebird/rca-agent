@@ -206,6 +206,13 @@ class EvidenceResult(BaseModel):
 
 
 class EvidenceProvider(Protocol):
+    """Host capability adapter returning neutral Observation values only.
+
+    Implementations do not receive a Candidate and cannot decide support,
+    contradiction, winner or root cause. EpisodeRunner performs admission and
+    records the result before CoreDecisionProvider evaluates it.
+    """
+
     provider_name: str
 
     def capabilities(self) -> tuple[EvidenceCapability, ...]: ...

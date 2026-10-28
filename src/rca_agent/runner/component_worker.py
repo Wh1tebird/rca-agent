@@ -272,6 +272,8 @@ class ComponentWorkerHost:
             self.state = WorkerLifecycle.FAILED
             raise WorkerProtocolVersionError("worker protocol version mismatch")
         self._child_directory = tempfile.TemporaryDirectory(prefix="rca-component-")
+        # Readiness has its own deadline. A child that misses it is terminated
+        # before any request can reach the parent-side admission boundary.
         try:
             self._process = subprocess.Popen(
                 [sys.executable, "-I", "-m", "rca_agent.runner.component_worker"],
@@ -326,6 +328,9 @@ class ComponentWorkerHost:
             raise RuntimeError(f"worker is not ready: {self.state}")
         _ensure_json_object(payload)
         self.state = WorkerLifecycle.REQUESTED
+        # The parent accepts a response only for this request id and protocol
+        # version. Timeout, EOF or malformed frames close the child before a
+        # late response can become Runtime state.
         try:
             self._send(_message("request", request_id=request_id, payload=payload))
             response = self._read(self.request_timeout_seconds)
@@ -361,6 +366,8 @@ class ComponentWorkerHost:
             raise
 
     def cancel(self, *, request_id: str = "request-1") -> None:
+        # Cancellation is a lifecycle transition, not a worker result. The
+        # child is still reaped even when its acknowledgement is unavailable.
         self._record_metric(OperationalMetricName.CANCELLATION)
         if self._process is None or self._process.poll() is not None:
             self.state = WorkerLifecycle.CANCELLED

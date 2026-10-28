@@ -101,6 +101,8 @@ class RoutingProjection(BaseModel):
 
     It carries references and previews only.  It contains no Workspace ledger,
     budget, permission, Answer, or decision authority owned by the graph.
+    The graph must return every proposal to the Runner for validation and
+    execution; this projection is never a second source of control facts.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

@@ -75,6 +75,8 @@ class ReasoningResponse(BaseModel):
 
 
 class ReasoningAdapter(Protocol):
+    """Replaceable model-facing proposal interface without Runtime authority."""
+
     def invoke(self, request: ReasoningRequest) -> ReasoningResponse: ...
 
 

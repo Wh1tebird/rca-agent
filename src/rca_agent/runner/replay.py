@@ -1,3 +1,9 @@
+"""Offline Replay of the authoritative Transcript and frozen projections.
+
+Replay validates recorded facts and digest bindings without invoking a model,
+EvidenceProvider, Environment, evaluator loader or external service.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -53,7 +59,7 @@ class ReplayReport(BaseModel):
 
 
 class RecordedReplay:
-    """Offline transcript verification. It never opens RCA100 or evaluation data."""
+    """Verify recorded facts without creating a second Runtime authority."""
 
     @classmethod
     def from_path(cls, path: Path) -> ReplayReport:
@@ -61,6 +67,9 @@ class RecordedReplay:
 
     @classmethod
     def verify(cls, events: tuple[TranscriptEvent, ...] | list[TranscriptEvent]) -> ReplayReport:
+        # Reconstruct only from event payloads and frozen artifacts. Re-running
+        # a provider or adapter here would make Replay nondeterministic and
+        # could issue an unrecorded Observation.
         if not events:
             raise ReplayValidationError("transcript is empty")
         episode_id = events[0].episode_id

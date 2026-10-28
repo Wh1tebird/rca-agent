@@ -71,7 +71,12 @@ class RecoveryValidationError(ValueError):
 
 
 class EpisodeRecovery:
-    """Inspect a transcript or a fully populated EventRecord stream offline."""
+    """Inspect a transcript offline and return a bounded Recovery plan.
+
+    Recovery never guesses a missing fact or silently reconstructs live
+    dependencies. A `RETRYABLE` snapshot identifies pending work for the host
+    to rebuild explicitly; only a clean `RESUMABLE` Runner may continue.
+    """
 
     @classmethod
     def inspect(

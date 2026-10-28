@@ -66,7 +66,7 @@ class OperationalMetricsSnapshot(BaseModel):
 
 
 class OperationalMetrics:
-    """A small in-memory, thread-safe metrics sink owned by the host."""
+    """A host-owned diagnostic sink that cannot influence Runtime decisions."""
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -115,7 +115,11 @@ class OperationalMetrics:
 
 
 class AuditRecord(BaseModel):
-    """A redacted event projection safe for operational diagnostics."""
+    """A redacted event projection safe for operational diagnostics.
+
+    Only approved opaque references and digests cross this boundary; secrets,
+    raw paths, complete prompts and evaluator-only facts are ignored.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

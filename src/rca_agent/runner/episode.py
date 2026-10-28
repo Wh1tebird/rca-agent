@@ -1,3 +1,11 @@
+"""Host-owned Episode lifecycle, admission, projection and Answer Freeze.
+
+`EpisodeRunner` is deliberately the sole Runtime state writer. Model-facing
+adapters may propose work, but only this module can admit a Query, issue an
+Observation, append the authoritative Transcript event, request Handoff or
+freeze an Answer.
+"""
+
 from __future__ import annotations
 
 import re
@@ -163,6 +171,13 @@ class LifecycleDefaultDecisionProvider:
 
 
 class EpisodeRunner:
+    """Own one Episode's lifecycle and all authoritative state transitions.
+
+    Workspace, LangGraph and operational metrics are projections or diagnostics;
+    they cannot grant permissions, alter budget, override Core, or mutate a
+    frozen Answer. This invariant also makes late worker results harmless.
+    """
+
     def __init__(
         self,
         environment: RcaEnvironment,
@@ -2285,6 +2300,10 @@ class EpisodeRunner:
         return True, payload.model_dump(mode="json")
 
     def _invoke_discovery_component(self, invoke) -> tuple[bool, Any]:
+        # Legacy live adapters keep this compatibility wrapper until their
+        # caller is migrated. Worker-backed adapters use a killable child path
+        # in `_invoke_component_method`, so a timeout never leaves a daemon
+        # invocation that can write into the Episode.
         from queue import Empty, Queue
         from threading import Thread
 
@@ -3212,6 +3231,9 @@ class EpisodeRunner:
         missing = tuple(
             sorted({item for proposal in proposals for item in proposal.missing_evidence})
         )
+        # Core computes the decision from the admitted references at Freeze.
+        # Projections and model suggestions are read-only and cannot supply a
+        # replacement status or winner after this point.
         decision = self.__decision_provider.decide(
             proposals,
             tuple(self.__observation_ledger[item] for item in used_observations),
@@ -3338,6 +3360,9 @@ class EpisodeRunner:
         )
         if source == "startup":
             self.__startup_selection = None
+        # Provider execution is enclosed by the host admission boundary. Only
+        # the resulting typed response is appended; a late or foreign result
+        # cannot bypass this method to mutate Transcript or Observation state.
         try:
             evidence_result = self.__evidence_provider.execute(
                 evidence_query, budget_remaining=self.__budget_remaining

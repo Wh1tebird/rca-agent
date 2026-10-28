@@ -1,6 +1,37 @@
 # RCA Agent project context
 
-## P1-1 cancellation boundary assessment — 2026-10-26
+## RCA Agent 1.0 current baseline — 2026-10-28
+
+P1-1 through P2-5 are complete at commit `721a28221e76801bd07077b6495d097b7f6de2e5`, and
+`main` is synchronized with `origin/main`. This section is the canonical current architecture;
+the dated sections below are historical implementation notes and must not override it.
+
+The stable host-owned layer is `EpisodeRunner`, `EvidenceProvider`, `CoreDecisionProvider`,
+`Transcript`, `Replay`, `EpisodeRecovery`, `AuditRecord`, `OperationalMetrics` and `Answer Freeze`.
+`EpisodeRunner` owns admission, Capability checks, Query execution, Observation issuance,
+Candidate-scoped Evidence admission, Core decision, budget, stop, Handoff, projection writes and
+Answer Freeze. Workspace and LangGraph are projections or compatibility caches only.
+
+The replaceable model-facing layer is `ReasoningAdapter` plus the Inquiry, Discovery, Formalizer,
+Planner and LangGraph compatibility wrappers. These components can propose a Candidate, Query,
+Hypothesis, plan, next action, stop or Handoff, but cannot write Observation, Evidence, Transcript,
+Workspace, Answer, budget, permission or stop authority. Replay does not invoke them.
+
+Worker calls use JSON-only typed payloads and bounded framed messages. The parent remains the sole
+state writer; timeout, cancel, exception, crash and malformed frame lead to stream cleanup and
+terminate/kill/wait/reap. A late result cannot enter Transcript, Workspace, Observation or a frozen
+Answer. `EpisodeRecovery` returns `RESUMABLE`, `RETRYABLE`, `TERMINAL`, `FROZEN` or `CORRUPTED`.
+`RETRYABLE` is a host action plan for an explicit pending operation, not proof that recovery has
+already happened. Cross-process restart cannot currently reconstruct live Environment or adapters.
+
+Runtime never imports evaluator-only loaders. Evaluation loads Ground Truth/RCA100 and scoring data
+only after Answer artifact Freeze. Current tests use deterministic fixtures and offline stubs; no
+real provider smoke test is part of this baseline. RCA100, evaluator data, `rca-core` and frontend
+remain outside this runtime change boundary.
+
+## Historical P1-1 cancellation boundary assessment — 2026-10-26
+
+The following assessment predates the delivered worker protocol and is retained for audit history.
 
 P1-1 is **not implemented**. The existing Discovery and shared Formalizer/Planner calls still
 use daemon threads with a waiting deadline; expiry does not cancel the underlying invocation.

@@ -88,7 +88,13 @@ class _CoreEvaluation:
 
 
 class CoreDecisionProvider:
-    """Translate issued Agent facts into the internal evidence-controlled decision kernel."""
+    """Produce the only authoritative decision for an Episode.
+
+    Admission is Candidate-scoped: the provider evaluates only issued
+    Observation references explicitly attached to each Hypothesis. A preview
+    is routing information; `decide` at Answer Freeze is the authority for
+    status, winner, Abstention and stop semantics.
+    """
 
     def __init__(self, excluded_catalog_candidate_ids: frozenset[str] = frozenset()) -> None:
         self._dynamic: dict[str, CompiledCandidate] = {}
@@ -180,6 +186,8 @@ class CoreDecisionProvider:
         observations: tuple[IssuedObservation, ...],
         termination_reason: StopReason,
     ) -> AuthoritativeDecision:
+        # Model output supplies proposals only. Core-owned sufficiency,
+        # trust-state and Candidate isolation rules determine the decision.
         if termination_reason == StopReason.TOOL_FAILURE:
             return AuthoritativeDecision(
                 status=DecisionStatus.QUERY_FAILED,
