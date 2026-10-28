@@ -21,6 +21,8 @@ from typing import Any, BinaryIO
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from rca_agent.runner.operations import OperationalMetricName, OperationalMetrics
+
 PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024
 FAKE_FACTORY_ID = "test.fake"
@@ -237,6 +239,7 @@ class ComponentWorkerHost:
         request_timeout_seconds: float = 1.0,
         terminate_grace_seconds: float = 0.2,
         max_frame_size: int = DEFAULT_MAX_FRAME_SIZE,
+        metrics: OperationalMetrics | None = None,
     ) -> None:
         if ready_timeout_seconds <= 0 or request_timeout_seconds <= 0:
             raise ValueError("worker deadlines must be positive")
@@ -247,6 +250,7 @@ class ComponentWorkerHost:
         self.request_timeout_seconds = request_timeout_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
         self.max_frame_size = max_frame_size
+        self._metrics = metrics
         self.state = WorkerLifecycle.STARTING
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: FrameReader | None = None
@@ -297,8 +301,10 @@ class ComponentWorkerHost:
             if ready.get("message_type") != "ready":
                 raise WorkerProtocolError("worker did not send ready")
             self.state = WorkerLifecycle.READY
+            self._record_metric(OperationalMetricName.WORKER_READY)
         except WorkerTimeoutError:
             self.state = WorkerLifecycle.TIMED_OUT
+            self._record_metric(OperationalMetricName.WORKER_STARTUP_TIMEOUT)
             self._terminate_and_reap()
             raise
         except WorkerProtocolVersionError:
@@ -311,6 +317,7 @@ class ComponentWorkerHost:
             raise
         except (EOFError, BrokenPipeError) as exc:
             self.state = WorkerLifecycle.FAILED
+            self._record_metric(OperationalMetricName.WORKER_CRASH)
             self._terminate_and_reap()
             raise WorkerCrashedError("worker failed during startup") from exc
 
@@ -328,6 +335,7 @@ class ComponentWorkerHost:
             message_type = response.get("message_type")
             if message_type == "error":
                 self.state = WorkerLifecycle.FAILED
+                self._record_metric(OperationalMetricName.WORKER_EXCEPTION)
                 self._terminate_and_reap()
                 details = response.get("payload", {})
                 raise WorkerExecutionError(details.get("message", "worker error"), details=details)
@@ -337,18 +345,23 @@ class ComponentWorkerHost:
             return response["payload"]
         except WorkerTimeoutError:
             self.state = WorkerLifecycle.TIMED_OUT
+            self._record_metric(OperationalMetricName.WORKER_REQUEST_TIMEOUT)
+            self._record_metric(OperationalMetricName.LATE_RESULT_REJECTED)
             self._terminate_and_reap()
             raise
         except (EOFError, BrokenPipeError) as exc:
             self.state = WorkerLifecycle.FAILED
+            self._record_metric(OperationalMetricName.WORKER_CRASH)
             self._terminate_and_reap()
             raise WorkerCrashedError("worker exited before response") from exc
         except WorkerProtocolError:
             self.state = WorkerLifecycle.FAILED
+            self._record_metric(OperationalMetricName.WORKER_EXCEPTION)
             self._terminate_and_reap()
             raise
 
     def cancel(self, *, request_id: str = "request-1") -> None:
+        self._record_metric(OperationalMetricName.CANCELLATION)
         if self._process is None or self._process.poll() is not None:
             self.state = WorkerLifecycle.CANCELLED
             self._close_streams()
@@ -368,6 +381,7 @@ class ComponentWorkerHost:
             self.state = WorkerLifecycle.CANCELLED
 
     def terminate(self) -> None:
+        self._record_metric(OperationalMetricName.WORKER_TERMINATE)
         self.state = WorkerLifecycle.TERMINATING
         process = self._process
         if process is not None and process.poll() is None:
@@ -379,6 +393,7 @@ class ComponentWorkerHost:
             if exited is None:
                 self._terminate_and_reap()
             else:
+                self._record_metric(OperationalMetricName.WORKER_REAP)
                 self._close_streams()
         else:
             self._close_streams()
@@ -414,14 +429,23 @@ class ComponentWorkerHost:
         process = self._process
         if process is None:
             return
+        was_alive = process.poll() is None
         if process.poll() is None:
             process.terminate()
+            self._record_metric(OperationalMetricName.WORKER_TERMINATE)
             try:
                 process.wait(timeout=self.terminate_grace_seconds)
             except subprocess.TimeoutExpired:
                 process.kill()
+                self._record_metric(OperationalMetricName.WORKER_KILL)
                 process.wait(timeout=self.terminate_grace_seconds)
+        if was_alive or process.returncode is not None:
+            self._record_metric(OperationalMetricName.WORKER_REAP)
         self._close_streams()
+
+    def _record_metric(self, name: OperationalMetricName) -> None:
+        if self._metrics is not None:
+            self._metrics.count(name, capability=self.spec.worker_type)
 
     def _close_streams(self) -> None:
         process = self._process

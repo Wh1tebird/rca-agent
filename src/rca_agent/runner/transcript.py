@@ -124,6 +124,9 @@ class TranscriptEvent(BaseModel):
             payload=self.payload,
             schema_version=self.schema_version,
             provenance=self.provenance,
+            recorded_at=self.recorded_at,
+            previous_digest=self.previous_digest,
+            digest=self.digest,
         )
 
     def digest_payload(self) -> dict[str, Any]:
@@ -134,7 +137,11 @@ class TranscriptEvent(BaseModel):
 
 
 class EventRecord(BaseModel):
-    """Typed, projection-facing event envelope without changing JSONL format."""
+    """Typed event envelope that can retain integrity fields for recovery.
+
+    The integrity fields are optional for old projection callers.  A record can
+    participate in recovery only when all of them are present.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -145,6 +152,22 @@ class EventRecord(BaseModel):
     payload: dict[str, Any]
     schema_version: int = Field(default=EVENT_SCHEMA_VERSION, ge=1)
     provenance: str = Field(default="episode_runner", min_length=1, max_length=80)
+    recorded_at: datetime | None = None
+    previous_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    def to_transcript_event(self) -> TranscriptEvent:
+        if self.recorded_at is None or self.previous_digest is None or self.digest is None:
+            raise ValueError("EventRecord lacks transcript integrity fields")
+        return TranscriptEvent(
+            episode_id=self.episode_id,
+            sequence=self.sequence,
+            event_type=self.event_type,
+            payload=self.payload,
+            recorded_at=self.recorded_at,
+            previous_digest=self.previous_digest,
+            digest=self.digest,
+        )
 
 
 class JsonlTranscriptStore:

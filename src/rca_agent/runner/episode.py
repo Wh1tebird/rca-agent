@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from collections.abc import Callable
 from copy import deepcopy
@@ -98,6 +99,7 @@ from rca_agent.models import (
 )
 from rca_agent.runner.core_decision import CoreDecisionProvider, IssuedObservation
 from rca_agent.runner.inquiry_outcomes import inquiry_outcomes
+from rca_agent.runner.operations import OperationalMetricName, OperationalMetrics
 from rca_agent.runner.plan_extension import added_predictions
 from rca_agent.runner.transcript import EventType, JsonlTranscriptStore, Transcript
 from rca_agent.tools.fingerprint import query_fingerprint, sha256_digest
@@ -184,6 +186,7 @@ class EpisodeRunner:
         investigation_workspace_mode: Literal["off", "shadow", "active"] = "shadow",
         mechanism_coverage_mode: Literal["off", "shadow"] = "off",
         evidence_provider: EvidenceProvider | None = None,
+        operational_metrics: OperationalMetrics | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
@@ -226,6 +229,7 @@ class EpisodeRunner:
         self.transcript = Transcript(self.episode_id, store)
         self.status = EpisodeStatus.CREATED
         self.__environment = environment
+        self.__operational_metrics = operational_metrics or OperationalMetrics()
         self.__evidence_provider = evidence_provider or EnvironmentEvidenceProvider(environment)
         self.__max_rounds = max_rounds
         self.__rounds = 0
@@ -309,6 +313,12 @@ class EpisodeRunner:
     @property
     def answer(self) -> AnswerArtifact | None:
         return self.__answer
+
+    @property
+    def operational_metrics(self) -> OperationalMetrics:
+        """Read-only access to host diagnostics; metrics never affect decisions."""
+
+        return self.__operational_metrics
 
     @property
     def rounds(self) -> int:
@@ -2924,6 +2934,10 @@ class EpisodeRunner:
         self.__budget_remaining = bootstrap.query_budget.remaining
         self.__issued_entities = {bootstrap.alert_entity.entity_ref}
         self.status = EpisodeStatus.ACTIVE
+        self.__operational_metrics.count(
+            OperationalMetricName.EPISODE_STARTED,
+            episode_id=self.episode_id,
+        )
         self.transcript.append(
             EventType.ENVIRONMENT_RESET,
             {"status": self.status, "bootstrap": bootstrap.model_dump(mode="json")},
@@ -2933,7 +2947,14 @@ class EpisodeRunner:
     def handle(self, action: PolicyAction) -> ToolResponse | AnswerArtifact | None:
         self._require_status(EpisodeStatus.ACTIVE)
         if isinstance(action, CallToolAction):
-            self._admit_tool_action(action)
+            try:
+                self._admit_tool_action(action)
+            except ActionRejectedError:
+                self.__operational_metrics.count(
+                    OperationalMetricName.QUERY_REJECTED,
+                    episode_id=self.episode_id,
+                )
+                raise
         self.transcript.append(EventType.POLICY_ACTION, action)
         if isinstance(action, RequestStopAction):
             self.transcript.append(EventType.STOP_REQUESTED, action)
@@ -2984,6 +3005,11 @@ class EpisodeRunner:
         )
         self.transcript.append(event_type, {"error_type": error_type})
         self.transcript.append(EventType.STOP_REQUESTED, {"reason": reason})
+        self.__operational_metrics.count(
+            OperationalMetricName.EPISODE_FAILED,
+            episode_id=self.episode_id,
+            failure_category="EXECUTION",
+        )
         return self.freeze_answer(reason)
 
     def finish_script(self) -> AnswerArtifact:
@@ -3229,6 +3255,10 @@ class EpisodeRunner:
         self.__answer = artifact
         self.status = EpisodeStatus.ANSWER_FROZEN
         self.transcript.append(EventType.ANSWER_FROZEN, artifact)
+        self.__operational_metrics.count(
+            OperationalMetricName.EPISODE_COMPLETED,
+            episode_id=self.episode_id,
+        )
         return artifact
 
     def _record_mechanism_coverage_shadow(self) -> None:
@@ -3279,6 +3309,7 @@ class EpisodeRunner:
 
     def _call_tool(self, action: CallToolAction) -> ToolResponse | AnswerArtifact:
         source = self._admit_tool_action(action)
+        started_at = time.monotonic()
         query_ref = query_fingerprint(action.tool_name, action.request)
         evidence_query = evidence_query_from_action(action)
         capability = next((item for item in self.__evidence_provider.capabilities()
@@ -3321,6 +3352,15 @@ class EpisodeRunner:
                 truncated=evidence_result.truncated,
             )
         except Exception as exc:  # noqa: BLE001 - exception type only crosses the transcript
+            self.__operational_metrics.record(
+                OperationalMetricName.QUERY_FAILED,
+                episode_id=self.episode_id,
+                capability=capability.capability_ref if capability else None,
+                provider=getattr(self.__evidence_provider, "provider_name", "unknown"),
+                result_status="exception",
+                failure_category="EXECUTION",
+                latency_ms=(time.monotonic() - started_at) * 1000,
+            )
             self.transcript.append(
                 EventType.TOOL_EXCEPTION,
                 {"tool_name": action.tool_name, "error_type": type(exc).__name__},
@@ -3339,6 +3379,26 @@ class EpisodeRunner:
             },
         )
         self.__budget_remaining = response.cost.budget_after
+        metric_name = (
+            OperationalMetricName.BUDGET_EXHAUSTED
+            if response.status == ToolStatus.BUDGET_EXHAUSTED
+            else OperationalMetricName.QUERY_FAILED
+            if response.status == ToolStatus.QUERY_FAILED
+            else OperationalMetricName.PROVIDER_UNAVAILABLE
+            if response.status == ToolStatus.CAPABILITY_UNAVAILABLE
+            else OperationalMetricName.QUERY_COMPLETED
+        )
+        self.__operational_metrics.record(
+            metric_name,
+            episode_id=self.episode_id,
+            capability=capability.capability_ref if capability else None,
+            provider=getattr(self.__evidence_provider, "provider_name", "unknown"),
+            result_status=response.status.value,
+            cost_units=response.cost.units,
+            query_ref=response.query_ref,
+            latency_ms=(time.monotonic() - started_at) * 1000,
+            failure_category=("EXECUTION" if response.status == ToolStatus.QUERY_FAILED else None),
+        )
         if any(
             item.observation_id in self.__observation_ledger
             and self.__observation_ledger[item.observation_id] != IssuedObservation(
