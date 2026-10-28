@@ -1,14 +1,25 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+import pytest
 from langchain_core.runnables import RunnableLambda
+from pydantic import ValidationError
 
 from rca_agent.langchain_policy import (
     LangChainPolicyAdapter,
     PolicyEnvelope,
     ScriptedPolicyRunnable,
 )
-from rca_agent.langgraph_orchestrator import LangGraphInvestigation
+from rca_agent.langgraph_orchestrator import (
+    COMPATIBILITY_CACHE_FIELDS,
+    EPHEMERAL_ROUTING_FIELDS,
+    ROUTING_PROJECTION_FIELDS,
+    InvestigationGraphState,
+    LangGraphInvestigation,
+    RoutingProjection,
+)
 from rca_agent.models import (
+    AuthoritativeDecision,
     CallToolAction,
     CapabilityDescriptor,
     CoreAssessmentPreview,
@@ -32,6 +43,7 @@ from rca_agent.models import (
     ToolStatus,
     UpdateCandidateEvidenceAction,
 )
+from rca_agent.reasoning import ReasoningRequest, ReasoningResponse
 from rca_agent.runner import EpisodeRunner, EventType, RecordedReplay
 from rca_agent.tools.fingerprint import query_fingerprint
 
@@ -154,6 +166,22 @@ class RecordingScriptedPolicyRunnable(ScriptedPolicyRunnable):
         return super().invoke(input, config, **kwargs)
 
 
+class RecordingReasoningAdapter:
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.requests: list[ReasoningRequest] = []
+
+    def invoke(self, request: ReasoningRequest) -> ReasoningResponse:
+        self.requests.append(request)
+        action = self.actions.pop(0)
+        return ReasoningResponse(
+            role=request.role,
+            operation=request.operation,
+            kind="next_action",
+            proposal={"action": action.model_dump(mode="json")},
+        )
+
+
 def _tool_action() -> CallToolAction:
     return CallToolAction(
         tool_name=ToolName.GET_TRACE_STAGE_BREAKDOWN,
@@ -206,6 +234,71 @@ def test_fake_langchain_policy_drives_graph_to_core_confirmation():
     )
     assert len(report.history) == 2
     assert RecordedReplay.verify(runner.transcript.events).valid
+
+
+def test_graph_uses_typed_reasoning_facade_and_runner_projection():
+    environment = FakeTraceEnvironment()
+    runner = EpisodeRunner(environment)
+    reasoning = RecordingReasoningAdapter((_tool_action(), _hypothesis_action()))
+    compatibility_policy = LangChainPolicyAdapter(ScriptedPolicyRunnable(()))
+
+    report = LangGraphInvestigation(
+        runner,
+        compatibility_policy,
+        reasoning_adapter=reasoning,
+    ).run()
+
+    assert len(reasoning.requests) == 2
+    assert all(request.role == "inquiry" for request in reasoning.requests)
+    assert all(request.operation == "next_action" for request in reasoning.requests)
+    assert all(isinstance(request.context, dict) for request in reasoning.requests)
+    assert report.routing_projection is not None
+    projection = report.routing_projection
+    assert projection.stage == runner.status.value
+    assert projection.needs_continue is False
+    assert projection.stop_signal == runner.status.value
+    assert projection.reasoning_request_ref is not None
+    assert projection.reasoning_response_ref is not None
+    assert report.answer == runner.answer
+    with pytest.raises(ValidationError):
+        projection.stage = "active"
+    assert set(RoutingProjection.model_fields) == ROUTING_PROJECTION_FIELDS
+    assert not {"answer", "workspace", "budget", "permission"} & set(
+        projection.model_dump(mode="json")
+    )
+
+
+def test_stale_graph_preview_is_overridden_by_runner_projection():
+    runner = EpisodeRunner(FakeTraceEnvironment())
+    runner.start()
+    investigation = LangGraphInvestigation(
+        runner,
+        LangChainPolicyAdapter(ScriptedPolicyRunnable(())),
+    )
+    investigation._last_preview = CoreAssessmentPreview(overall_decision=AuthoritativeDecision(
+        status=DecisionStatus.CONFIRMED_ROOT_CAUSE,
+        source=DecisionSource.CORE,
+        winning_hypothesis_id="h-stale",
+        reason="stale cache",
+    ))
+
+    projection = investigation._routing_projection()
+
+    assert projection.core_assessment.overall_decision.status != DecisionStatus.CONFIRMED_ROOT_CAUSE
+    assert projection.needs_continue is True
+
+
+def test_langgraph_state_marks_legacy_fields_as_cache_only():
+    annotations = set(InvestigationGraphState.__annotations__)
+    assert COMPATIBILITY_CACHE_FIELDS <= annotations
+    assert EPHEMERAL_ROUTING_FIELDS <= annotations
+    assert "routing_projection" in annotations
+    source = Path(__file__).parents[1].joinpath(
+        "src", "rca_agent", "langgraph_orchestrator.py"
+    ).read_text()
+    assert "from rca_agent.environment" not in source
+    assert "from rca_agent.evidence" not in source
+    assert ".transcript.append" not in source
 
 
 def test_core_preview_is_read_only_and_does_not_freeze_or_append_transcript():

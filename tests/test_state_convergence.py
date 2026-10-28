@@ -46,6 +46,7 @@ def test_replay_reconstructs_stop_budget_frontier_and_answer_digest(cases_root: 
     report = RecordedReplay.verify(runner.transcript.events)
 
     assert runner.status is EpisodeStatus.ANSWER_FROZEN
+    assert answer is runner.answer  # a non-LangGraph driver uses the same Runner authority
     assert answer.termination_reason is StopReason.POLICY_REQUEST
     assert report.stop_reason is answer.termination_reason
     assert report.answer_digest == answer.artifact_digest

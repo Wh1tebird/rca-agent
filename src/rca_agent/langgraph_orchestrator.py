@@ -26,26 +26,82 @@ from rca_agent.models import (
     StopReason,
     ToolResponse,
     UpdateCandidateEvidenceAction,
+    parse_policy_action,
+)
+from rca_agent.reasoning import (
+    ReasoningAdapter,
+    ReasoningFailure,
+    ReasoningRequest,
+    ReasoningResponse,
 )
 from rca_agent.runner import EpisodeRunner
 from rca_agent.tools.fingerprint import sha256_digest
 
+ROUTING_PROJECTION_FIELDS = frozenset({
+    "stage",
+    "needs_continue",
+    "next_action_ref",
+    "candidate_frontier",
+    "stop_signal",
+    "handoff_signal",
+    "core_assessment",
+    "reasoning_request_ref",
+    "reasoning_response_ref",
+})
+"""Fields that are safe for LangGraph to retain as a routing projection."""
+
+COMPATIBILITY_CACHE_FIELDS = frozenset({
+    "history",
+    "core_assessment",
+    "candidate_frontier",
+    "investigation_workspace",
+    "answer",
+})
+"""Legacy state fields retained for API compatibility, never as fact sources."""
+
+EPHEMERAL_ROUTING_FIELDS = frozenset({
+    "action",
+    "discovery_requested",
+    "deferred_stop",
+    "feedback_attempted",
+})
+"""One-step proposal/routing caches; authority remains in EpisodeRunner."""
+
 
 class InvestigationGraphState(TypedDict, total=False):
+    """LangGraph state with an explicit non-authoritative compatibility boundary.
+
+    ``routing_projection`` is the only durable graph projection.  The flat fields
+    below are retained because callers and old graph checkpoints still expose
+    them, but they are compatibility/ephemeral caches.  They must never be used
+    to authorize a tool call, admission, stop, decision, or answer mutation.
+    """
+
+    # Compatibility cache: historical graph/debug output only.
     history: tuple[dict[str, Any], ...]
+    # Ephemeral proposal cache, validated and executed by EpisodeRunner.
     action: PolicyAction
+    # Compatibility cache: the latest Runner-owned preview/frontier projection.
     core_assessment: CoreAssessmentPreview
     candidate_frontier: CandidateFrontier
+    # Compatibility cache: Workspace is Runner/transcript-derived.
     investigation_workspace: InvestigationWorkspaceSnapshot
+    # Compatibility cache: a frozen Runner artifact, never a graph-owned answer.
     answer: AnswerArtifact
+    # Ephemeral routing suggestions, rechecked against Runner state by routers.
     discovery_requested: bool
     deferred_stop: bool
     feedback_attempted: bool
+    # Authoritative read-only routing projection supplied by Runner queries.
     routing_projection: RoutingProjection
 
 
 class RoutingProjection(BaseModel):
-    """Non-authoritative graph cache derived from the EpisodeRunner."""
+    """Read-only routing projection derived from the EpisodeRunner.
+
+    It carries references and previews only.  It contains no Workspace ledger,
+    budget, permission, Answer, or decision authority owned by the graph.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -54,7 +110,48 @@ class RoutingProjection(BaseModel):
     next_action_ref: str | None = None
     candidate_frontier: CandidateFrontier
     stop_signal: str | None = None
+    handoff_signal: str | None = None
     core_assessment: CoreAssessmentPreview
+    reasoning_request_ref: str | None = None
+    reasoning_response_ref: str | None = None
+
+
+class _PolicyReasoningAdapter:
+    """Typed bridge from the legacy Policy adapter to the reasoning facade."""
+
+    def __init__(self, policy: LangChainPolicyAdapter) -> None:
+        self._policy = policy
+
+    def invoke(self, request: ReasoningRequest) -> ReasoningResponse:
+        if request.role != "inquiry" or request.operation != "next_action":
+            return ReasoningResponse(
+                role="inquiry",
+                operation=request.operation,
+                kind="next_action",
+                proposal={},
+                failure=ReasoningFailure(
+                    kind="unsupported_operation", phase="inquiry", retryable=False,
+                ),
+            )
+        try:
+            context = PolicyContext.model_validate(request.context)
+            action = self._policy.next_action(context)
+        except Exception as exc:  # noqa: BLE001 - typed facade boundary
+            return ReasoningResponse(
+                role="inquiry",
+                operation=request.operation,
+                kind="next_action",
+                proposal={},
+                failure=ReasoningFailure(
+                    kind=type(exc).__name__, phase="inquiry", retryable=True,
+                ),
+            )
+        return ReasoningResponse(
+            role="inquiry",
+            operation=request.operation,
+            kind="next_action",
+            proposal={"action": action.model_dump(mode="json")},
+        )
 
 
 class LangGraphRunReport(BaseModel):
@@ -80,6 +177,7 @@ class LangGraphInvestigation:
                                            dict[str, Any] | None] | None = None,
         inquiry_rounds_provider: Callable[[], tuple[dict[str, Any], ...]] | None = None,
         enable_core_feedback: bool = False,
+        reasoning_adapter: ReasoningAdapter | None = None,
     ) -> None:
         self._runner = runner
         self._policy = policy
@@ -94,9 +192,13 @@ class LangGraphInvestigation:
             raise ValueError("Inquiry query limit differs between host and Policy")
         self._recorded_inquiry_rounds = 0
         self._enable_core_feedback = enable_core_feedback
+        self._reasoning_adapter = reasoning_adapter or _PolicyReasoningAdapter(policy)
         self._bootstrap = None
         self._candidate_options: tuple[CandidateOption, ...] = ()
         self._graph_steps = 0
+        self._last_preview: CoreAssessmentPreview | None = None
+        self._last_reasoning_request_ref: str | None = None
+        self._last_reasoning_response_ref: str | None = None
         self._graph = self._build_graph()
 
     def run(self, *, recursion_limit: int = 100) -> LangGraphRunReport:
@@ -110,33 +212,36 @@ class LangGraphInvestigation:
         initial_preview = self._runner.preview_core_assessment()
         initial_frontier = _candidate_frontier(initial_preview, self._candidate_options)
         initial_workspace = self._runner.investigation_workspace_snapshot
+        self._last_preview = initial_preview
         state = self._graph.invoke(
             {
                 "history": (),
                 "core_assessment": initial_preview,
                 "candidate_frontier": initial_frontier,
                 "investigation_workspace": initial_workspace,
+                "routing_projection": self._routing_projection(),
             },
             {"recursion_limit": recursion_limit},
         )
-        answer = state.get("answer")
+        # The graph may carry an answer cache, but only the Runner can freeze
+        # one.  Read it back from the authority after graph execution.
+        answer = self._runner.answer
         if answer is None:
             raise RuntimeError("LangGraph completed without a frozen answer")
-        projection = state.get("routing_projection")
-        if answer is not None:
-            projection = RoutingProjection(
-                stage=self._runner.status.value,
-                needs_continue=False,
-                candidate_frontier=state.get("candidate_frontier", initial_frontier),
-                core_assessment=state.get("core_assessment", initial_preview),
-                stop_signal=self._runner.status.value,
-            )
+        final_preview = self._last_preview or initial_preview
+        final_frontier = _candidate_frontier(final_preview, self._candidate_options)
+        projection = self._routing_projection(
+            stop_signal=self._runner.status.value,
+            next_action_ref=None,
+            reasoning_request_ref=self._last_reasoning_request_ref,
+            reasoning_response_ref=self._last_reasoning_response_ref,
+        )
         return LangGraphRunReport(
             answer=answer,
             graph_steps=self._graph_steps,
             history=state.get("history", ()),
-            final_preview=state.get("core_assessment", initial_preview),
-            final_frontier=state.get("candidate_frontier", initial_frontier),
+            final_preview=final_preview,
+            final_frontier=final_frontier,
             final_workspace=(
                 answer.investigation_workspace
                 or state.get("investigation_workspace", initial_workspace)
@@ -178,29 +283,92 @@ class LangGraphInvestigation:
         builder.add_edge("finalize", END)
         return builder.compile(name="rca-agent-investigation")
 
+    def _routing_projection(
+        self,
+        *,
+        next_action_ref: str | None = None,
+        stop_signal: str | None = None,
+        reasoning_request_ref: str | None = None,
+        reasoning_response_ref: str | None = None,
+    ) -> RoutingProjection:
+        """Read the current routing view from Runner-owned state.
+
+        ``preview_core_assessment`` is available only while an episode is
+        active.  Once the Runner freezes an answer, the last active preview is
+        retained as an immutable compatibility cache for reporting; no graph
+        state is consulted to reconstruct a decision.
+        """
+
+        if self._runner.status == EpisodeStatus.ACTIVE:
+            preview = self._runner.preview_core_assessment()
+            self._last_preview = preview
+        elif self._last_preview is not None:
+            preview = self._last_preview
+        else:
+            raise RuntimeError("routing projection requested before Runner preview")
+        frontier = _candidate_frontier(preview, self._candidate_options)
+        request_ref = reasoning_request_ref or (
+            "reasoning-request-"
+            + sha256_digest({
+                "episode_id": self._runner.episode_id,
+                "stage": self._runner.status.value,
+                "preview": sha256_digest(preview.model_dump(mode="json")),
+                "frontier": sha256_digest(frontier.model_dump(mode="json")),
+            })[:20]
+        )
+        self._last_reasoning_request_ref = request_ref
+        if reasoning_response_ref is not None:
+            self._last_reasoning_response_ref = reasoning_response_ref
+        handoff_signal = (
+            "inquiry_handoff"
+            if self._runner.inquiry_loop_phase == "handoff"
+            else None
+        )
+        return RoutingProjection(
+            stage=self._runner.status.value,
+            needs_continue=self._runner.status == EpisodeStatus.ACTIVE,
+            next_action_ref=next_action_ref,
+            candidate_frontier=frontier,
+            stop_signal=stop_signal,
+            handoff_signal=handoff_signal,
+            core_assessment=preview,
+            reasoning_request_ref=request_ref,
+            reasoning_response_ref=reasoning_response_ref,
+        )
+
     def _policy_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         self._graph_steps += 1
         assert self._bootstrap is not None
         try:
+            projection = self._routing_projection()
             if self._runner.inquiry_loop_mode == "batched":
                 self._runner.select_startup_query()
             action = None
             for _ in range(12):
                 try:
-                    proposed = self._policy.next_action(
-                        PolicyContext(
-                            bootstrap=self._bootstrap,
-                            candidate_options=self._candidate_options,
-                            history=state.get("history", ()),
-                            core_assessment=state["core_assessment"],
-                            candidate_frontier=state["candidate_frontier"],
-                            investigation_workspace=(
-                                self._runner.investigation_workspace_snapshot.model_dump(mode="json")
-                                if self._runner.inquiry_loop_mode == "batched" else None),
-                            inquiry_state_view=(self._runner.inquiry_loop_view()
-                                if self._runner.inquiry_loop_mode == "batched" else None),
-                        )
+                    policy_context = PolicyContext(
+                        bootstrap=self._bootstrap,
+                        candidate_options=self._candidate_options,
+                        history=state.get("history", ()),
+                        core_assessment=projection.core_assessment,
+                        candidate_frontier=projection.candidate_frontier,
+                        investigation_workspace=(
+                            self._runner.investigation_workspace_snapshot.model_dump(mode="json")
+                            if self._runner.inquiry_loop_mode == "batched" else None),
+                        inquiry_state_view=(self._runner.inquiry_loop_view()
+                            if self._runner.inquiry_loop_mode == "batched" else None),
                     )
+                    request = ReasoningRequest(
+                        role="inquiry",
+                        operation="next_action",
+                        context=policy_context.model_dump(mode="json"),
+                    )
+                    reasoning_response = self._reasoning_adapter.invoke(request)
+                    if reasoning_response.failure is not None:
+                        raise RuntimeError(reasoning_response.failure.kind)
+                    if reasoning_response.kind != "next_action":
+                        raise ValueError("reasoning adapter returned a non-action proposal")
+                    proposed = parse_policy_action(reasoning_response.proposal["action"])
                 finally:
                     for diagnostic in self._policy.drain_inquiry_diagnostics():
                         self._runner.record_inquiry_attempt(diagnostic)
@@ -229,16 +397,23 @@ class LangGraphInvestigation:
                 type(exc).__name__,
             )
             return {"answer": answer}
+        action_ref = "action-" + sha256_digest(action.model_dump(mode="json"))[:20]
+        reasoning_response_ref = (
+            "reasoning-response-"
+            + sha256_digest(reasoning_response.model_dump(mode="json"))[:20]
+        )
+        self._last_reasoning_request_ref = (
+            "reasoning-request-" + sha256_digest(request.model_dump(mode="json"))[:20]
+        )
+        self._last_reasoning_response_ref = reasoning_response_ref
         return {
             "action": action,
             "discovery_requested": isinstance(action, RequestStopAction)
             and self._runner.should_discover(stopping=True),
-            "routing_projection": RoutingProjection(
-                stage=self._runner.status.value,
-                needs_continue=self._runner.status == EpisodeStatus.ACTIVE,
-                next_action_ref="action-" + sha256_digest(action.model_dump(mode="json"))[:20],
-                candidate_frontier=state["candidate_frontier"],
-                core_assessment=state["core_assessment"],
+            "routing_projection": self._routing_projection(
+                next_action_ref=action_ref,
+                reasoning_request_ref=self._last_reasoning_request_ref,
+                reasoning_response_ref=reasoning_response_ref,
             ),
         }
 
@@ -343,19 +518,17 @@ class LangGraphInvestigation:
     def _assess_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
         del state
         self._graph_steps += 1
-        preview = self._runner.preview_core_assessment()
+        projection = self._routing_projection()
         return {
-            "core_assessment": preview,
-            "candidate_frontier": _candidate_frontier(preview, self._candidate_options),
+            "core_assessment": projection.core_assessment,
+            "candidate_frontier": projection.candidate_frontier,
             "investigation_workspace": self._runner.investigation_workspace_snapshot,
-            "routing_projection": RoutingProjection(
-                stage=self._runner.status.value,
-                needs_continue=self._runner.status == EpisodeStatus.ACTIVE,
-                candidate_frontier=_candidate_frontier(preview, self._candidate_options),
-                core_assessment=preview,
-                stop_signal=(None if self._runner.status == EpisodeStatus.ACTIVE
-                             else self._runner.status.value),
-            ),
+            "routing_projection": projection.model_copy(update={
+                "stop_signal": (
+                    None if self._runner.status == EpisodeStatus.ACTIVE
+                    else self._runner.status.value
+                ),
+            }),
         }
 
     def _finalize_node(self, state: InvestigationGraphState) -> InvestigationGraphState:
@@ -368,21 +541,33 @@ class LangGraphInvestigation:
             raise TypeError("Core-confirmed finalization did not freeze an answer")
         return {"answer": answer}
 
-    @staticmethod
-    def _route_after_policy(state: InvestigationGraphState) -> Literal["execute", "discover", "end"]:
-        if "answer" in state:
+    def _route_after_policy(
+        self, state: InvestigationGraphState,
+    ) -> Literal["execute", "discover", "end"]:
+        if self._runner.answer is not None or self._runner.status != EpisodeStatus.ACTIVE:
             return "end"
-        return "discover" if state.get("discovery_requested") else "execute"
+        return (
+            "discover"
+            if state.get("discovery_requested") and self._runner.should_discover(stopping=True)
+            else "execute"
+        )
 
-    @staticmethod
-    def _route_after_execute(state: InvestigationGraphState) -> Literal["assess", "end"]:
-        return "end" if "answer" in state else "assess"
+    def _route_after_execute(
+        self, state: InvestigationGraphState,
+    ) -> Literal["assess", "end"]:
+        del state
+        return (
+            "end"
+            if self._runner.answer is not None or self._runner.status != EpisodeStatus.ACTIVE
+            else "assess"
+        )
 
     def _route_after_assess(self, state: InvestigationGraphState):
+        projection = self._routing_projection()
         if self._runner.has_verification_queries:
             return "verify_discovery"
         if (
-            state["core_assessment"].overall_decision.status
+            projection.core_assessment.overall_decision.status
             in {
                 DecisionStatus.CONFIRMED_ROOT_CAUSE,
                 DecisionStatus.DISCOVERED_VERIFIED,
@@ -398,7 +583,7 @@ class LangGraphInvestigation:
                 and (self._runner.feedback_plan_available()
                      or self._runner.feedback_query_options())):
             return "feedback"
-        if (state["core_assessment"].overall_decision.status
+        if (projection.core_assessment.overall_decision.status
                 == DecisionStatus.MULTIPLE_SUPPORTED):
             return "finalize"
         if state.get("deferred_stop"):
