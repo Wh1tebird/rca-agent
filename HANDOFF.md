@@ -1268,3 +1268,17 @@ authorized DeepSeek t030 batched re-test executed one dynamic query and stopped 
 calls because the second step was not accepted; Replay remained valid. No Benchmark, GT or
 evaluator was called. Further real re-test requires a new authorization after the smoke-entry
 diagnostic gap is repaired.
+
+## Latest handoff — 2026-10-29 RCA Agent 1.0 acceptance
+
+The deterministic/local 1.0 acceptance is complete at `7c31b9e3ea5637910cab1b05f8c164377e0cd3a1`.
+Ruff passes; the full suite passes 911/911, and the existing local RCA100 marker suite passes
+142/142. Lifecycle, worker cleanup and late-result rejection, bounded capabilities and evidence,
+candidate-scoped Core admission, neutral Observation trust states, budget/stop/Handoff, Answer
+Freeze, Transcript/Replay, Recovery, Audit, OperationalMetrics, EvaluationReport, Failure Taxonomy,
+non-LangGraph Runner reuse and ReasoningAdapter replacement are covered by deterministic tests.
+No runtime code changed. See `analysis/acceptance_1_0_20261029.md` for the matrix and evidence.
+
+The project is an **RCA Agent 1.0 candidate** for this acceptance boundary. Real paid-model,
+production telemetry/database and network smoke tests remain separately authorized work; they are
+not accuracy or release evidence for this candidate.
