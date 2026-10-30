@@ -30,6 +30,8 @@ async function copyRaw() {
 }
 
 const roleLabel: Record<Evidence['role'], string> = {
+  observation: 'Neutral Observation',
+  admission: 'Candidate admission',
   support: '支持证据',
   refutation: '反驳证据',
   alternative: '竞争证据',
@@ -41,8 +43,8 @@ const roleLabel: Record<Evidence['role'], string> = {
   <aside class="panel evidence-panel">
     <div class="panel-heading">
       <div>
-        <span class="eyebrow">证据检查器</span>
-        <h2>查到了什么</h2>
+        <span class="eyebrow">Observation 检查器</span>
+        <h2>Host 返回了什么</h2>
       </div>
       <el-icon class="panel-icon"><DataLine /></el-icon>
     </div>
@@ -74,16 +76,18 @@ const roleLabel: Record<Evidence['role'], string> = {
       <div><dt>数据源</dt><dd>{{ evidence.source }}</dd></div>
       <div><dt>时间范围</dt><dd>{{ evidence.timeRange }}</dd></div>
       <div><dt>查询状态</dt><dd><StatusBadge :status="evidence.queryStatus" compact /></dd></div>
+      <div><dt>Observation status</dt><dd><StatusBadge :status="evidence.dataStatus" compact /></dd></div>
     </dl>
 
     <div class="evidence-note">
-      <span>这条证据说明什么</span>
-      <p>{{ evidence.interpretation }}</p>
+      <span>Observation note</span>
+      <p>{{ evidence.observationNote }}</p>
     </div>
 
     <div class="related-candidates">
-      <span>影响哪些候选</span>
-      <div><span v-for="candidate in relatedCandidates" :key="candidate.id">{{ candidate.name }}</span></div>
+      <span>显式 Evidence admission</span>
+      <div v-if="evidence.admissionContext"><span v-for="candidate in relatedCandidates" :key="candidate.id">{{ candidate.name }}</span></div>
+      <div v-else class="muted">尚未显式绑定 Candidate</div>
     </div>
 
     <div v-if="developerMode" class="developer-evidence">

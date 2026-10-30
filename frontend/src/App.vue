@@ -34,7 +34,7 @@ const runProfileLabel = computed(() => sourceMode === 'Mock' ? '演示数据' : 
 
 function selectCandidate(candidate: Candidate) {
   selectedCandidateId.value = candidate.id
-  const relatedStep = activeCase.value?.timeline.find((step) => candidateMatchesStep(candidate, step))
+  const relatedStep = activeCase.value?.timeline.find((step) => step.candidateIds?.includes(candidate.id))
   if (relatedStep) {
     selectedTimelineId.value = relatedStep.id
     selectedEvidenceId.value = relatedStep.evidenceId ?? candidate.evidenceIds[0] ?? selectedEvidenceId.value
@@ -45,11 +45,6 @@ function selectTimeline(step: TimelineStep) {
   selectedTimelineId.value = step.id
   if (step.evidenceId) selectedEvidenceId.value = step.evidenceId
   if (step.candidateIds?.[0]) selectedCandidateId.value = step.candidateIds[0]
-}
-
-function candidateMatchesStep(candidate: Candidate, step: TimelineStep) {
-  if (step.candidateIds?.includes(candidate.id)) return true
-  return Boolean(candidate.mechanismId && JSON.stringify(step.developer).includes(candidate.mechanismId))
 }
 
 async function selectCase(caseId: string) {
@@ -99,7 +94,11 @@ async function startInvestigation() {
     selectedRunId.value = created.runId
     for (let attempt = 0; attempt < 3600; attempt += 1) {
       const current = await dataSource.getRunStatus(created.runId)
-      runProgress.value = current.status === 'queued' ? '等待执行' : 'AI 正在调查并记录过程'
+      runProgress.value = current.status === 'queued'
+        ? '等待执行'
+        : current.recoveryStatus === 'retryable'
+          ? '等待 host recovery plan'
+          : current.status === 'running' ? '正在调查并记录过程' : '正在校验 Replay'
       if (current.status === 'succeeded') {
         activeCase.value = await dataSource.loadRun(created.runId)
         runs.value = await dataSource.listRuns(selectedCaseId.value)
@@ -108,7 +107,7 @@ async function startInvestigation() {
         runProgress.value = '调查完成，重放检查通过'
         return
       }
-      if (current.status === 'failed' || current.status === 'cancelled') throw new Error(`调查 ${current.status}: ${current.errorCode ?? '未知错误'}`)
+      if (current.status === 'failed' || current.status === 'cancelled') throw new Error(`调查 ${current.status}（${current.recoveryStatus}）: ${current.errorCode ?? '未知错误'}`)
       await new Promise((resolve) => window.setTimeout(resolve, 1000))
     }
     throw new Error('调查等待超时')

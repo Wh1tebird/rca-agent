@@ -4,10 +4,27 @@ export type CandidateStatus =
   | 'UNRESOLVED'
   | 'FAILED'
   | 'INCONCLUSIVE'
+  | 'OUT_OF_SCOPE'
+  | 'QUERY_FAILED'
+  | 'UNKNOWN'
+  | 'MISSING'
   | 'NOT_PROPOSED'
 
 export type EvidenceKind = 'metric' | 'trace' | 'query' | 'log'
-export type EvidenceRole = 'support' | 'refutation' | 'alternative' | 'context'
+export type EvidenceRole = 'observation' | 'admission' | 'support' | 'refutation' | 'alternative' | 'context'
+export type QueryStatus =
+  | 'SUCCESS'
+  | 'EMPTY'
+  | 'MISSING'
+  | 'UNKNOWN'
+  | 'QUERY_FAILED'
+  | 'CAPABILITY_UNAVAILABLE'
+  | 'COVERAGE_INSUFFICIENT'
+  | 'REJECTED'
+  | 'BUDGET_EXHAUSTED'
+  | 'FAILED'
+export type ReplayStatus = 'VALID' | 'INVALID' | 'NOT_AVAILABLE'
+export type RecoveryStatus = 'RESUMABLE' | 'RETRYABLE' | 'TERMINAL' | 'FROZEN' | 'CORRUPTED' | 'NOT_AVAILABLE'
 
 export interface Candidate {
   id: string
@@ -39,8 +56,11 @@ export interface Evidence {
   unit?: string
   source: string
   timeRange: string
-  queryStatus: 'SUCCESS' | 'MISSING' | 'FAILED'
+  queryStatus: QueryStatus
+  dataStatus: string
   observation: string
+  observationNote: string
+  admissionContext?: string
   interpretation: string
   candidateIds: string[]
   query: string
@@ -81,7 +101,15 @@ export interface RcaCase {
   status: string
   queryCount: number
   duration: string
-  replayStatus: 'VALID' | 'INVALID' | 'NOT_AVAILABLE'
+  schemaVersion: number
+  episodeId?: string
+  answerDigest?: string
+  replayStatus: ReplayStatus
+  recoveryStatus: RecoveryStatus
+  stopReason?: string
+  replay: ReplayMetadata
+  recovery: RecoveryMetadata
+  audit: AuditRecord[]
   candidates: Candidate[]
   timeline: TimelineStep[]
   evidence: Evidence[]
@@ -92,5 +120,62 @@ export interface RcaCase {
     missing: string[]
     alternatives: string[]
     whyNotVerified: string
+    authoritative: boolean
+    answerFrozen: boolean
+    answerDigest?: string
+    replayStatus: ReplayStatus
   }
+}
+
+export interface ReplayMetadata {
+  schemaVersion: number
+  status: ReplayStatus
+  valid: boolean
+  eventCount: number
+  headDigest?: string
+  answerDigest?: string
+  errorCode?: string
+}
+
+export interface PendingOperation {
+  operationId: string
+  kind: 'query' | 'adapter_call' | 'handoff'
+  disposition: 'retryable' | 'terminate'
+  sourceEventId: string
+}
+
+export interface RecoveryMetadata {
+  schemaVersion: number
+  status: RecoveryStatus
+  episodeId?: string
+  eventCount: number
+  nextSequence: number
+  headDigest?: string
+  budgetRemaining?: number
+  answerDigest?: string
+  stopReason?: string
+  pendingOperations: PendingOperation[]
+  replayValid: boolean
+  failureCategory?: string
+  failureKind?: string
+}
+
+export interface AuditRecord {
+  episodeId: string
+  eventId: string
+  sequence: number
+  previousDigest: string
+  capability?: string
+  provider?: string
+  queryRef?: string
+  entityScopeDigest?: string
+  timeRange?: Record<string, unknown>
+  costUnits?: number
+  adapterRef?: string
+  coreDecision?: string
+  stopReason?: string
+  handoff?: string
+  answerArtifactDigest?: string
+  replayResult?: string
+  failureCategory?: string
 }

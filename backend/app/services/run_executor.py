@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Lock
 
 from backend.app.config import Settings
-from backend.app.schemas import RunCreateResponse, RunStatus
+from backend.app.schemas import RecoveryStatus, RunCreateResponse, RunStatus
 from backend.app.services.run_store import RUN_ID_RE, RunManifest
 from rca_agent.core.runtime_registry import rca100_evidence_registry
 from rca_agent.environment import Rca100Environment
@@ -28,7 +28,13 @@ from rca_agent.models import (
     ToolResponse,
 )
 from rca_agent.qwen_policy import create_qwen_discovery_pipeline
-from rca_agent.runner import CoreDecisionProvider, EpisodeRunner, RecordedReplay
+from rca_agent.runner import (
+    CoreDecisionProvider,
+    EpisodeRunner,
+    OperationalMetricName,
+    OperationalMetrics,
+    RecordedReplay,
+)
 
 SCRIPTED_PROFILE = "scripted-trace-demo"
 QWEN_PROFILE = "qwen-investigation"
@@ -102,18 +108,21 @@ class RunJobManager:
     def _execute(self, run_dir: Path, queued: RunManifest) -> None:
         running = queued.model_copy(update={"status": RunStatus.RUNNING})
         _write_manifest(run_dir, running)
+        operational_metrics = OperationalMetrics()
         try:
             if queued.profile_id == SCRIPTED_PROFILE:
                 answer = _run_scripted_trace_profile(
                     self._cases_root,
                     queued.case_id,
                     run_dir / "transcript.jsonl",
+                    operational_metrics=operational_metrics,
                 )
             else:
                 answer = _run_qwen_investigation_profile(
                     self._settings,
                     queued.case_id,
                     run_dir / "transcript.jsonl",
+                    operational_metrics=operational_metrics,
                 )
             replay = RecordedReplay.from_path(run_dir / "transcript.jsonl")
             if not replay.valid:
@@ -125,12 +134,21 @@ class RunJobManager:
             })
             _write_manifest(run_dir, finished)
         except Exception as exc:  # noqa: BLE001 - persist safe failure type, never exception text
+            operational_metrics.count(
+                OperationalMetricName.EPISODE_FAILED,
+                failure_category="EXECUTION",
+            )
             failed = running.model_copy(update={
                 "status": RunStatus.FAILED,
                 "finished_at": datetime.now(UTC).isoformat(),
                 "error_code": type(exc).__name__,
             })
             _write_manifest(run_dir, failed)
+        finally:
+            _atomic_write(
+                run_dir / "metrics.json",
+                json.dumps(operational_metrics.snapshot().model_dump(mode="json"), ensure_ascii=False) + "\n",
+            )
 
     def _recover_interrupted_runs(self) -> None:
         for directory in self._runs_root.iterdir():
@@ -147,14 +165,23 @@ class RunJobManager:
                 "status": RunStatus.FAILED,
                 "finished_at": datetime.now(UTC).isoformat(),
                 "error_code": "HostRestarted",
+                "recovery_status": RecoveryStatus.RETRYABLE,
+                "recovery_failure": "host_restart_pending_operation",
             })
             _write_manifest(directory, recovered)
 
 
-def _run_scripted_trace_profile(cases_root: Path, case_id: str, transcript_path: Path):
+def _run_scripted_trace_profile(
+    cases_root: Path,
+    case_id: str,
+    transcript_path: Path,
+    *,
+    operational_metrics: OperationalMetrics | None = None,
+):
     runner = EpisodeRunner(
         Rca100Environment.from_case(cases_root, case_id),
         transcript_path=transcript_path,
+        operational_metrics=operational_metrics,
     )
     bootstrap = runner.start()
     response = runner.handle(CallToolAction(
@@ -189,6 +216,7 @@ def _run_qwen_investigation_profile(
     transcript_path: Path,
     *,
     mechanism_coverage_mode: str = "off",
+    operational_metrics: OperationalMetrics | None = None,
 ):
     """Run the provider-backed Agent without evaluator or Ground Truth access."""
     environment = Rca100Environment.from_case(
@@ -212,6 +240,7 @@ def _run_qwen_investigation_profile(
         evidence_registry=rca100_evidence_registry,
         discovery_timeout_seconds=settings.qwen_discovery_timeout_seconds,
         mechanism_coverage_mode=mechanism_coverage_mode,
+        operational_metrics=operational_metrics,
     )
     chat_model = create_local_chat_model(
         model=settings.qwen_model,

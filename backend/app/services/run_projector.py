@@ -9,42 +9,57 @@ import json
 from typing import Any
 
 from backend.app.schemas import (
+    API_SCHEMA_VERSION,
+    AuditRecordView,
     CandidateView,
     CaseDetail,
     EvidenceView,
     FinalDecisionView,
     InvestigationRunView,
+    RecoveryMetadata,
+    RecoveryStatus,
+    ReplayMetadata,
     ReplayStatus,
     RunSummary,
     TimelineStepView,
 )
 from backend.app.services.run_store import StoredRun
 from rca_agent.models import AnswerArtifact
+from rca_agent.runner.recovery import RecoveryState
 from rca_agent.runner.transcript import EventType, TranscriptEvent
 
 
 class RunProjector:
     def project(self, stored: StoredRun, case: CaseDetail) -> InvestigationRunView:
         summary = _run_summary(stored)
-        evidence, evidence_by_observation = _evidence(stored.events, case)
+        evidence, evidence_by_observation = _evidence(stored.events, case, stored.answer)
         candidates = _candidates(stored.answer, stored.events, evidence_by_observation)
         timeline = _timeline(stored.events, evidence_by_observation, candidates)
-        final = _final_decision(stored.answer, stored.replay_status)
+        final = _final_decision(stored.answer, stored)
         raw = {
+            "schema_version": API_SCHEMA_VERSION,
             "run_id": summary.run_id,
-            "episode_id": stored.answer.episode_id if stored.answer else None,
+            "episode_id": summary.episode_id,
             "replay_status": stored.replay_status.value,
-            "replay_error": stored.replay_error,
+            "recovery_status": stored.recovery.state.value,
+            "answer_digest": summary.answer_digest,
+            "stop_reason": summary.stop_reason,
             "transcript_event_count": len(stored.events),
-            "answer_artifact_digest": stored.answer.artifact_digest if stored.answer else None,
+            "replay_error": stored.replay_error,
         }
         return InvestigationRunView(
+            schema_version=API_SCHEMA_VERSION,
+            episode_id=summary.episode_id,
+            answer_digest=summary.answer_digest,
             run=summary,
             case=case,
             candidates=tuple(candidates),
             timeline=tuple(timeline),
             evidence=tuple(evidence),
             final_decision=final,
+            replay=_replay_metadata(stored),
+            recovery=_recovery_metadata(stored),
+            audit=tuple(_audit_view(item) for item in stored.audit),
             raw=_clean(raw),
         )
 
@@ -56,10 +71,11 @@ def _run_summary(stored: StoredRun) -> RunSummary:
 
 
 def _evidence(
-    events: tuple[TranscriptEvent, ...], case: CaseDetail
+    events: tuple[TranscriptEvent, ...], case: CaseDetail, answer: AnswerArtifact | None,
 ) -> tuple[list[EvidenceView], dict[str, str]]:
     result: list[EvidenceView] = []
     index: dict[str, str] = {}
+    admissions = _candidate_observation_refs(answer)
     for event in events:
         if event.event_type != EventType.TOOL_RESPONSE:
             continue
@@ -70,25 +86,52 @@ def _evidence(
                 continue
             evidence_id = f"ev-{observation_id}"
             index[observation_id] = evidence_id
-            status = str(payload.get("status", "unknown")).upper()
+            status = str(payload.get("status", "UNKNOWN")).upper()
             signal = str(raw_observation.get("signal", "observation"))
+            candidate_ids = admissions.get(observation_id, ())
+            observation_note = (
+                "Neutral Observation returned by the host EvidenceProvider."
+            )
+            admission_context = (
+                "Explicitly admitted by Candidate refs: " + ", ".join(candidate_ids)
+                if candidate_ids else None
+            )
             result.append(EvidenceView(
                 id=evidence_id,
                 title=_human_signal(signal),
                 kind=str(raw_observation.get("modality", "query")),
-                role="context",
+                role="admission" if candidate_ids else "observation",
                 value=_value_text(raw_observation.get("value")),
                 unit=raw_observation.get("unit"),
                 source=str(payload.get("tool_name", "RCA100 tool")),
                 time_range=f"{case.window_start.isoformat()} — {case.window_end.isoformat()}",
                 query_status=status,
+                data_status=str(raw_observation.get("data_status", "UNKNOWN")).upper(),
                 observation=(f"{signal}: {_value_text(raw_observation.get('value'))}"),
-                interpretation="Recorded observation. Its evidence role is assigned only by a recorded verification plan.",
+                observation_note=observation_note,
+                admission_context=admission_context,
+                interpretation=observation_note,
+                candidate_ids=candidate_ids,
                 query_ref=payload.get("query_ref"),
                 observation_ref=observation_id,
-                raw=_clean(raw_observation),
+                raw=_observation_projection(raw_observation),
             ))
     return result, index
+
+
+def _candidate_observation_refs(
+    answer: AnswerArtifact | None,
+) -> dict[str, tuple[str, ...]]:
+    bindings: dict[str, set[str]] = {}
+    if answer is None:
+        return {}
+    for item in answer.inquiry_candidates:
+        for observation_ref in item.observation_refs:
+            bindings.setdefault(observation_ref, set()).add(item.hypothesis_id)
+    for proposal in answer.policy_proposals:
+        for observation_ref in proposal.observation_refs:
+            bindings.setdefault(observation_ref, set()).add(proposal.hypothesis_id)
+    return {ref: tuple(sorted(candidate_ids)) for ref, candidate_ids in bindings.items()}
 
 
 def _candidates(
@@ -225,36 +268,73 @@ def _timeline(
                       if event.event_type == EventType.ANSWER_FROZEN else None),
             evidence_id=evidence_id,
             candidate_ids=related,
-            developer=_clean(payload),
+            developer=_developer_projection(payload),
         ))
     return result
 
 
-def _final_decision(
-    answer: AnswerArtifact | None, replay_status: ReplayStatus
-) -> FinalDecisionView | None:
-    if answer is None or replay_status != ReplayStatus.VALID:
+def _final_decision(answer: AnswerArtifact | None, stored: StoredRun) -> FinalDecisionView | None:
+    if (
+        answer is None
+        or stored.replay_status != ReplayStatus.VALID
+        or stored.recovery.state != RecoveryState.FROZEN
+    ):
         return None
     decision = answer.authoritative_decision
     missing = answer.missing_evidence
     alternatives = tuple(item.alternative for item in answer.inquiry_candidates if item.alternative)
-    status = decision.status.value.upper()
+    status = _decision_status(decision.status.value)
     why = (
         "Recorded Replay is valid, but the Core did not issue a verified root-cause decision."
-        if status not in {"CONFIRMED_ROOT_CAUSE", "DISCOVERED_VERIFIED"}
+        if status != "VERIFIED"
         else "The Core issued an authoritative verified decision from the recorded evidence."
     )
     return FinalDecisionView(
         status=status,
         explanation=decision.reason,
-        supporting=tuple(
-            proposal.rationale for proposal in answer.policy_proposals
-            if proposal.hypothesis_id in decision.supported_hypothesis_ids
-        ),
+        supporting=tuple(f"Observation {ref}" for ref in answer.observation_refs),
         missing=missing,
         alternatives=alternatives,
         why_not_verified=why,
+        authoritative=True,
+        answer_frozen=True,
+        answer_digest=answer.artifact_digest,
+        replay_status=stored.replay_status,
     )
+
+
+def _replay_metadata(stored: StoredRun) -> ReplayMetadata:
+    report = stored.replay_report
+    return ReplayMetadata(
+        status=stored.replay_status,
+        valid=stored.replay_status == ReplayStatus.VALID,
+        event_count=len(stored.events),
+        head_digest=(report.head_digest if report else (stored.events[-1].digest if stored.events else None)),
+        answer_digest=(report.answer_digest if report else stored.recovery.answer_digest),
+        error_code=stored.replay_error,
+    )
+
+
+def _recovery_metadata(stored: StoredRun) -> RecoveryMetadata:
+    snapshot = stored.recovery
+    return RecoveryMetadata(
+        status=RecoveryStatus(snapshot.state.value),
+        episode_id=snapshot.episode_id,
+        event_count=snapshot.event_count,
+        next_sequence=snapshot.next_sequence,
+        head_digest=snapshot.head_digest,
+        budget_remaining=snapshot.budget_remaining,
+        answer_digest=snapshot.answer_digest,
+        stop_reason=snapshot.stop_reason.value if snapshot.stop_reason else None,
+        pending_operations=tuple(item.model_dump(mode="json") for item in snapshot.pending_operations),
+        replay_valid=snapshot.replay_valid,
+        failure_category=snapshot.failure_category,
+        failure_kind=snapshot.failure_kind,
+    )
+
+
+def _audit_view(record: Any) -> AuditRecordView:
+    return AuditRecordView.model_validate(record.model_dump(mode="json"))
 
 
 _EVENT_DISPLAY = {
@@ -325,12 +405,18 @@ def _decision_status(value: str) -> str:
     normalized = value.lower()
     if normalized in {"confirmed", "confirmed_root_cause", "discovered_verified"}:
         return "VERIFIED"
-    if normalized == "supported":
+    if normalized in {"supported", "supported_hypothesis", "multiple_supported"}:
         return "SUPPORTED"
     if normalized == "contradicted":
         return "FAILED"
-    if normalized in {"inconclusive", "out_of_scope", "query_failed"}:
+    if normalized == "out_of_scope":
+        return "OUT_OF_SCOPE"
+    if normalized == "query_failed":
+        return "QUERY_FAILED"
+    if normalized == "inconclusive":
         return "INCONCLUSIVE"
+    if normalized in {"unknown", "missing"}:
+        return normalized.upper()
     return "UNRESOLVED"
 
 
@@ -342,8 +428,14 @@ def _verification_status(value: str) -> str:
         return "FAILED"
     if normalized == "supported":
         return "SUPPORTED"
+    if normalized == "out_of_scope":
+        return "OUT_OF_SCOPE"
+    if normalized == "query_failed":
+        return "QUERY_FAILED"
     if normalized == "inconclusive":
         return "INCONCLUSIVE"
+    if normalized in {"unknown", "missing"}:
+        return normalized.upper()
     return "UNRESOLVED"
 
 
@@ -361,7 +453,28 @@ def _value_text(value: Any) -> str:
     return str(value)
 
 
-_PRIVATE_KEYS = {"ground_truth", "answer_key", "cases_root", "workspace", "region_id"}
+_PRIVATE_KEYS = {
+    "ground_truth", "answer_key", "cases_root", "workspace", "region_id",
+    "path", "filesystem", "secret", "token", "prompt", "trace_id",
+}
+
+_OBSERVATION_KEYS = {
+    "observation_id", "modality", "entity_ref", "signal", "value", "unit",
+    "data_status", "observed_at", "details",
+}
+_DETAIL_KEYS = {
+    "trace_ref", "stage", "duration_ms", "ratio", "sample_count", "status",
+    "baseline", "incident_max", "baseline_mean", "baseline_ratio", "incident_delta",
+    "baseline_delta", "connection_acquisition_ms", "trust", "data_status",
+}
+_DEVELOPER_KEYS = {
+    "query_ref", "observation_ref", "capability_ref", "evidence_capability",
+    "evidence_provider", "evidence_scope_digest", "evidence_time_range",
+    "evidence_cost_units", "status", "reason", "termination_reason", "stop_reason",
+    "failure_category", "failure_kind", "error_type", "candidate_id", "hypothesis_id",
+    "mechanism_id", "plan_version", "core_revision", "replay", "query_refs",
+    "operation_status", "operation_kind", "operation_id", "execution_source",
+}
 
 
 def _clean(value: Any) -> Any:
@@ -372,3 +485,54 @@ def _clean(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_clean(item) for item in value]
     return value
+
+
+def _observation_projection(value: dict[str, Any]) -> dict[str, Any]:
+    projection = {
+        key: _safe_value(value[key])
+        for key in _OBSERVATION_KEYS
+        if key in value and key != "details"
+    }
+    details = value.get("details")
+    if isinstance(details, dict):
+        safe_details = {
+            key: _safe_value(details[key])
+            for key in _DETAIL_KEYS
+            if key in details
+        }
+        if safe_details:
+            projection["details"] = safe_details
+    return projection
+
+
+def _developer_projection(value: dict[str, Any]) -> dict[str, Any]:
+    projection: dict[str, Any] = {}
+    for key in _DEVELOPER_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if key == "authoritative_decision":
+            continue
+        projection[key] = _safe_value(item)
+    decision = value.get("authoritative_decision")
+    if isinstance(decision, dict):
+        projection["authoritative_decision"] = {
+            key: decision[key]
+            for key in ("status", "source")
+            if key in decision
+        }
+    return projection
+
+
+def _safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_value(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _PRIVATE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_value(item) for item in value[:32]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)[:200]

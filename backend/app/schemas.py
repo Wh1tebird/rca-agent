@@ -28,6 +28,18 @@ class ReplayStatus(StrEnum):
     NOT_AVAILABLE = "not_available"
 
 
+class RecoveryStatus(StrEnum):
+    RESUMABLE = "resumable"
+    RETRYABLE = "retryable"
+    TERMINAL = "terminal"
+    FROZEN = "frozen"
+    CORRUPTED = "corrupted"
+    NOT_AVAILABLE = "not_available"
+
+
+API_SCHEMA_VERSION = 1
+
+
 class CaseSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -51,15 +63,20 @@ class CaseDetail(CaseSummary):
 class RunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    schema_version: int = Field(default=API_SCHEMA_VERSION, ge=1)
     run_id: str
     case_id: str
+    episode_id: str | None = None
     status: RunStatus
     replay_status: ReplayStatus
+    recovery_status: RecoveryStatus = RecoveryStatus.NOT_AVAILABLE
     started_at: datetime
     finished_at: datetime | None = None
     duration_ms: int | None = Field(default=None, ge=0)
     query_count: int = Field(ge=0)
     final_status: str | None = None
+    answer_digest: str | None = None
+    stop_reason: str | None = None
     profile_id: str
     model_label: str | None = None
     error_code: str | None = None
@@ -76,6 +93,7 @@ class RunCreateRequest(BaseModel):
 class RunCreateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    schema_version: int = Field(default=API_SCHEMA_VERSION, ge=1)
     run_id: str
     case_id: str
     status: RunStatus
@@ -111,7 +129,11 @@ class EvidenceView(BaseModel):
     source: str
     time_range: str | None = None
     query_status: str
+    data_status: str = "UNKNOWN"
     observation: str
+    observation_note: str
+    admission_context: str | None = None
+    # Kept for older console clients; it is always a neutral observation note.
     interpretation: str
     candidate_ids: tuple[str, ...] = ()
     query_ref: str | None = None
@@ -150,6 +172,71 @@ class FinalDecisionView(BaseModel):
     missing: tuple[str, ...] = ()
     alternatives: tuple[str, ...] = ()
     why_not_verified: str
+    authoritative: bool = False
+    answer_frozen: bool = False
+    answer_digest: str | None = None
+    replay_status: ReplayStatus = ReplayStatus.NOT_AVAILABLE
+
+
+class ReplayMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: int = Field(default=API_SCHEMA_VERSION, ge=1)
+    status: ReplayStatus
+    valid: bool = False
+    event_count: int = Field(default=0, ge=0)
+    head_digest: str | None = None
+    answer_digest: str | None = None
+    error_code: str | None = None
+
+
+class PendingOperationView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str
+    kind: Literal["query", "adapter_call", "handoff"]
+    disposition: Literal["retryable", "terminate"]
+    source_event_id: str
+
+
+class RecoveryMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: int = Field(default=API_SCHEMA_VERSION, ge=1)
+    status: RecoveryStatus
+    episode_id: str | None = None
+    event_count: int = Field(default=0, ge=0)
+    next_sequence: int = Field(default=1, ge=1)
+    head_digest: str | None = None
+    budget_remaining: int | None = Field(default=None, ge=0)
+    answer_digest: str | None = None
+    stop_reason: str | None = None
+    pending_operations: tuple[PendingOperationView, ...] = ()
+    replay_valid: bool = False
+    failure_category: str | None = None
+    failure_kind: str | None = None
+
+
+class AuditRecordView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    episode_id: str
+    event_id: str
+    sequence: int = Field(ge=1)
+    previous_digest: str
+    capability: str | None = None
+    provider: str | None = None
+    query_ref: str | None = None
+    entity_scope_digest: str | None = None
+    time_range: dict[str, Any] | None = None
+    cost_units: int | None = Field(default=None, ge=0)
+    adapter_ref: str | None = None
+    core_decision: str | None = None
+    stop_reason: str | None = None
+    handoff: str | None = None
+    answer_artifact_digest: str | None = None
+    replay_result: str | None = None
+    failure_category: str | None = None
 
 
 class InvestigationRunView(BaseModel):
@@ -157,12 +244,18 @@ class InvestigationRunView(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    schema_version: int = Field(default=API_SCHEMA_VERSION, ge=1)
+    episode_id: str | None = None
+    answer_digest: str | None = None
     run: RunSummary
     case: CaseDetail
     candidates: tuple[CandidateView, ...]
     timeline: tuple[TimelineStepView, ...]
     evidence: tuple[EvidenceView, ...]
     final_decision: FinalDecisionView | None = None
+    replay: ReplayMetadata
+    recovery: RecoveryMetadata
+    audit: tuple[AuditRecordView, ...] = ()
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

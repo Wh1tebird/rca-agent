@@ -12,21 +12,23 @@ const props = defineProps<{
 }>()
 const failedCandidates = computed(() => props.candidates.filter((candidate) => candidate.formalized && candidate.status === 'FAILED'))
 const unresolvedCandidates = computed(() => props.candidates.filter((candidate) => candidate.formalized && candidate.status === 'UNRESOLVED'))
+const isAuthoritative = computed(() => props.decision.authoritative && props.decision.answerFrozen && props.replayStatus === 'VALID')
 </script>
 
 <template>
   <section class="final-decision">
     <div class="decision-summary">
-      <span class="eyebrow">Core 最终裁决 · 重放 {{ replayStatus }}</span>
+      <span class="eyebrow">Core decision projection · Replay {{ replayStatus }}</span>
       <div class="decision-status-row">
-        <h2>最终调查结论</h2><StatusBadge :status="decision.status" />
+        <h2>{{ isAuthoritative ? 'Answer Freeze 后的 Core decision' : '当前没有 authoritative RCA conclusion' }}</h2><StatusBadge :status="decision.status" />
       </div>
       <p>{{ decision.explanation }}</p>
+      <div v-if="!isAuthoritative" class="not-verified"><el-icon><InfoFilled /></el-icon><span><strong>仅显示安全状态</strong>Replay invalid、Answer 未 Freeze 或 Recovery 尚未完成时，前端不会展示 authoritative conclusion。</span></div>
       <div class="not-verified"><el-icon><InfoFilled /></el-icon><span><strong>为什么还不能确认根因</strong>{{ decision.whyNotVerified }}</span></div>
     </div>
     <div class="decision-columns">
       <div class="decision-list support">
-        <h3><el-icon><CircleCheck /></el-icon>支持证据</h3>
+        <h3><el-icon><CircleCheck /></el-icon>Core 引用的 Observation</h3>
         <ul><li v-for="item in decision.supporting" :key="item">{{ item }}</li></ul>
       </div>
       <div class="decision-list missing">

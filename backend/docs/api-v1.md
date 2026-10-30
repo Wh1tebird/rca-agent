@@ -6,6 +6,10 @@ score a Case. The `scripted-trace-demo` profile is deterministic and does not
 invoke a model; `qwen-investigation` is an optional host-configured provider
 profile.
 
+The presentation layer is a projection of the host-owned `EpisodeRunner`. It
+does not own workflow, Evidence admission, Core decision, stopping, Recovery,
+or Answer Freeze. `schema_version` is currently `1`.
+
 ## Safety contract
 
 The API must never return Ground Truth, answer-key content, evaluator output,
@@ -35,20 +39,34 @@ missing Observation files remains visible as `incomplete`.
 
 ### `GET /api/v1/cases/{case_id}/runs`
 
-Returns recorded runs for a Case, newest first. A run summary includes the
-final recorded decision string and Replay validity, never evaluation results.
+Returns recorded runs for a Case, newest first. A run summary includes
+`episode_id`, `answer_digest`, `replay_status`, `recovery_status` and
+`stop_reason`. `final_status` is populated only when the Answer is frozen and
+Recorded Replay is valid. It never contains evaluation results.
 
 ### `GET /api/v1/runs/{run_id}`
 
 Returns the presentation projection used by the Vue console:
 
 ```text
-run + case + candidates + timeline + evidence + final_decision
+run + case + candidates + timeline + evidence + final_decision + replay + recovery + audit
 ```
 
 The projection is derived only from the stored Manifest, Transcript and frozen
-AnswerArtifact. If Replay is invalid, the forensic timeline remains available,
-but `final_decision` is absent and cannot be presented as authoritative.
+AnswerArtifact. `evidence` contains neutral Observation values. Candidate
+admission is represented only by explicit observation references recorded in
+the Answer; the presenter does not infer a Candidate binding from text.
+
+`final_decision` is returned only when the AnswerArtifact is valid, Recorded
+Replay is valid, and Recovery is `FROZEN`. If Replay is invalid, Answer is not
+frozen, or Recovery is `RETRYABLE`/`CORRUPTED`, safe timeline and status
+metadata remain available, but no authoritative RCA conclusion is returned.
+
+The `replay` object contains only validity, event count, digest, Answer digest
+and a safe error code. The `recovery` object exposes the explicit Recovery
+state and pending operation references. `audit` is generated through the
+redacted `AuditRecord` projection and excludes secrets, paths, raw prompts,
+evaluator-only data and raw trace/log identifiers.
 
 ### `POST /api/v1/cases/{case_id}/runs`
 
@@ -82,15 +100,21 @@ schema.
 
 ### `GET /api/v1/runs/{run_id}/status`
 
-Returns the persistent job state. State transitions are:
+Returns the persistent job state. The existing job status transitions are:
 
 ```text
 queued -> running -> succeeded | failed
 ```
 
+`recovery_status` is independent from job status and is one of `RESUMABLE`,
+`RETRYABLE`, `TERMINAL`, `FROZEN`, `CORRUPTED` or `NOT_AVAILABLE`.
+`RETRYABLE` is a host recovery plan; it does not mean that a pending Query,
+adapter call or Handoff has already been replayed or completed.
+
 If the local host restarts during a queued or running job, the manifest is
-recovered as `failed` with `HostRestarted`; an interrupted job is never silently
-reported as successful.
+recovered as `failed` with `HostRestarted` and `recovery_status=RETRYABLE`.
+The API does not guess a pending result or report the job as successfully
+recovered.
 
 ## Run directory contract
 
@@ -98,13 +122,16 @@ reported as successful.
 backend/var/runs/{run_id}/
 ├── manifest.json
 ├── transcript.jsonl
-└── answer.json
+├── answer.json
+└── metrics.json
 ```
 
 `manifest.json` contains public run metadata only. `transcript.jsonl` uses the
 existing append-only Transcript format. `answer.json` is a frozen
-`AnswerArtifact`. The server validates the Answer digest and runs Recorded
-Replay before producing a trusted final decision.
+`AnswerArtifact`. `metrics.json` contains host-owned operational counters only;
+it cannot affect Core decision, Evidence admission, stopping or Answer Freeze.
+The server validates the Answer digest and runs Recorded Replay before producing
+a trusted final decision.
 
 ## Future live-run controls
 
