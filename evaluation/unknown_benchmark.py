@@ -5,12 +5,21 @@ import argparse
 import json
 import os
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from langchain_core.runnables import Runnable
 
+from evaluation.benchmark_metrics import (
+    authoritative_allowed,
+    benchmark_config_digest,
+    classify_setup_exception,
+    invalid_action_diagnostics,
+    reasoning_mode,
+    unavailable_usage,
+)
 from evaluation.ground_truth import FlatGroundTruthRepository
 from rca_agent.core.runtime_registry import rca100_evidence_registry
 from rca_agent.deepseek_policy import create_deepseek_chat_model, create_deepseek_discovery_pipeline
@@ -424,6 +433,13 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     model_name = args.model or (DEFAULT_LOCAL_MODEL if provider == "qwen-local"
                                 else "deepseek-v4-pro")
     thinking_enabled = provider == "qwen-local" or not args.disable_thinking
+    profile = getattr(args, "acquisition", "fixed")
+    config_digest = benchmark_config_digest(
+        provider=provider, model=model_name, profile=profile, temperature=0,
+        reasoning_mode=reasoning_mode(thinking_enabled=thinking_enabled),
+        query_budget=args.query_budget, max_rounds=args.max_rounds,
+        inquiry_limit=getattr(args, "inquiry_query_limit", 10), retry_count=0,
+    )
 
     def chat_model(*, max_retries: int = 0):
         if provider == "qwen-local":
@@ -600,9 +616,23 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         re.sub(r"-[a-f0-9]{9,10}-[a-z0-9]{5}$", "", entity)
         for entity in truth.root_cause_entities
     }
+    model_call_count = (
+        acquisition.selection_calls
+        + len(discovery_started)
+        + len(plan_generated)
+        + len(plan_generated)
+    )
+    authoritative = authoritative_allowed(
+        replay_valid=replay.valid,
+        answer_frozen=(
+            runner.answer is not None
+            and runner.status.value in {"answer_frozen", "evaluated"}
+        ),
+    )
     return {
         "case_id": args.case_id,
-        "acquisition_mode": getattr(args, "acquisition", "fixed"),
+        "run_status": "completed",
+        "acquisition_mode": profile,
         "inquiry_query_limit": acquisition.inquiry_query_limit,
         "acquisition_selection_calls": acquisition.selection_calls,
         "acquisition_selection_errors": acquisition.selection_errors,
@@ -624,6 +654,14 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "holdout_candidate": args.holdout_candidate,
         "provider": provider,
         "model": model_name,
+        "reasoning_mode": reasoning_mode(thinking_enabled=thinking_enabled),
+        "temperature": 0,
+        "model_call_count": model_call_count,
+        "model_call_durations_seconds": "unavailable",
+        **unavailable_usage(),
+        "timeout_count": 0,
+        "cancel_count": 0,
+        "retry_count": 0,
         "thinking_enabled": thinking_enabled,
         "model_timeout_seconds": args.model_timeout_seconds,
         "model_max_tokens": (args.model_max_tokens if provider == "deepseek" else 16384),
@@ -703,6 +741,22 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             }),
         },
         "replay_valid": replay.valid,
+        "episode_id": runner.episode_id,
+        "answer_digest": runner.answer.artifact_digest if runner.answer else None,
+        "replay_status": "valid" if replay.valid else "invalid",
+        "recovery_status": "unavailable",
+        "stop_reason": runner.answer.termination_reason.value if runner.answer else None,
+        "transcript_head_digest": replay.head_digest,
+        "evaluation_report_digest": "unavailable",
+        "authoritative_conclusion": (
+            decision.model_dump(mode="json") if authoritative else None
+        ),
+        "failure_taxonomy": [],
+        "config_digest": config_digest,
+        "invalid_action_diagnostics": invalid_action_diagnostics(
+            events=list(runner.transcript.events), provider=provider,
+            profile=profile, config_digest=config_digest,
+        ),
     }
 
 
@@ -735,7 +789,48 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    result = run_case(args)
+    started = time.perf_counter()
+    try:
+        result = run_case(args)
+    except Exception as exc:  # noqa: BLE001 - benchmark boundary records raw setup failure.
+        message = str(exc)
+        setup_error = classify_setup_exception(exc)
+        result = {
+            "case_id": args.case_id,
+            "run_status": "CASE_SETUP_ERROR" if setup_error else "MODEL_FAILURE",
+            "failure_taxonomy": [
+                "CASE_SETUP_ERROR" if setup_error else "MODEL_FAILURE"
+            ],
+            "error_type": type(exc).__name__,
+            "error_message": message,
+            "provider": args.provider,
+            "model": args.model,
+            "reasoning_mode": reasoning_mode(thinking_enabled=not args.disable_thinking),
+            "profile": getattr(args, "acquisition", "fixed"),
+            "config_digest": benchmark_config_digest(
+                provider=args.provider, model=args.model or "unavailable",
+                profile=getattr(args, "acquisition", "fixed"), temperature=0,
+                reasoning_mode=reasoning_mode(thinking_enabled=not args.disable_thinking),
+                query_budget=args.query_budget, max_rounds=args.max_rounds,
+                inquiry_limit=args.inquiry_query_limit, retry_count=0,
+            ),
+            "temperature": 0,
+            "model_call_count": "unavailable",
+            **unavailable_usage(),
+            "timeout_count": 0,
+            "cancel_count": 0,
+            "retry_count": 0,
+            "episode_id": None,
+            "answer_digest": None,
+            "replay_status": "unavailable",
+            "recovery_status": "unavailable",
+            "stop_reason": "initialization_failure",
+            "transcript_head_digest": None,
+            "evaluation_report_digest": "unavailable",
+            "authoritative_conclusion": None,
+            "invalid_action_diagnostics": [],
+        }
+    result["wall_time_seconds"] = round(time.perf_counter() - started, 6)
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
