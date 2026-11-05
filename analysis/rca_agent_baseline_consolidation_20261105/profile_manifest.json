@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1.0",
+  "generated": "2026-11-05",
+  "profiles": {
+    "deepseek_inquiry_bounded": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "temperature": 0,
+      "reasoning_mode": "disabled",
+      "acquisition": "inquiry",
+      "query_budget": 6,
+      "max_rounds": 3,
+      "inquiry_limit": 6,
+      "retry": 0,
+      "cases": [
+        "t001",
+        "t003",
+        "t011",
+        "t025",
+        "t030",
+        "t062",
+        "t074",
+        "t079",
+        "t095",
+        "t103"
+      ],
+      "config_digest": "22f35c5119e20804617f5eb6e2706569f96155ffb26579af2453d2ffb49e78a5"
+    },
+    "deepseek_fixed_legacy": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "temperature": 0,
+      "reasoning_mode": "disabled",
+      "acquisition": "fixed",
+      "query_budget": 20,
+      "max_rounds": 20,
+      "inquiry_limit": 10,
+      "retry": 0,
+      "cases": [
+        "t001",
+        "t003",
+        "t011",
+        "t025",
+        "t030",
+        "t062",
+        "t074",
+        "t079",
+        "t095",
+        "t103"
+      ],
+      "config_digest": "3daeaf1a2e56c32ee0ac9d2f76707fb35503bdfd17d42c864f6a19f35082154b"
+    }
+  },
+  "evaluator": {
+    "attempted": true,
+    "status": "not_evaluable",
+    "reason": "Existing inputs are frozen artifact JSON without a live EpisodeRunner and replay transcript; EvaluatorHost requires a live frozen runner. No new Ground Truth was loaded."
+  }
+}
